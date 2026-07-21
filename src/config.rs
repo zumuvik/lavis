@@ -47,7 +47,7 @@ impl ConfigPaths {
             .or_else(|| environment("HOME").map(|home| PathBuf::from(home).join(".local/state")))
             .ok_or(ConfigError::MissingStateDirectory)?;
 
-        Ok(Self::new(".", state_directory.join("lavis/session")))
+        Ok(Self::new(",", state_directory.join("lavis/session")))
     }
 }
 
@@ -188,6 +188,7 @@ mod tests {
             ConfigPaths::default_with(&xdg).unwrap().session_path,
             PathBuf::from("/tmp/state/lavis/session")
         );
+        assert_eq!(ConfigPaths::default_with(&xdg).unwrap().prefix, ",");
         assert_eq!(
             ConfigPaths::default_with(&home).unwrap().session_path,
             PathBuf::from("/tmp/home/.local/state/lavis/session")

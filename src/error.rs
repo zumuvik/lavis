@@ -34,6 +34,8 @@ pub enum ClientError {
     SecureSessionFile,
     #[error("Telegram runner task failed")]
     RunnerTask,
+    #[error("Telegram update stream has already been started")]
+    UpdatesAlreadyTaken,
 }
 
 #[derive(Debug, Error)]

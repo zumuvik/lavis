@@ -3,13 +3,14 @@ use std::{path::PathBuf, sync::Arc};
 use grammers_client::Client;
 use grammers_mtsender::SenderPool;
 use grammers_session::storages::SqliteSession;
-use tokio::task::JoinHandle;
+use tokio::{sync::mpsc::UnboundedReceiver, task::JoinHandle};
 
 use crate::{config::Config, error::ClientError};
 
 pub struct TelegramClient {
     client: Client,
     runner: JoinHandle<()>,
+    updates: Option<UnboundedReceiver<grammers_session::updates::UpdatesLike>>,
 }
 
 impl TelegramClient {
@@ -27,15 +28,30 @@ impl TelegramClient {
         let client = Client::new(pool.handle);
         let runner = tokio::spawn(pool.runner.run());
 
-        Ok(Self { client, runner })
+        Ok(Self {
+            client,
+            runner,
+            updates: Some(pool.updates),
+        })
     }
 
     pub(crate) fn client(&self) -> &Client {
         &self.client
     }
 
+    pub(crate) fn take_updates(
+        &mut self,
+    ) -> Result<UnboundedReceiver<grammers_session::updates::UpdatesLike>, ClientError> {
+        self.updates.take().ok_or(ClientError::UpdatesAlreadyTaken)
+    }
+
     pub async fn shutdown(self) -> Result<(), ClientError> {
-        let Self { client, runner } = self;
+        let Self {
+            client,
+            runner,
+            updates,
+        } = self;
+        drop(updates);
         client.disconnect();
         drop(client);
         runner.await.map_err(|_| ClientError::RunnerTask)

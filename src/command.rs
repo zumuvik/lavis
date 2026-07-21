@@ -31,7 +31,7 @@ mod tests {
     #[test]
     fn parses_command_without_arguments() {
         assert_eq!(
-            parse(".ping", "."),
+            parse(",ping", ","),
             Some(Command {
                 name: "ping".to_owned(),
                 args: String::new(),
@@ -42,7 +42,7 @@ mod tests {
     #[test]
     fn parses_command_arguments() {
         assert_eq!(
-            parse(".edit hello world", "."),
+            parse(",edit hello world", ","),
             Some(Command {
                 name: "edit".to_owned(),
                 args: "hello world".to_owned(),
@@ -52,10 +52,11 @@ mod tests {
 
     #[test]
     fn ignores_empty_plain_and_prefix_only_input() {
-        assert_eq!(parse("", "."), None);
-        assert_eq!(parse("hello world", "."), None);
-        assert_eq!(parse(".", "."), None);
-        assert_eq!(parse(".   ", "."), None);
+        assert_eq!(parse("", ","), None);
+        assert_eq!(parse("hello world", ","), None);
+        assert_eq!(parse(",", ","), None);
+        assert_eq!(parse(",   ", ","), None);
+        assert_eq!(parse(".ping", ","), None);
     }
 
     #[test]
@@ -72,7 +73,7 @@ mod tests {
     #[test]
     fn supports_unicode_arguments() {
         assert_eq!(
-            parse(".say Привет, 世界", "."),
+            parse(",say Привет, 世界", ","),
             Some(Command {
                 name: "say".to_owned(),
                 args: "Привет, 世界".to_owned(),
