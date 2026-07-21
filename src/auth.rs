@@ -1,10 +1,11 @@
 use std::io::{self, Write};
 
 use grammers_client::{Client, SignInError};
+use grammers_session::types::PeerId;
 
 use crate::{config::Config, error::AuthError};
 
-pub async fn authorize(client: &Client, config: &Config) -> Result<(), AuthError> {
+pub async fn authorize(client: &Client, config: &Config) -> Result<PeerId, AuthError> {
     if !client
         .is_authorized()
         .await
@@ -42,7 +43,7 @@ pub async fn authorize(client: &Client, config: &Config) -> Result<(), AuthError
         .await
         .map_err(|_| AuthError::GetAuthorizedUser)?;
     log_authorized_user(&user);
-    Ok(())
+    Ok(user.id())
 }
 
 async fn read_line(prompt: &'static str) -> Result<String, AuthError> {

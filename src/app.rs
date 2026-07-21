@@ -15,7 +15,7 @@ pub async fn run() -> anyhow::Result<()> {
         .context("failed to open the Telegram session")?;
 
     let run_result = async {
-        auth::authorize(client.client(), &config)
+        let self_user_id = auth::authorize(client.client(), &config)
             .await
             .context("Telegram authorization failed")?;
 
@@ -28,7 +28,7 @@ pub async fn run() -> anyhow::Result<()> {
             .stream_updates(
                 receiver,
                 grammers_client::client::UpdatesConfiguration {
-                    catch_up: true,
+                    catch_up: false,
                     ..Default::default()
                 },
             )
@@ -37,7 +37,7 @@ pub async fn run() -> anyhow::Result<()> {
             .context("failed to create the Telegram update stream")?;
 
         tracing::info!(event = "application_started", "lavis is running");
-        updates::run(&mut stream, &config.prefix).await?;
+        updates::run(&mut stream, &config.prefix, self_user_id).await?;
         drop(stream);
         Ok(())
     }
