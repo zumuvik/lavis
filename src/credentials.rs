@@ -251,7 +251,7 @@ fn read_credentials(path: &Path) -> Result<Credentials, CredentialsError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Err(CredentialsError::NotFound)
+            return Err(CredentialsError::NotFound);
         }
         Err(_) => return Err(CredentialsError::Read),
     };
@@ -572,7 +572,10 @@ mod tests {
         let old_bytes = fs::read(&path).unwrap();
         let oversized = Credentials::new(1, "x".repeat(MAX_FILE_BYTES)).unwrap();
         assert_eq!(store.save(oversized), Err(CredentialsError::FileTooLarge));
-        assert_eq!(store.credentials(), Some(&credentials()));
+        assert_eq!(
+            store.credentials(),
+            Some(&credentials())
+        );
         assert_eq!(fs::read(path).unwrap(), old_bytes);
     }
 
@@ -727,7 +730,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn reset_rejects_symlinks_and_save_migrates_existing_directory_permissions() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::os::unix::fs::{PermissionsExt, symlink};
 
         let path = path();
         let directory = path.parent().unwrap();

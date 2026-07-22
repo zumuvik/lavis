@@ -174,7 +174,8 @@ where
                     let path = credentials::credentials_path(config::ConfigPaths::config_dir_with(
                         environment,
                     )?);
-                    let credentials = tokio::task::spawn_blocking(move || credentials::onboard(path))
+                    let credentials =
+                        tokio::task::spawn_blocking(move || credentials::onboard(path))
                         .await
                         .map_err(|_| anyhow::anyhow!("credential onboarding task failed"))?
                         .context("credential onboarding failed")?;
@@ -302,8 +303,8 @@ async fn initialize_dialog_cache(client: &grammers_client::Client) -> anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::{
-        authorization_failure, logout_confirmed, parse_cli, remove_session_files, CliCommand,
-        NONINTERACTIVE_LOGOUT, NONINTERACTIVE_MISSING_CREDENTIALS,
+        CliCommand, NONINTERACTIVE_LOGOUT, NONINTERACTIVE_MISSING_CREDENTIALS,
+        authorization_failure, logout_confirmed, parse_cli, remove_session_files,
     };
     use std::{
         ffi::OsString,
@@ -327,10 +328,7 @@ mod tests {
             CliCommand::Credentials
         );
         assert_eq!(
-            parse_cli(vec![
-                OsString::from("credentials"),
-                OsString::from("reset"),
-            ])
+            parse_cli(vec![OsString::from("credentials"), OsString::from("reset"),])
             .unwrap(),
             CliCommand::CredentialsReset
         );
@@ -339,12 +337,14 @@ mod tests {
             CliCommand::Logout
         );
         assert!(parse_cli(vec![OsString::from("auth"), OsString::from("extra")]).is_err());
-        assert!(parse_cli(vec![
-            OsString::from("credentials"),
-            OsString::from("reset"),
-            OsString::from("extra"),
-        ])
-        .is_err());
+        assert!(
+            parse_cli(vec![
+                OsString::from("credentials"),
+                OsString::from("reset"),
+                OsString::from("extra"),
+            ])
+            .is_err()
+        );
         assert!(parse_cli(vec![OsString::from("unknown")]).is_err());
     }
 
