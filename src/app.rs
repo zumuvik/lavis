@@ -192,7 +192,8 @@ async fn logout() -> anyhow::Result<()> {
     if !confirmed {
         anyhow::bail!("logout cancelled")
     }
-    let session_path = config::ConfigPaths::state_session_path_with(&std::env::var_os)?;
+    let environment = |name: &str| std::env::var_os(name);
+    let session_path = config::ConfigPaths::state_session_path_with(&environment)?;
     tokio::task::spawn_blocking(move || remove_session_files(&session_path))
         .await
         .map_err(|_| anyhow::anyhow!("logout storage task failed"))??;

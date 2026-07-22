@@ -245,7 +245,9 @@ fn read_credentials(path: &Path) -> Result<Credentials, CredentialsError> {
 }
 
 fn write_credentials(path: &Path, bytes: &[u8], counter: u64) -> Result<(), CredentialsError> {
-    write_credentials_with(path, bytes, counter, fs::rename)
+    write_credentials_with(path, bytes, counter, |source, destination| {
+        fs::rename(source, destination)
+    })
 }
 
 fn write_credentials_with<F>(
