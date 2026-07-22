@@ -135,8 +135,9 @@ where
     match credentials::resolve_environment(environment)? {
         Some(credentials) => Ok(credentials),
         None => {
-            let path =
-                credentials::credentials_path(config::ConfigPaths::config_dir_with(environment)?);
+            let path = credentials::credentials_path(
+                config::ConfigPaths::config_dir_with(environment)?,
+            );
             match tokio::task::spawn_blocking(move || credentials::resolve_stored(path))
                 .await
                 .map_err(|_| anyhow::anyhow!("credential storage task failed"))?
@@ -239,8 +240,8 @@ async fn initialize_dialog_cache(client: &grammers_client::Client) -> anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::{
-        logout_confirmed, parse_cli, remove_session_files, CliCommand,
-        NONINTERACTIVE_LOGOUT, NONINTERACTIVE_MISSING_CREDENTIALS,
+        CliCommand, NONINTERACTIVE_LOGOUT, NONINTERACTIVE_MISSING_CREDENTIALS, logout_confirmed,
+        parse_cli, remove_session_files,
     };
     use std::{
         ffi::OsString,
@@ -304,10 +305,15 @@ mod tests {
         }
         remove_session_files(&session).unwrap();
         for suffix in ["", "-journal", "-wal", "-shm"] {
-            assert!(!std::path::PathBuf::from(format!("{}{}", session.display(), suffix)).exists());
+            assert!(
+                !std::path::PathBuf::from(format!("{}{}", session.display(), suffix)).exists()
+            );
         }
         for name in ["settings.json", "aliases.json", "credentials.json"] {
-            assert_eq!(fs::read_to_string(directory.join(name)).unwrap(), "persistent");
+            assert_eq!(
+                fs::read_to_string(directory.join(name)).unwrap(),
+                "persistent"
+            );
         }
         fs::remove_dir_all(directory).unwrap();
     }

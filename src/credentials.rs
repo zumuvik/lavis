@@ -179,7 +179,9 @@ fn credentials_from_env(id: OsString, hash: OsString) -> Result<Credentials, Cre
         .ok_or(CredentialsError::InvalidApiId)?
         .parse()
         .map_err(|_| CredentialsError::InvalidApiId)?;
-    let api_hash = hash.into_string().map_err(|_| CredentialsError::InvalidApiHash)?;
+    let api_hash = hash
+        .into_string()
+        .map_err(|_| CredentialsError::InvalidApiHash)?;
     map_config_error(Credentials::new(api_id, api_hash))
 }
 
@@ -283,11 +285,17 @@ where
     }
     if file.write_all(bytes).is_err() || file.flush().is_err() {
         drop(file);
-        return Err(cleanup_temporary(&temporary, CredentialsError::WriteTemporary));
+        return Err(cleanup_temporary(
+            &temporary,
+            CredentialsError::WriteTemporary,
+        ));
     }
     if file.sync_all().is_err() {
         drop(file);
-        return Err(cleanup_temporary(&temporary, CredentialsError::SyncTemporary));
+        return Err(cleanup_temporary(
+            &temporary,
+            CredentialsError::SyncTemporary,
+        ));
     }
     drop(file);
     if replace(&temporary, path).is_err() {
@@ -522,8 +530,14 @@ mod tests {
     #[test]
     fn debug_and_errors_do_not_expose_hash() {
         let credentials = credentials();
-        assert!(!format!("{credentials:?}").contains(credentials.api_hash()));
-        assert!(!CredentialsError::InvalidApiHash.to_string().contains(credentials.api_hash()));
+        assert!(
+            !format!("{credentials:?}").contains(credentials.api_hash())
+        );
+        assert!(
+            !CredentialsError::InvalidApiHash
+                .to_string()
+                .contains(credentials.api_hash())
+        );
     }
 
     #[test]
@@ -534,7 +548,7 @@ mod tests {
         let old_bytes = fs::read(&path).unwrap();
         let temporary = path.parent().unwrap().join(format!(
             ".credentials.json.{}.2.tmp",
-            std::process::id()
+            std::process::id(),
         ));
         fs::create_dir(&temporary).unwrap();
         assert_eq!(
@@ -572,7 +586,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn strict_permissions_and_unsafe_types_are_rejected() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::os::unix::fs::{PermissionsExt, symlink};
 
         let path = path();
         let mut store = CredentialsStore::new(path.clone());
