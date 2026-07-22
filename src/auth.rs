@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 
 use grammers_client::{Client, SignInError};
 use grammers_session::types::PeerId;
@@ -11,6 +11,9 @@ pub async fn authorize(client: &Client, config: &Config) -> Result<PeerId, AuthE
         .await
         .map_err(|_| AuthError::AuthorizationCheck)?
     {
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            return Err(AuthError::NonInteractive);
+        }
         let phone = read_line("Telegram phone number: ").await?;
         let token = client
             .request_login_code(&phone, config.api_hash())

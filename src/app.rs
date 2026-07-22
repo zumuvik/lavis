@@ -1,5 +1,12 @@
 use anyhow::Context;
-use std::time::Instant;
+use std::{
+    env,
+    ffi::OsString,
+    fs,
+    io::{self, IsTerminal, Write},
+    path::Path,
+    time::Instant,
+};
 
 pub mod aliases;
 pub mod auth;
@@ -7,6 +14,7 @@ pub mod client;
 pub mod command;
 pub mod commands;
 pub mod config;
+pub mod credentials;
 pub mod error;
 pub mod fastfetch;
 pub mod help;
@@ -17,20 +25,62 @@ pub mod settings;
 pub mod updates;
 
 pub async fn run() -> anyhow::Result<()> {
+    match parse_cli(env::args_os().skip(1))? {
+        CliCommand::Run => run_command(false).await,
+        CliCommand::Auth => run_command(true).await,
+        CliCommand::Credentials => credentials_status().await,
+        CliCommand::Logout => logout().await,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliCommand {
+    Run,
+    Auth,
+    Credentials,
+    Logout,
+}
+
+const NONINTERACTIVE_MISSING_CREDENTIALS: &str =
+    "Run `lavis auth` in an interactive terminal first.";
+const NONINTERACTIVE_LOGOUT: &str = "logout requires an interactive terminal";
+
+fn parse_cli(arguments: impl IntoIterator<Item = OsString>) -> anyhow::Result<CliCommand> {
+    let arguments = arguments.into_iter().collect::<Vec<_>>();
+    match arguments.as_slice() {
+        [] => Ok(CliCommand::Run),
+        [argument] if argument == "run" => Ok(CliCommand::Run),
+        [argument] if argument == "auth" => Ok(CliCommand::Auth),
+        [argument] if argument == "credentials" => Ok(CliCommand::Credentials),
+        [argument] if argument == "logout" => Ok(CliCommand::Logout),
+        _ => anyhow::bail!("usage: lavis [run|auth|credentials|logout]"),
+    }
+}
+
+async fn run_command(auth_only: bool) -> anyhow::Result<()> {
     let started_at = Instant::now();
-    let config = config::Config::load().context("failed to load configuration")?;
+    let environment = |name: &str| std::env::var_os(name);
+    let session_path = config::ConfigPaths::state_session_path_with(&environment)
+        .context("failed to determine application state path")?;
+    let credentials = resolve_or_onboard(&environment).await?;
+    let paths = config::ConfigPaths::new(session_path);
+    let config = config::Config::from_credentials(credentials, paths)
+        .context("failed to load configuration")?;
     let mut client = client::TelegramClient::connect(&config)
         .await
         .context("failed to open the Telegram session")?;
 
     let run_result = async {
-        let settings = settings::SettingsStore::load(config.settings_path.clone())
-            .await
-            .context("failed to load persistent settings")?;
         let self_user_id = auth::authorize(client.client(), &config)
             .await
             .context("Telegram authorization failed")?;
 
+        if auth_only {
+            return Ok(());
+        }
+        let settings = settings::SettingsStore::load(config.settings_path.clone())
+            .await
+            .context("failed to load persistent settings")?;
         initialize_dialog_cache(client.client()).await?;
         let receiver = client
             .take_updates()
@@ -78,6 +128,103 @@ pub async fn run() -> anyhow::Result<()> {
     }
 }
 
+async fn resolve_or_onboard<F>(environment: &F) -> anyhow::Result<credentials::Credentials>
+where
+    F: Fn(&str) -> Option<OsString>,
+{
+    match credentials::resolve_environment(environment)? {
+        Some(credentials) => Ok(credentials),
+        None => {
+            let path =
+                credentials::credentials_path(config::ConfigPaths::config_dir_with(environment)?);
+            match tokio::task::spawn_blocking(move || credentials::resolve_stored(path))
+                .await
+                .map_err(|_| anyhow::anyhow!("credential storage task failed"))?
+            {
+                Ok((credentials, _)) => Ok(credentials),
+                Err(crate::error::CredentialsError::NotFound) if credentials::interactive() => {
+                    let path = credentials::credentials_path(
+                        config::ConfigPaths::config_dir_with(environment)?,
+                    );
+                    tokio::task::spawn_blocking(move || credentials::onboard(path))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("credential onboarding task failed"))?
+                        .context("credential onboarding failed")
+                }
+                Err(crate::error::CredentialsError::NotFound) => {
+                    anyhow::bail!(NONINTERACTIVE_MISSING_CREDENTIALS)
+                }
+                Err(error) => Err(error).context("failed to resolve credentials"),
+            }
+        }
+    }
+}
+
+async fn credentials_status() -> anyhow::Result<()> {
+    let environment = |name: &str| std::env::var_os(name);
+    if credentials::resolve_environment(&environment)?.is_some() {
+        println!("credentials: present (Environment); path: not used");
+        return Ok(());
+    }
+    let config_dir = config::ConfigPaths::config_dir_with(&environment)?;
+    let path = credentials::credentials_path(config_dir);
+    let path_display = path.display().to_string();
+    let result = tokio::task::spawn_blocking(move || credentials::resolve_stored(path))
+        .await
+        .map_err(|_| anyhow::anyhow!("credential storage task failed"))?;
+    match result {
+        Ok((_, source)) => println!("credentials: present ({source:?}); path: {path_display}"),
+        Err(crate::error::CredentialsError::NotFound) => {
+            println!("credentials: absent; path: {path_display}")
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+async fn logout() -> anyhow::Result<()> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        anyhow::bail!(NONINTERACTIVE_LOGOUT)
+    }
+    let confirmed = tokio::task::spawn_blocking(read_logout_confirmation)
+        .await
+        .map_err(|_| anyhow::anyhow!("logout confirmation task failed"))??;
+    if !confirmed {
+        anyhow::bail!("logout cancelled")
+    }
+    let session_path = config::ConfigPaths::state_session_path_with(&std::env::var_os)?;
+    tokio::task::spawn_blocking(move || remove_session_files(&session_path))
+        .await
+        .map_err(|_| anyhow::anyhow!("logout storage task failed"))??;
+    println!("Local Telegram session removed. This does not revoke remote access.");
+    Ok(())
+}
+
+fn read_logout_confirmation() -> io::Result<bool> {
+    print!("Remove the local Telegram session? This does not revoke remote access. [y/N] ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(logout_confirmed(&answer))
+}
+
+fn logout_confirmed(answer: &str) -> bool {
+    credentials::confirmed(answer)
+}
+
+fn remove_session_files(session: &Path) -> anyhow::Result<()> {
+    for suffix in ["", "-journal", "-wal", "-shm"] {
+        let mut path = session.to_path_buf();
+        path.as_mut_os_string().push(suffix);
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
 async fn initialize_dialog_cache(client: &grammers_client::Client) -> anyhow::Result<()> {
     let mut dialogs = client.iter_dialogs();
     while dialogs
@@ -87,4 +234,81 @@ async fn initialize_dialog_cache(client: &grammers_client::Client) -> anyhow::Re
         .is_some()
     {}
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        logout_confirmed, parse_cli, remove_session_files, CliCommand,
+        NONINTERACTIVE_LOGOUT, NONINTERACTIVE_MISSING_CREDENTIALS,
+    };
+    use std::{
+        ffi::OsString,
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    #[test]
+    fn accepts_only_documented_cli_forms() {
+        assert_eq!(parse_cli(Vec::new()).unwrap(), CliCommand::Run);
+        assert_eq!(parse_cli(vec![OsString::from("run")]).unwrap(), CliCommand::Run);
+        assert_eq!(parse_cli(vec![OsString::from("auth")]).unwrap(), CliCommand::Auth);
+        assert_eq!(
+            parse_cli(vec![OsString::from("credentials")]).unwrap(),
+            CliCommand::Credentials
+        );
+        assert_eq!(
+            parse_cli(vec![OsString::from("logout")]).unwrap(),
+            CliCommand::Logout
+        );
+        assert!(parse_cli(vec![OsString::from("auth"), OsString::from("extra")]).is_err());
+        assert!(parse_cli(vec![OsString::from("unknown")]).is_err());
+    }
+
+    #[test]
+    fn noninteractive_missing_credentials_message_is_exact() {
+        assert_eq!(
+            NONINTERACTIVE_MISSING_CREDENTIALS,
+            "Run `lavis auth` in an interactive terminal first."
+        );
+    }
+
+    #[test]
+    fn noninteractive_logout_message_is_exact() {
+        assert_eq!(NONINTERACTIVE_LOGOUT, "logout requires an interactive terminal");
+    }
+
+    #[test]
+    fn logout_confirmation_defaults_to_no() {
+        assert!(!logout_confirmed(""));
+        assert!(!logout_confirmed("no"));
+        assert!(logout_confirmed("yes"));
+    }
+
+    #[test]
+    fn logout_removes_only_session_and_sidecars() {
+        let directory = std::env::temp_dir().join(format!(
+            "lavis-logout-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let session = directory.join("session");
+        for suffix in ["", "-journal", "-wal", "-shm"] {
+            fs::write(format!("{}{}", session.display(), suffix), "session").unwrap();
+        }
+        for name in ["settings.json", "aliases.json", "credentials.json"] {
+            fs::write(directory.join(name), "persistent").unwrap();
+        }
+        remove_session_files(&session).unwrap();
+        for suffix in ["", "-journal", "-wal", "-shm"] {
+            assert!(!std::path::PathBuf::from(format!("{}{}", session.display(), suffix)).exists());
+        }
+        for name in ["settings.json", "aliases.json", "credentials.json"] {
+            assert_eq!(fs::read_to_string(directory.join(name)).unwrap(), "persistent");
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
 }

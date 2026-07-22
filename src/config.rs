@@ -1,6 +1,6 @@
 use std::{ffi::OsString, fmt, path::PathBuf};
 
-use crate::error::ConfigError;
+use crate::{credentials::Credentials, error::ConfigError};
 
 pub const API_ID_ENV: &str = "LAVIS_API_ID";
 pub const API_HASH_ENV: &str = "LAVIS_API_HASH";
@@ -30,12 +30,14 @@ impl fmt::Debug for Config {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigPaths {
     pub session_path: PathBuf,
+    pub config_dir: PathBuf,
 }
 
 impl ConfigPaths {
     pub fn new(session_path: impl Into<PathBuf>) -> Self {
         Self {
             session_path: session_path.into(),
+            config_dir: PathBuf::from("/tmp/lavis-config"),
         }
     }
 
@@ -43,12 +45,44 @@ impl ConfigPaths {
     where
         F: Fn(&str) -> Option<OsString>,
     {
+        Ok(Self {
+            session_path: Self::state_session_path_with(environment)?,
+            config_dir: Self::config_dir_with(environment)?,
+        })
+    }
+
+    pub fn state_session_path_with<F>(environment: &F) -> Result<PathBuf, ConfigError>
+    where
+        F: Fn(&str) -> Option<OsString>,
+    {
         let state_directory = environment("XDG_STATE_HOME")
             .map(PathBuf::from)
-            .or_else(|| environment("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+            .filter(|path| !path.as_os_str().is_empty())
+            .or_else(|| {
+                environment("HOME")
+                    .filter(|home| !home.is_empty())
+                    .map(|home| PathBuf::from(home).join(".local/state"))
+            })
             .ok_or(ConfigError::MissingStateDirectory)?;
+        valid_root(&state_directory)?;
+        Ok(state_directory.join("lavis/session"))
+    }
 
-        Ok(Self::new(state_directory.join("lavis/session")))
+    pub fn config_dir_with<F>(environment: &F) -> Result<PathBuf, ConfigError>
+    where
+        F: Fn(&str) -> Option<OsString>,
+    {
+        let config_directory = environment("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|path| !path.as_os_str().is_empty())
+            .or_else(|| {
+                environment("HOME")
+                    .filter(|home| !home.is_empty())
+                    .map(|home| PathBuf::from(home).join(".config"))
+            })
+            .ok_or(ConfigError::MissingConfigDirectory)?;
+        valid_root(&config_directory)?;
+        Ok(config_directory.join("lavis"))
     }
 }
 
@@ -65,7 +99,13 @@ impl Config {
     {
         let api_id = required_api_id(environment(API_ID_ENV))?;
         let api_hash = required_api_hash(environment(API_HASH_ENV))?;
+        Self::from_credentials(Credentials::new(api_id, api_hash)?, paths)
+    }
 
+    pub fn from_credentials(
+        credentials: Credentials,
+        paths: ConfigPaths,
+    ) -> Result<Self, ConfigError> {
         if paths.session_path.as_os_str().is_empty() {
             return Err(ConfigError::EmptySessionPath);
         }
@@ -78,8 +118,8 @@ impl Config {
             .ok_or(ConfigError::MissingSessionDirectory)?;
 
         Ok(Self {
-            api_id,
-            api_hash,
+            api_id: credentials.api_id(),
+            api_hash: credentials.api_hash().to_owned(),
             default_prefix: crate::settings::DEFAULT_PREFIX.to_owned(),
             session_path: paths.session_path,
             aliases_path: state_dir.join("aliases.json"),
@@ -93,16 +133,26 @@ impl Config {
     }
 }
 
+pub(crate) fn validate_api_id(api_id: u32) -> Result<u32, ConfigError> {
+    if api_id == 0 || i32::try_from(api_id).is_err() {
+        return Err(ConfigError::InvalidApiId);
+    }
+    Ok(api_id)
+}
+
+pub(crate) fn validate_api_hash(value: String) -> Result<String, ConfigError> {
+    if value.is_empty() {
+        return Err(ConfigError::InvalidApiHash);
+    }
+    Ok(value)
+}
+
 fn required_api_id(value: Option<OsString>) -> Result<u32, ConfigError> {
     let value = value.ok_or(ConfigError::MissingApiId)?;
     let value = value.to_str().ok_or(ConfigError::InvalidApiId)?;
     let api_id = value.parse().map_err(|_| ConfigError::InvalidApiId)?;
 
-    if api_id == 0 || i32::try_from(api_id).is_err() {
-        return Err(ConfigError::InvalidApiId);
-    }
-
-    Ok(api_id)
+    validate_api_id(api_id)
 }
 
 fn required_api_hash(value: Option<OsString>) -> Result<String, ConfigError> {
@@ -111,11 +161,14 @@ fn required_api_hash(value: Option<OsString>) -> Result<String, ConfigError> {
         .into_string()
         .map_err(|_| ConfigError::InvalidApiHash)?;
 
-    if value.is_empty() {
-        return Err(ConfigError::InvalidApiHash);
-    }
+    validate_api_hash(value)
+}
 
-    Ok(value)
+fn valid_root(path: &std::path::Path) -> Result<(), ConfigError> {
+    if path.as_os_str().is_empty() || !path.is_absolute() {
+        return Err(ConfigError::InvalidDirectory);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -192,7 +245,10 @@ mod tests {
 
     #[test]
     fn derives_xdg_compatible_session_paths_from_injected_environment() {
-        let xdg = environment(&[("XDG_STATE_HOME", "/tmp/state")]);
+        let xdg = environment(&[
+            ("XDG_STATE_HOME", "/tmp/state"),
+            ("XDG_CONFIG_HOME", "/tmp/config"),
+        ]);
         let home = environment(&[("HOME", "/tmp/home")]);
 
         assert_eq!(
@@ -216,6 +272,31 @@ mod tests {
         assert_eq!(
             ConfigPaths::default_with(&home).unwrap().session_path,
             PathBuf::from("/tmp/home/.local/state/lavis/session")
+        );
+        assert_eq!(
+            ConfigPaths::config_dir_with(&home).unwrap(),
+            PathBuf::from("/tmp/home/.config/lavis")
+        );
+    }
+
+    #[test]
+    fn empty_xdg_roots_fall_back_to_home_and_relative_roots_are_rejected() {
+        assert_eq!(
+            ConfigPaths::default_with(&environment(&[
+                ("XDG_STATE_HOME", "state"),
+                ("XDG_CONFIG_HOME", "/tmp/config"),
+            ])),
+            Err(ConfigError::InvalidDirectory)
+        );
+        assert_eq!(
+            ConfigPaths::default_with(&environment(&[
+                ("XDG_STATE_HOME", ""),
+                ("XDG_CONFIG_HOME", ""),
+                ("HOME", "/tmp/home"),
+            ]))
+            .unwrap()
+            .config_dir,
+            PathBuf::from("/tmp/home/.config/lavis")
         );
     }
 }

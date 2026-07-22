@@ -18,6 +18,46 @@ pub enum ConfigError {
     MissingSessionDirectory,
     #[error("neither XDG_STATE_HOME nor HOME is available for the session path")]
     MissingStateDirectory,
+    #[error("neither XDG_CONFIG_HOME nor HOME is available for the credentials path")]
+    MissingConfigDirectory,
+    #[error("configuration and state directories must be absolute, non-empty paths")]
+    InvalidDirectory,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum CredentialsError {
+    #[error("credential onboarding was cancelled")]
+    Cancelled,
+    #[error("failed to read credentials input or storage")]
+    Read,
+    #[error("credentials file was not found")]
+    NotFound,
+    #[error("credential API ID must be a positive integer")]
+    InvalidApiId,
+    #[error("credential API hash must be a non-empty Unicode value")]
+    InvalidApiHash,
+    #[error("LAVIS_API_ID and LAVIS_API_HASH must be set together")]
+    PartialEnvironment,
+    #[error("credentials file is too large")]
+    FileTooLarge,
+    #[error("credentials file is malformed")]
+    MalformedFile,
+    #[error("credentials file version is unsupported")]
+    UnsupportedVersion,
+    #[error("credentials storage has unsafe permissions or type")]
+    UnsafeStorage,
+    #[error("failed to create credentials directory")]
+    CreateDirectory,
+    #[error("failed to create credentials temporary file")]
+    CreateTemporary,
+    #[error("failed to write credentials temporary file")]
+    WriteTemporary,
+    #[error("failed to synchronize credentials temporary file")]
+    SyncTemporary,
+    #[error("failed to synchronize credentials directory")]
+    SyncDirectory,
+    #[error("failed to replace credentials file")]
+    Replace,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -114,6 +154,8 @@ pub enum ClientError {
 
 #[derive(Debug, Error)]
 pub enum AuthError {
+    #[error("Telegram authorization requires an interactive terminal")]
+    NonInteractive,
     #[error("failed to read authorization input")]
     ReadInput,
     #[error("authorization input must not be empty")]
