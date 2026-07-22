@@ -29,6 +29,7 @@ pub async fn run() -> anyhow::Result<()> {
         CliCommand::Run => run_command(false).await,
         CliCommand::Auth => run_command(true).await,
         CliCommand::Credentials => credentials_status().await,
+        CliCommand::CredentialsReset => credentials_reset().await,
         CliCommand::Logout => logout().await,
     }
 }
@@ -38,6 +39,7 @@ enum CliCommand {
     Run,
     Auth,
     Credentials,
+    CredentialsReset,
     Logout,
 }
 
@@ -52,8 +54,11 @@ fn parse_cli(arguments: impl IntoIterator<Item = OsString>) -> anyhow::Result<Cl
         [argument] if argument == "run" => Ok(CliCommand::Run),
         [argument] if argument == "auth" => Ok(CliCommand::Auth),
         [argument] if argument == "credentials" => Ok(CliCommand::Credentials),
+        [credentials, reset] if credentials == "credentials" && reset == "reset" => {
+            Ok(CliCommand::CredentialsReset)
+        }
         [argument] if argument == "logout" => Ok(CliCommand::Logout),
-        _ => anyhow::bail!("usage: lavis [run|auth|credentials|logout]"),
+        _ => anyhow::bail!("usage: lavis [run|auth|credentials [reset]|logout]"),
     }
 }
 
@@ -62,9 +67,10 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
     let environment = |name: &str| std::env::var_os(name);
     let session_path = config::ConfigPaths::state_session_path_with(&environment)
         .context("failed to determine application state path")?;
-    let credentials = resolve_or_onboard(&environment).await?;
+    let resolved = resolve_or_onboard(&environment).await?;
+    let newly_saved = resolved.newly_saved;
     let paths = config::ConfigPaths::new(session_path);
-    let config = config::Config::from_credentials(credentials, paths)
+    let config = config::Config::from_credentials(resolved.credentials, paths)
         .context("failed to load configuration")?;
     let mut client = client::TelegramClient::connect(&config)
         .await
@@ -73,7 +79,8 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
     let run_result = async {
         let self_user_id = auth::authorize(client.client(), &config)
             .await
-            .context("Telegram authorization failed")?;
+            .context("Telegram authorization failed")
+            .map_err(|error| authorization_failure(error, newly_saved))?;
 
         if auth_only {
             return Ok(());
@@ -128,12 +135,30 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
     }
 }
 
-async fn resolve_or_onboard<F>(environment: &F) -> anyhow::Result<credentials::Credentials>
+fn authorization_failure(error: anyhow::Error, newly_saved: bool) -> anyhow::Error {
+    if newly_saved {
+        error.context(
+            "new credentials were saved; if they are incorrect, run `lavis credentials reset`",
+        )
+    } else {
+        error
+    }
+}
+
+struct ResolvedCredentials {
+    credentials: credentials::Credentials,
+    newly_saved: bool,
+}
+
+async fn resolve_or_onboard<F>(environment: &F) -> anyhow::Result<ResolvedCredentials>
 where
     F: Fn(&str) -> Option<OsString>,
 {
     match credentials::resolve_environment(environment)? {
-        Some(credentials) => Ok(credentials),
+        Some(credentials) => Ok(ResolvedCredentials {
+            credentials,
+            newly_saved: false,
+        }),
         None => {
             let path =
                 credentials::credentials_path(config::ConfigPaths::config_dir_with(environment)?);
@@ -141,15 +166,22 @@ where
                 .await
                 .map_err(|_| anyhow::anyhow!("credential storage task failed"))?
             {
-                Ok((credentials, _)) => Ok(credentials),
+                Ok((credentials, _)) => Ok(ResolvedCredentials {
+                    credentials,
+                    newly_saved: false,
+                }),
                 Err(crate::error::CredentialsError::NotFound) if credentials::interactive() => {
                     let path = credentials::credentials_path(config::ConfigPaths::config_dir_with(
                         environment,
                     )?);
-                    tokio::task::spawn_blocking(move || credentials::onboard(path))
+                    let credentials = tokio::task::spawn_blocking(move || credentials::onboard(path))
                         .await
                         .map_err(|_| anyhow::anyhow!("credential onboarding task failed"))?
-                        .context("credential onboarding failed")
+                        .context("credential onboarding failed")?;
+                    Ok(ResolvedCredentials {
+                        credentials,
+                        newly_saved: true,
+                    })
                 }
                 Err(crate::error::CredentialsError::NotFound) => {
                     anyhow::bail!(NONINTERACTIVE_MISSING_CREDENTIALS)
@@ -158,6 +190,36 @@ where
             }
         }
     }
+}
+
+async fn credentials_reset() -> anyhow::Result<()> {
+    if !credentials::interactive() {
+        anyhow::bail!("credentials reset requires an interactive terminal")
+    }
+    let confirmed = tokio::task::spawn_blocking(read_credentials_reset_confirmation)
+        .await
+        .map_err(|_| anyhow::anyhow!("credentials reset confirmation task failed"))??;
+    if !confirmed {
+        anyhow::bail!("credentials reset cancelled")
+    }
+    let environment = |name: &str| std::env::var_os(name);
+    let path = credentials::credentials_path(config::ConfigPaths::config_dir_with(&environment)?);
+    let result = tokio::task::spawn_blocking(move || credentials::reset(&path))
+        .await
+        .map_err(|_| anyhow::anyhow!("credentials reset storage task failed"))??;
+    match result {
+        credentials::ResetResult::Removed => println!("Local credentials removed."),
+        credentials::ResetResult::Absent => println!("No local credentials were present."),
+    }
+    Ok(())
+}
+
+fn read_credentials_reset_confirmation() -> io::Result<bool> {
+    print!("Remove local API credentials? [y/N] ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(credentials::confirmed(&answer))
 }
 
 async fn credentials_status() -> anyhow::Result<()> {
@@ -240,8 +302,8 @@ async fn initialize_dialog_cache(client: &grammers_client::Client) -> anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::{
-        CliCommand, NONINTERACTIVE_LOGOUT, NONINTERACTIVE_MISSING_CREDENTIALS, logout_confirmed,
-        parse_cli, remove_session_files,
+        authorization_failure, logout_confirmed, parse_cli, remove_session_files, CliCommand,
+        NONINTERACTIVE_LOGOUT, NONINTERACTIVE_MISSING_CREDENTIALS,
     };
     use std::{
         ffi::OsString,
@@ -265,10 +327,24 @@ mod tests {
             CliCommand::Credentials
         );
         assert_eq!(
+            parse_cli(vec![
+                OsString::from("credentials"),
+                OsString::from("reset"),
+            ])
+            .unwrap(),
+            CliCommand::CredentialsReset
+        );
+        assert_eq!(
             parse_cli(vec![OsString::from("logout")]).unwrap(),
             CliCommand::Logout
         );
         assert!(parse_cli(vec![OsString::from("auth"), OsString::from("extra")]).is_err());
+        assert!(parse_cli(vec![
+            OsString::from("credentials"),
+            OsString::from("reset"),
+            OsString::from("extra"),
+        ])
+        .is_err());
         assert!(parse_cli(vec![OsString::from("unknown")]).is_err());
     }
 
@@ -286,6 +362,15 @@ mod tests {
             NONINTERACTIVE_LOGOUT,
             "logout requires an interactive terminal"
         );
+    }
+
+    #[test]
+    fn authorization_recovery_hint_only_applies_to_newly_saved_credentials() {
+        let new = authorization_failure(anyhow::anyhow!("authorization failed"), true);
+        let existing = authorization_failure(anyhow::anyhow!("authorization failed"), false);
+
+        assert!(new.to_string().contains("lavis credentials reset"));
+        assert!(!existing.to_string().contains("lavis credentials reset"));
     }
 
     #[test]

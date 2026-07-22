@@ -58,6 +58,8 @@ pub enum CredentialsError {
     SyncDirectory,
     #[error("failed to replace credentials file")]
     Replace,
+    #[error("failed to remove credentials file")]
+    Delete,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]

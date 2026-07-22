@@ -16,9 +16,12 @@ use crate::{
 const VERSION: u32 = 1;
 const MAX_FILE_BYTES: usize = 4096;
 pub const ONBOARDING_DISCLAIMER: &str = concat!(
-    "Store these credentials securely. Do not commit credentials.json, your Telegram session, ",
-    "or your API hash. This does not make the account or userbot legal, safe, or approved by ",
-    "Telegram.",
+    "Lavis is an unofficial Telegram client. Its use may result in account restrictions or bans.\n\n",
+    "Copyright (C) 2026 zumuvik.\n\n",
+    "The software is provided as-is. The author is not liable for account loss, loss of access, ",
+    "data loss, or other damages to the extent permitted by applicable law.\n\n",
+    "Store these credentials securely. Do not commit credentials.json, your Telegram session, or ",
+    "your API hash.",
 );
 
 #[derive(Clone, PartialEq, Eq)]
@@ -106,6 +109,12 @@ pub enum CredentialSource {
     Stored,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetResult {
+    Removed,
+    Absent,
+}
+
 pub fn resolve_environment<F>(environment: &F) -> Result<Option<Credentials>, CredentialsError>
 where
     F: Fn(&str) -> Option<OsString>,
@@ -138,6 +147,25 @@ where
 
 pub fn credentials_path(config_dir: PathBuf) -> PathBuf {
     config_dir.join("credentials.json")
+}
+
+pub fn reset(path: &Path) -> Result<ResetResult, CredentialsError> {
+    let parent = path.parent().ok_or(CredentialsError::Read)?;
+    match fs::symlink_metadata(parent) {
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return Err(CredentialsError::UnsafeStorage),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(ResetResult::Absent),
+        Err(_) => return Err(CredentialsError::Read),
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            fs::remove_file(path).map_err(|_| CredentialsError::Delete)?;
+            Ok(ResetResult::Removed)
+        }
+        Ok(_) => Err(CredentialsError::UnsafeStorage),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(ResetResult::Absent),
+        Err(_) => Err(CredentialsError::Read),
+    }
 }
 
 pub fn interactive() -> bool {
@@ -218,10 +246,20 @@ fn serialize_credentials(credentials: &Credentials) -> Result<Vec<u8>, Credentia
 }
 
 fn read_credentials(path: &Path) -> Result<Credentials, CredentialsError> {
-    if let Some(parent) = path.parent() {
-        validate_existing_directory(parent)?;
+    let parent = path.parent().ok_or(CredentialsError::Read)?;
+    validate_parent_for_read(parent)?;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(CredentialsError::NotFound)
+        }
+        Err(_) => return Err(CredentialsError::Read),
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(CredentialsError::UnsafeStorage);
     }
-    validate_existing_file(path)?;
+    validate_mode(&metadata, 0o600)?;
+    validate_existing_directory(parent)?;
     let file = fs::File::open(path).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             CredentialsError::NotFound
@@ -244,10 +282,23 @@ fn read_credentials(path: &Path) -> Result<Credentials, CredentialsError> {
     map_config_error(Credentials::new(file.api_id, file.api_hash))
 }
 
+fn validate_parent_for_read(path: &Path) -> Result<(), CredentialsError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            Ok(())
+        }
+        Ok(_) => Err(CredentialsError::UnsafeStorage),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(CredentialsError::Read),
+    }
+}
+
 fn write_credentials(path: &Path, bytes: &[u8], counter: u64) -> Result<(), CredentialsError> {
-    write_credentials_with(path, bytes, counter, |source, destination| {
-        fs::rename(source, destination)
-    })
+    write_credentials_with(path, bytes, counter, rename_credentials)
+}
+
+fn rename_credentials(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)
 }
 
 fn write_credentials_with<F>(
@@ -319,7 +370,16 @@ fn cleanup_temporary(path: &Path, error: CredentialsError) -> CredentialsError {
 
 fn ensure_secure_directory(path: &Path) -> Result<(), CredentialsError> {
     match fs::symlink_metadata(path) {
-        Ok(_) => validate_existing_directory(path),
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                    .map_err(|_| CredentialsError::CreateDirectory)?;
+            }
+            validate_existing_directory(path)
+        }
+        Ok(_) => Err(CredentialsError::UnsafeStorage),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             fs::create_dir_all(path).map_err(|_| CredentialsError::CreateDirectory)?;
             #[cfg(unix)]
@@ -422,7 +482,12 @@ mod tests {
     fn disclaimer_is_exact() {
         assert_eq!(
             ONBOARDING_DISCLAIMER,
-            "Store these credentials securely. Do not commit credentials.json, your Telegram session, or your API hash. This does not make the account or userbot legal, safe, or approved by Telegram."
+            concat!(
+                "Lavis is an unofficial Telegram client. Its use may result in account restrictions or bans.\n\n",
+                "Copyright (C) 2026 zumuvik.\n\n",
+                "The software is provided as-is. The author is not liable for account loss, loss of access, data loss, or other damages to the extent permitted by applicable law.\n\n",
+                "Store these credentials securely. Do not commit credentials.json, your Telegram session, or your API hash."
+            )
         );
     }
 
@@ -583,6 +648,26 @@ mod tests {
         assert_eq!(fs::read(path).unwrap(), old_bytes);
     }
 
+    #[test]
+    fn reset_removes_only_credentials_and_reports_missing_files() {
+        let path = path();
+        let directory = path.parent().unwrap();
+        fs::write(&path, "credentials").unwrap();
+        for name in ["session", "settings.json", "aliases.json"] {
+            fs::write(directory.join(name), "preserved").unwrap();
+        }
+        assert_eq!(reset(&path), Ok(ResetResult::Removed));
+        assert!(!path.exists());
+        for name in ["session", "settings.json", "aliases.json"] {
+            assert_eq!(fs::read_to_string(directory.join(name)).unwrap(), "preserved");
+        }
+        assert_eq!(reset(&path), Ok(ResetResult::Absent));
+        assert_eq!(
+            reset(&path.with_file_name("missing/credentials.json")),
+            Ok(ResetResult::Absent)
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn strict_permissions_and_unsafe_types_are_rejected() {
@@ -637,5 +722,38 @@ mod tests {
             CredentialsStore::load(path),
             Err(CredentialsError::UnsafeStorage)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reset_rejects_symlinks_and_save_migrates_existing_directory_permissions() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let path = path();
+        let directory = path.parent().unwrap();
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            CredentialsStore::load(path.clone()),
+            Err(CredentialsError::NotFound)
+        ));
+        let mut store = CredentialsStore::new(path.clone());
+        store.save(credentials()).unwrap();
+        assert_eq!(
+            fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        fs::remove_file(&path).unwrap();
+        symlink("missing-target", &path).unwrap();
+        assert_eq!(reset(&path), Err(CredentialsError::UnsafeStorage));
+
+        fs::remove_file(&path).unwrap();
+        let target = directory.with_extension("reset-target");
+        fs::create_dir(&target).unwrap();
+        let target_credentials = target.join("credentials.json");
+        fs::write(&target_credentials, "credentials").unwrap();
+        fs::remove_dir(directory).unwrap();
+        symlink(&target, directory).unwrap();
+        assert_eq!(reset(&path), Err(CredentialsError::UnsafeStorage));
+        assert!(target_credentials.exists());
     }
 }
