@@ -3,7 +3,8 @@
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
 
-  outputs = { self, nixpkgs }:
+  outputs =
+    { self, nixpkgs }:
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
@@ -12,7 +13,8 @@
         version = "0.1.0";
         src = pkgs.lib.cleanSourceWith {
           src = self;
-          filter = path: type:
+          filter =
+            path: type:
             pkgs.lib.cleanSourceFilter path type
             && builtins.baseNameOf path != "result"
             && builtins.baseNameOf path != "target";
@@ -23,6 +25,13 @@
           wrapProgram $out/bin/lavis \
             --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.fastfetch ]}
         '';
+        meta = {
+          description = "Personal Telegram userbot written in Rust";
+          homepage = "https://github.com/zumuvik/lavis";
+          license = pkgs.lib.licenses.gpl3Only;
+          mainProgram = "lavis";
+          platforms = pkgs.lib.platforms.linux;
+        };
       };
     in
     {
@@ -32,7 +41,13 @@
         program = "${package}/bin/lavis";
       };
       devShells.${system}.default = pkgs.mkShell {
-        packages = with pkgs; [ cargo clippy rustc rustfmt fastfetch ];
+        packages = with pkgs; [
+          cargo
+          clippy
+          rustc
+          rustfmt
+          fastfetch
+        ];
       };
       checks.${system}.default = package;
     };

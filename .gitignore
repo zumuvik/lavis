@@ -3,6 +3,9 @@
 /result
 /result-*
 .env
+/.env.*
+/settings.json
+/aliases.json
 *.session
 *.session-journal
 *.session-shm
