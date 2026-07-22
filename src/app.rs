@@ -176,9 +176,9 @@ where
                     )?);
                     let credentials =
                         tokio::task::spawn_blocking(move || credentials::onboard(path))
-                        .await
-                        .map_err(|_| anyhow::anyhow!("credential onboarding task failed"))?
-                        .context("credential onboarding failed")?;
+                            .await
+                            .map_err(|_| anyhow::anyhow!("credential onboarding task failed"))?
+                            .context("credential onboarding failed")?;
                     Ok(ResolvedCredentials {
                         credentials,
                         newly_saved: true,
@@ -328,8 +328,7 @@ mod tests {
             CliCommand::Credentials
         );
         assert_eq!(
-            parse_cli(vec![OsString::from("credentials"), OsString::from("reset"),])
-            .unwrap(),
+            parse_cli(vec![OsString::from("credentials"), OsString::from("reset"),]).unwrap(),
             CliCommand::CredentialsReset
         );
         assert_eq!(

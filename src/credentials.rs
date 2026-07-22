@@ -572,10 +572,7 @@ mod tests {
         let old_bytes = fs::read(&path).unwrap();
         let oversized = Credentials::new(1, "x".repeat(MAX_FILE_BYTES)).unwrap();
         assert_eq!(store.save(oversized), Err(CredentialsError::FileTooLarge));
-        assert_eq!(
-            store.credentials(),
-            Some(&credentials())
-        );
+        assert_eq!(store.credentials(), Some(&credentials()));
         assert_eq!(fs::read(path).unwrap(), old_bytes);
     }
 
@@ -662,7 +659,10 @@ mod tests {
         assert_eq!(reset(&path), Ok(ResetResult::Removed));
         assert!(!path.exists());
         for name in ["session", "settings.json", "aliases.json"] {
-            assert_eq!(fs::read_to_string(directory.join(name)).unwrap(), "preserved");
+            assert_eq!(
+                fs::read_to_string(directory.join(name)).unwrap(),
+                "preserved"
+            );
         }
         assert_eq!(reset(&path), Ok(ResetResult::Absent));
         assert_eq!(
