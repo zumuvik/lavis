@@ -239,8 +239,8 @@ async fn initialize_dialog_cache(client: &grammers_client::Client) -> anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::{
-        logout_confirmed, parse_cli, remove_session_files, CliCommand,
-        NONINTERACTIVE_LOGOUT, NONINTERACTIVE_MISSING_CREDENTIALS,
+        CliCommand, NONINTERACTIVE_LOGOUT, NONINTERACTIVE_MISSING_CREDENTIALS, logout_confirmed,
+        parse_cli, remove_session_files,
     };
     use std::{
         ffi::OsString,

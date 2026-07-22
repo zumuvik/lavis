@@ -544,10 +544,10 @@ mod tests {
         let mut store = CredentialsStore::new(path.clone());
         store.save(credentials()).unwrap();
         let old_bytes = fs::read(&path).unwrap();
-        let temporary = path.parent().unwrap().join(format!(
-            ".credentials.json.{}.2.tmp",
-            std::process::id(),
-        ));
+        let temporary = path
+            .parent()
+            .unwrap()
+            .join(format!(".credentials.json.{}.2.tmp", std::process::id(),));
         fs::create_dir(&temporary).unwrap();
         assert_eq!(
             store.save(Credentials::new(2, "other-test-hash".to_owned()).unwrap()),
@@ -572,10 +572,10 @@ mod tests {
             }),
             Err(CredentialsError::Replace)
         );
-        let temporary = path.parent().unwrap().join(format!(
-            ".credentials.json.{}.2.tmp",
-            std::process::id()
-        ));
+        let temporary = path
+            .parent()
+            .unwrap()
+            .join(format!(".credentials.json.{}.2.tmp", std::process::id()));
         assert!(!temporary.exists());
         assert_eq!(store.credentials(), Some(&credentials()));
         assert_eq!(fs::read(path).unwrap(), old_bytes);
