@@ -135,18 +135,17 @@ where
     match credentials::resolve_environment(environment)? {
         Some(credentials) => Ok(credentials),
         None => {
-            let path = credentials::credentials_path(
-                config::ConfigPaths::config_dir_with(environment)?,
-            );
+            let path =
+                credentials::credentials_path(config::ConfigPaths::config_dir_with(environment)?);
             match tokio::task::spawn_blocking(move || credentials::resolve_stored(path))
                 .await
                 .map_err(|_| anyhow::anyhow!("credential storage task failed"))?
             {
                 Ok((credentials, _)) => Ok(credentials),
                 Err(crate::error::CredentialsError::NotFound) if credentials::interactive() => {
-                    let path = credentials::credentials_path(
-                        config::ConfigPaths::config_dir_with(environment)?,
-                    );
+                    let path = credentials::credentials_path(config::ConfigPaths::config_dir_with(
+                        environment,
+                    )?);
                     tokio::task::spawn_blocking(move || credentials::onboard(path))
                         .await
                         .map_err(|_| anyhow::anyhow!("credential onboarding task failed"))?
@@ -240,8 +239,8 @@ async fn initialize_dialog_cache(client: &grammers_client::Client) -> anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::{
-        CliCommand, NONINTERACTIVE_LOGOUT, NONINTERACTIVE_MISSING_CREDENTIALS, logout_confirmed,
-        parse_cli, remove_session_files,
+        logout_confirmed, parse_cli, remove_session_files, CliCommand,
+        NONINTERACTIVE_LOGOUT, NONINTERACTIVE_MISSING_CREDENTIALS,
     };
     use std::{
         ffi::OsString,
@@ -252,8 +251,14 @@ mod tests {
     #[test]
     fn accepts_only_documented_cli_forms() {
         assert_eq!(parse_cli(Vec::new()).unwrap(), CliCommand::Run);
-        assert_eq!(parse_cli(vec![OsString::from("run")]).unwrap(), CliCommand::Run);
-        assert_eq!(parse_cli(vec![OsString::from("auth")]).unwrap(), CliCommand::Auth);
+        assert_eq!(
+            parse_cli(vec![OsString::from("run")]).unwrap(),
+            CliCommand::Run
+        );
+        assert_eq!(
+            parse_cli(vec![OsString::from("auth")]).unwrap(),
+            CliCommand::Auth
+        );
         assert_eq!(
             parse_cli(vec![OsString::from("credentials")]).unwrap(),
             CliCommand::Credentials
@@ -276,7 +281,10 @@ mod tests {
 
     #[test]
     fn noninteractive_logout_message_is_exact() {
-        assert_eq!(NONINTERACTIVE_LOGOUT, "logout requires an interactive terminal");
+        assert_eq!(
+            NONINTERACTIVE_LOGOUT,
+            "logout requires an interactive terminal"
+        );
     }
 
     #[test]
@@ -305,9 +313,7 @@ mod tests {
         }
         remove_session_files(&session).unwrap();
         for suffix in ["", "-journal", "-wal", "-shm"] {
-            assert!(
-                !std::path::PathBuf::from(format!("{}{}", session.display(), suffix)).exists()
-            );
+            assert!(!std::path::PathBuf::from(format!("{}{}", session.display(), suffix)).exists());
         }
         for name in ["settings.json", "aliases.json", "credentials.json"] {
             assert_eq!(

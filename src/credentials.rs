@@ -9,7 +9,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    config::{validate_api_hash, validate_api_id, API_HASH_ENV, API_ID_ENV},
+    config::{API_HASH_ENV, API_ID_ENV, validate_api_hash, validate_api_id},
     error::{ConfigError, CredentialsError},
 };
 
@@ -149,8 +149,8 @@ pub fn onboard(path: PathBuf) -> Result<Credentials, CredentialsError> {
     let api_id = prompt("Telegram API ID: ")?
         .parse()
         .map_err(|_| CredentialsError::InvalidApiId)?;
-    let api_hash = rpassword::prompt_password("Telegram API hash: ")
-        .map_err(|_| CredentialsError::Read)?;
+    let api_hash =
+        rpassword::prompt_password("Telegram API hash: ").map_err(|_| CredentialsError::Read)?;
     let credentials = map_config_error(Credentials::new(api_id, api_hash))?;
 
     println!("{ONBOARDING_DISCLAIMER}");
@@ -530,9 +530,7 @@ mod tests {
     #[test]
     fn debug_and_errors_do_not_expose_hash() {
         let credentials = credentials();
-        assert!(
-            !format!("{credentials:?}").contains(credentials.api_hash())
-        );
+        assert!(!format!("{credentials:?}").contains(credentials.api_hash()));
         assert!(
             !CredentialsError::InvalidApiHash
                 .to_string()
