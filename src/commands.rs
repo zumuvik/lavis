@@ -13,36 +13,37 @@ pub enum CommandKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandRisk {
+    ReadOnly,
+    PersistentStateChange,
+    RestrictedProcess,
+    ArbitraryProcess,
+    Privileged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandDefinition {
     pub kind: CommandKind,
     pub name: &'static str,
     pub usage: &'static str,
-    pub summary: &'static str,
-    pub description: &'static str,
+    pub summary_ru: &'static str,
+    pub description_ru: &'static str,
+    pub examples: &'static [&'static str],
+    pub risk: CommandRisk,
     pub icon: &'static str,
     pub aliasable: bool,
     pub module: ModuleId,
 }
 
-pub struct CommandRegistry([CommandDefinition; 7]);
-
-impl CommandRegistry {
-    pub fn iter(&self) -> impl Iterator<Item = &CommandDefinition> {
-        self.0.iter()
-    }
-
-    pub fn canonical_iter(&self) -> impl Iterator<Item = &CommandDefinition> {
-        self.0.iter()
-    }
-}
-
-pub const COMMANDS: CommandRegistry = CommandRegistry([
+const COMMAND_SPECS: [CommandDefinition; 7] = [
     CommandDefinition {
         kind: CommandKind::Help,
         name: "help",
         usage: "help [command]",
-        summary: "Show command help",
-        description: "Shows the command overview or detailed help for a command, alias, or module.",
+        summary_ru: "Показать справку",
+        description_ru: "Показывает обзор команд или подробную справку о команде, псевдониме либо модуле.",
+        examples: &["help", "help fastfetch"],
+        risk: CommandRisk::ReadOnly,
         icon: "🛠",
         aliasable: true,
         module: ModuleId::Core,
@@ -51,8 +52,10 @@ pub const COMMANDS: CommandRegistry = CommandRegistry([
         kind: CommandKind::Modules,
         name: "modules",
         usage: "modules",
-        summary: "List internal modules",
-        description: "Lists the statically registered Lavis modules and their commands.",
+        summary_ru: "Список внутренних модулей",
+        description_ru: "Перечисляет статически зарегистрированные модули Lavis и их команды.",
+        examples: &["modules"],
+        risk: CommandRisk::ReadOnly,
         icon: "🧩",
         aliasable: true,
         module: ModuleId::Core,
@@ -61,8 +64,10 @@ pub const COMMANDS: CommandRegistry = CommandRegistry([
         kind: CommandKind::Ping,
         name: "ping",
         usage: "ping",
-        summary: "Measure Telegram latency",
-        description: "Measures a real Telegram MTProto RPC round-trip over the existing authenticated connection.",
+        summary_ru: "Измерить задержку Telegram",
+        description_ru: "Измеряет время реального MTProto RPC-запроса через текущую авторизованную сессию.",
+        examples: &["ping"],
+        risk: CommandRisk::ReadOnly,
         icon: "🏓",
         aliasable: true,
         module: ModuleId::Core,
@@ -71,8 +76,10 @@ pub const COMMANDS: CommandRegistry = CommandRegistry([
         kind: CommandKind::Prefix,
         name: "prefix",
         usage: "prefix [new-prefix|reset]",
-        summary: "Show or change the command prefix",
-        description: "Shows the active prefix or persists a new prefix.",
+        summary_ru: "Показать или изменить префикс",
+        description_ru: "Показывает активный префикс или сохраняет новый.",
+        examples: &["prefix", "prefix .", "prefix reset"],
+        risk: CommandRisk::PersistentStateChange,
         icon: "⚙️",
         aliasable: false,
         module: ModuleId::Core,
@@ -81,8 +88,10 @@ pub const COMMANDS: CommandRegistry = CommandRegistry([
         kind: CommandKind::Stats,
         name: "stats",
         usage: "stats",
-        summary: "Show runtime statistics",
-        description: "Shows fresh Telegram RPC latency, Lavis process uptime, host uptime, resident memory, command count, and package version.",
+        summary_ru: "Показать статистику работы",
+        description_ru: "Показывает задержку Telegram, время работы Lavis и хоста, память, число команд и версию пакета.",
+        examples: &["stats"],
+        risk: CommandRisk::ReadOnly,
         icon: "📊",
         aliasable: true,
         module: ModuleId::Core,
@@ -91,8 +100,10 @@ pub const COMMANDS: CommandRegistry = CommandRegistry([
         kind: CommandKind::Fastfetch,
         name: "fastfetch",
         usage: "fastfetch [--no-profile] [--logo <...>] [--structure <...>] [--separator <text>]",
-        summary: "Показать системную информацию",
-        description: "Разрешены только --no-profile, --logo none|Alpine|Arch|Debian|Fedora|FreeBSD|Linux|MacOS|NixOS|OpenBSD|Ubuntu|Windows, --structure из title:separator:os:kernel:uptime:cpu:memory:gpu:packages:shell:terminal:terminalsize и --separator.",
+        summary_ru: "Показать системную информацию",
+        description_ru: "Запускает Fastfetch только с ограниченными безопасными параметрами отображения.",
+        examples: &["fastfetch", "fastfetch --logo arch", "fastfetch --no-profile"],
+        risk: CommandRisk::RestrictedProcess,
         icon: "🖥",
         aliasable: true,
         module: ModuleId::System,
@@ -101,13 +112,33 @@ pub const COMMANDS: CommandRegistry = CommandRegistry([
         kind: CommandKind::Alias,
         name: "alias",
         usage: "alias [list|add <name> <command> [arguments...]|show <name>|del <name>]",
-        summary: "Manage command aliases",
-        description: "Manages persistent aliases for canonical commands.",
+        summary_ru: "Управлять псевдонимами команд",
+        description_ru: "Создаёт, показывает и удаляет постоянные псевдонимы канонических команд.",
+        examples: &["alias list", "alias add sys fastfetch", "alias del sys"],
+        risk: CommandRisk::PersistentStateChange,
         icon: "🔗",
         aliasable: false,
         module: ModuleId::Aliases,
     },
-]);
+];
+
+pub fn commands() -> &'static [CommandDefinition] {
+    &COMMAND_SPECS
+}
+
+pub fn command_by_kind(kind: CommandKind) -> Option<&'static CommandDefinition> {
+    commands().iter().find(|command| command.kind == kind)
+}
+
+pub fn command_by_name(name: &str) -> Option<&'static CommandDefinition> {
+    commands()
+        .iter()
+        .find(|command| command.name.eq_ignore_ascii_case(name))
+}
+
+pub fn module_for_command(command: &CommandDefinition) -> Option<&'static crate::modules::ModuleSpec> {
+    crate::modules::module_by_id(command.module)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HelpRequest {
@@ -180,9 +211,7 @@ pub fn dispatch(command: &Command) -> Option<Action> {
 }
 
 pub fn definition(kind: CommandKind) -> &'static CommandDefinition {
-    COMMANDS
-        .canonical_iter()
-        .find(|command| command.kind == kind)
+    command_by_kind(kind)
         .unwrap_or_else(|| unreachable!("all CommandKind values are registered"))
 }
 
@@ -235,9 +264,7 @@ fn parse_alias_request(args: &str) -> AliasRequest {
 }
 
 pub fn canonical_command(name: &str) -> Option<&'static CommandDefinition> {
-    COMMANDS
-        .canonical_iter()
-        .find(|command| command.name == name)
+    commands().iter().find(|command| command.name == name)
 }
 
 fn parse_help_request(args: &str) -> HelpRequest {
@@ -254,10 +281,13 @@ fn parse_help_request(args: &str) -> HelpRequest {
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, AliasRequest, COMMANDS, HelpRequest, ModulesRequest, dispatch};
+    use super::{
+        Action, AliasRequest, CommandKind, CommandRisk, HelpRequest, ModulesRequest,
+        command_by_kind, command_by_name, commands, dispatch, module_for_command,
+    };
     use crate::command::Command;
     use crate::modules::{
-        MODULES, ModuleId, commands_for_module, module_by_name, module_definition,
+        ModuleId, commands_for_module, module_by_name, module_definition, modules,
     };
     use std::collections::HashSet;
 
@@ -337,10 +367,7 @@ mod tests {
 
     #[test]
     fn registry_invariants_and_ownership_are_complete() {
-        let names = COMMANDS
-            .canonical_iter()
-            .map(|definition| definition.name)
-            .collect::<Vec<_>>();
+        let names = commands().iter().map(|definition| definition.name).collect::<Vec<_>>();
         assert_eq!(
             names,
             [
@@ -353,35 +380,35 @@ mod tests {
                 "alias"
             ]
         );
-        let module_names = MODULES.iter().map(|module| module.name).collect::<Vec<_>>();
+        let module_names = modules().iter().map(|module| module.name).collect::<Vec<_>>();
         assert_eq!(module_names, ["core", "system", "aliases"]);
         assert_eq!(
             module_names.iter().copied().collect::<HashSet<_>>().len(),
-            MODULES.len()
+            modules().len()
         );
         assert_eq!(
-            MODULES
+            modules()
                 .iter()
                 .map(|module| module.id)
                 .collect::<HashSet<_>>()
                 .len(),
-            MODULES.len()
+            modules().len()
         );
         assert_eq!(
             names.iter().copied().collect::<HashSet<_>>().len(),
             names.len()
         );
         assert_eq!(
-            COMMANDS
-                .canonical_iter()
+            commands()
+                .iter()
                 .map(|definition| definition.kind)
                 .collect::<HashSet<_>>()
                 .len(),
             names.len()
         );
-        assert!(MODULES.iter().all(|module| !module.description.is_empty()));
+        assert!(modules().iter().all(|module| !module.description_ru.is_empty()));
         assert!(
-            MODULES
+            modules()
                 .iter()
                 .all(|module| commands_for_module(module.id).next().is_some())
         );
@@ -391,12 +418,12 @@ mod tests {
             Some(ModuleId::Core)
         );
         assert_eq!(module_definition(ModuleId::Aliases).name, "aliases");
-        for definition in COMMANDS.canonical_iter() {
+        for definition in commands() {
             assert!(!definition.usage.is_empty());
-            assert!(!definition.summary.is_empty());
-            assert!(!definition.description.is_empty());
+            assert!(!definition.summary_ru.is_empty());
+            assert!(!definition.description_ru.is_empty());
             assert!(!definition.icon.is_empty());
-            assert!(MODULES.iter().any(|module| module.id == definition.module));
+            assert!(modules().iter().any(|module| module.id == definition.module));
             if matches!(definition.name, "alias" | "prefix") {
                 assert!(!definition.aliasable);
                 continue;
@@ -425,6 +452,69 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["alias"]
         );
+    }
+
+    #[test]
+    fn static_registry_api_has_complete_safe_metadata() {
+        let command_names = commands().iter().map(|command| command.name).collect::<Vec<_>>();
+        assert_eq!(
+            command_names
+                .iter()
+                .map(|name| name.to_ascii_lowercase())
+                .collect::<HashSet<_>>()
+                .len(),
+            command_names.len()
+        );
+        assert_eq!(
+            commands()
+                .iter()
+                .map(|command| command.kind)
+                .collect::<HashSet<_>>()
+                .len(),
+            commands().len()
+        );
+        assert_eq!(command_by_name("PING").map(|command| command.kind), Some(CommandKind::Ping));
+        assert_eq!(command_by_kind(CommandKind::Fastfetch).map(|command| command.name), Some("fastfetch"));
+
+        for command in commands() {
+            assert!(!command.usage.is_empty());
+            assert!(!command.summary_ru.is_empty());
+            assert!(!command.description_ru.is_empty());
+            assert!(!command.icon.is_empty());
+            assert!(!command.examples.is_empty());
+            assert!(command.examples.iter().all(|example| {
+                !example.starts_with(',')
+                    && !example.starts_with('.')
+                    && example.split_whitespace().next() == Some(command.name)
+            }));
+            assert!(module_for_command(command).is_some());
+            assert!(!matches!(command.risk, CommandRisk::ArbitraryProcess | CommandRisk::Privileged));
+        }
+        assert_eq!(
+            crate::modules::modules()
+                .iter()
+                .map(|module| crate::modules::commands_for_module(module.id).count())
+                .sum::<usize>(),
+            commands().len()
+        );
+        assert_eq!(
+            command_by_kind(CommandKind::Fastfetch).unwrap().risk,
+            CommandRisk::RestrictedProcess
+        );
+        for kind in [
+            CommandKind::Help,
+            CommandKind::Modules,
+            CommandKind::Ping,
+            CommandKind::Stats,
+        ] {
+            assert_eq!(command_by_kind(kind).unwrap().risk, CommandRisk::ReadOnly);
+        }
+        for kind in [CommandKind::Prefix, CommandKind::Alias] {
+            assert_eq!(
+                command_by_kind(kind).unwrap().risk,
+                CommandRisk::PersistentStateChange
+            );
+        }
     }
 
     #[test]

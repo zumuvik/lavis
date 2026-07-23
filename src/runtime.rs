@@ -12,8 +12,7 @@ use crate::{
     command::Command,
     commands::{Action, AliasRequest, ModulesRequest, PrefixRequest, dispatch},
     fastfetch::{self, FastfetchInputError, FastfetchProfileError, FastfetchResult},
-    help::render,
-    modules::{MODULES, commands_for_module},
+    help::{render, render_modules_overview},
     response::Response,
     settings::{DEFAULT_PREFIX, SettingsStore},
 };
@@ -140,12 +139,7 @@ impl RuntimeState {
                 ))
             }
             Action::Help(request) => {
-                let rendered = render(
-                    request,
-                    &prefix,
-                    &self.aliases,
-                    &self.fastfetch_profile_path,
-                );
+                let rendered = render(request, &prefix, &self.aliases);
                 if rendered.entity_fallback {
                     tracing::warn!(
                         event = "help_entity_fallback",
@@ -168,32 +162,13 @@ impl RuntimeState {
     fn execute_modules(&self, request: &ModulesRequest, prefix: &str) -> Response {
         match request {
             ModulesRequest::Overview => {
-                let command_count = crate::commands::COMMANDS.canonical_iter().count();
                 tracing::info!(
                     event = "modules_overview",
-                    module_count = MODULES.len(),
-                    command_count,
+                    module_count = crate::modules::modules().len(),
+                    command_count = crate::commands::commands().len(),
                     "Rendered module overview"
                 );
-                let rendered = Response::collapsed(
-                    "🧩 Lavis modules".to_owned(),
-                    MODULES
-                        .iter()
-                        .map(|module| {
-                            let commands = commands_for_module(module.id)
-                                .map(|command| format!("{prefix}{}", command.name))
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            format!(
-                                "{} {} ({}): {commands}",
-                                module.icon,
-                                module.name,
-                                commands_for_module(module.id).count()
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                );
+                let rendered = render_modules_overview(prefix);
                 if rendered.entity_fallback {
                     tracing::warn!(
                         event = "modules_entity_fallback",
@@ -202,7 +177,7 @@ impl RuntimeState {
                 }
                 rendered.response
             }
-            ModulesRequest::Invalid => Response::plain(format!("⚠️ Usage: {prefix}modules")),
+            ModulesRequest::Invalid => Response::plain(format!("⚠️ Использование: {prefix}modules")),
         }
     }
 
@@ -616,37 +591,34 @@ mod tests {
             .await;
         let overview =
             runtime.execute_modules(&crate::commands::ModulesRequest::Overview, runtime.prefix());
-        assert_eq!(
-            overview.text,
-            "🧩 Lavis modules\n\n🧩 core (5): 🦀help, 🦀modules, 🦀ping, 🦀prefix, 🦀stats\n🖥 system (1): 🦀fastfetch\n🔗 aliases (1): 🦀alias"
-        );
-        assert_eq!(overview.entities.len(), 1);
+        assert!(overview.text.starts_with("🧩 Модули Lavis: 3\n\n"));
+        assert!(overview.text.contains("🦀fastfetch"));
+        assert!(overview.text.contains("Команды (7)"));
+        assert_eq!(overview.entities.len(), 2);
         assert_eq!(
             runtime.execute_modules(&crate::commands::ModulesRequest::Invalid, runtime.prefix()),
-            Response::plain("⚠️ Usage: 🦀modules")
+            Response::plain("⚠️ Использование: 🦀modules")
         );
-        let entity = &overview.entities[0];
-        let grammers_client::tl::enums::MessageEntity::Blockquote(entity) = entity else {
+        let grammers_client::tl::enums::MessageEntity::Blockquote(entity) = &overview.entities[0] else {
             panic!("expected blockquote")
         };
         let units = overview.text.encode_utf16().collect::<Vec<_>>();
         let offset = usize::try_from(entity.offset).unwrap();
         let length = usize::try_from(entity.length).unwrap();
-        assert_eq!(
-            String::from_utf16(&units[..offset]).unwrap(),
-            "🧩 Lavis modules\n\n"
-        );
-        assert_eq!(
-            String::from_utf16(&units[offset..offset + length]).unwrap(),
-            "🧩 core (5): 🦀help, 🦀modules, 🦀ping, 🦀prefix, 🦀stats\n🖥 system (1): 🦀fastfetch\n🔗 aliases (1): 🦀alias"
-        );
-        assert_eq!(
-            length,
-            "🧩 core (5): 🦀help, 🦀modules, 🦀ping, 🦀prefix, 🦀stats\n🖥 system (1): 🦀fastfetch\n🔗 aliases (1): 🦀alias"
-                .encode_utf16()
-                .count()
-        );
+        assert_eq!(String::from_utf16(&units[..offset]).unwrap(), "🧩 Модули Lavis: 3\n\n");
+        let body = String::from_utf16(&units[offset..offset + length]).unwrap();
+        assert!(body.contains("Команды (7)"));
+        let grammers_client::tl::enums::MessageEntity::Blockquote(provenance) = &overview.entities[1] else {
+            panic!("expected provenance blockquote")
+        };
         assert!(entity.collapsed);
+        assert!(!provenance.collapsed);
+        let provenance_offset = usize::try_from(provenance.offset).unwrap();
+        let provenance_length = usize::try_from(provenance.length).unwrap();
+        assert_eq!(
+            String::from_utf16(&units[provenance_offset..provenance_offset + provenance_length]).unwrap(),
+            "Это встроенный модуль Lavis. Его нельзя выгрузить или заменить."
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 

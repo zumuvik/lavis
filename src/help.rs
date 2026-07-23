@@ -1,10 +1,16 @@
 pub use crate::response::Response;
-use std::path::Path;
 
 use crate::{
     aliases::AliasStore,
-    commands::{CommandKind, HelpRequest, canonical_command},
-    modules::{commands_for_module, module_by_name},
+    commands::{
+        CommandDefinition, CommandRisk, HelpRequest, canonical_command, command_by_name,
+        commands, module_for_command,
+    },
+    modules::{
+        ModuleCapability, ModuleOrigin, ModuleSpec, commands_for_module, module_by_name, modules,
+        validate_external_origin,
+    },
+    response::RenderedResponse,
 };
 
 pub struct RenderedHelp {
@@ -12,156 +18,236 @@ pub struct RenderedHelp {
     pub entity_fallback: bool,
 }
 
-pub fn render(
-    request: &HelpRequest,
-    prefix: &str,
-    aliases: &AliasStore,
-    fastfetch_profile_path: &Path,
-) -> RenderedHelp {
+pub fn render(request: &HelpRequest, prefix: &str, aliases: &AliasStore) -> RenderedHelp {
     match request {
         HelpRequest::Overview => render_overview(prefix),
-        HelpRequest::Topic(topic) => render_topic(topic, prefix, aliases, fastfetch_profile_path),
-        HelpRequest::Invalid => RenderedHelp {
-            response: Response::plain(format!("⚠️ Usage: {prefix}help [command]")),
-            entity_fallback: false,
-        },
+        HelpRequest::Topic(topic) => render_topic(topic, prefix, aliases),
+        HelpRequest::Invalid => plain(format!("⚠️ Использование: {prefix}help [команда]")),
     }
 }
 
-fn render_overview(prefix: &str) -> RenderedHelp {
-    render_quote(
-        "🛠 Lavis commands".to_owned(),
-        crate::modules::MODULES
-            .iter()
-            .map(|module| {
-                let commands = commands_for_module(module.id)
-                    .map(|definition| {
-                        format!("{prefix}{} — {}", definition.usage, definition.summary)
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                format!(
-                    "{} {} ({})\n{}",
-                    module.icon,
-                    module.name,
-                    commands_for_module(module.id).count(),
-                    commands
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n"),
+pub fn render_modules_overview(prefix: &str) -> RenderedHelp {
+    let module_names = modules()
+        .iter()
+        .map(|module| format!("{} {}", module.icon, module.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let command_names = commands()
+        .iter()
+        .map(|command| format!("{prefix}{}", command.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    documentation(
+        format!("🧩 Модули Lavis: {}", modules().len()),
+        format!(
+            "Модули: {module_names}\nКоманды ({}): {command_names}\n\nИспользуйте {prefix}help <команда или модуль> для подробностей.",
+            commands().len()
+        ),
+        core_provenance(),
     )
 }
 
-fn render_alias(topic: &str, prefix: &str, aliases: &AliasStore) -> Option<RenderedHelp> {
-    let alias = aliases.lookup(topic)?;
-    let preset = if alias.args.is_empty() {
-        String::new()
-    } else {
-        format!(" {}", shell_words::join(&alias.args))
-    };
-    Some(render_quote(
-        format!("🔗 {prefix}{topic}"),
-        format!(
-            "Alias for {prefix}{}{preset}\n\nUsage: {prefix}{topic} [arguments]",
-            alias.target
-        ),
-    ))
+fn render_module_card(module: &ModuleSpec, prefix: &str) -> RenderedHelp {
+    if !validate_external_origin(&module.origin) {
+        return documentation(
+            "⚠️ Некорректные метаданные происхождения модуля".to_owned(),
+            "Внешние данные модуля не отображаются.".to_owned(),
+            "⚠️ Метаданные происхождения отклонены ядром Lavis.".to_owned(),
+        );
+    }
+    let command_list = commands_for_module(module.id)
+        .map(|command| format!("{prefix}{} — {}", command.usage, command.summary_ru))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let primary = format!(
+        "{}\n\nКоманды:\n{command_list}\n\nВозможности: {}\nПолитика: {}",
+        module.description_ru,
+        capability_labels(module.capabilities),
+        module_policy(module)
+    );
+    documentation(
+        format!("{} Модуль {}", module.icon, module.name),
+        primary,
+        module_provenance(module),
+    )
 }
 
-fn render_topic(
-    topic: &str,
-    prefix: &str,
-    aliases: &AliasStore,
-    fastfetch_profile_path: &Path,
-) -> RenderedHelp {
-    // Topic precedence is deliberate: canonical commands cannot be shadowed by aliases,
-    // while an existing alias named after a module remains useful.
-    if let Some(definition) = canonical_command(&topic.to_ascii_lowercase()) {
-        return render_command(definition, prefix, fastfetch_profile_path);
+fn render_overview(prefix: &str) -> RenderedHelp {
+    let body = modules()
+        .iter()
+        .map(|module| {
+            let names = commands_for_module(module.id)
+                .map(|command| format!("{prefix}{}", command.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{} {}: {names}", module.icon, module.name)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    documentation(
+        format!("🛠 Справка Lavis: {} модулей, {} команд", modules().len(), commands().len()),
+        format!("{body}\n\nИспользуйте {prefix}help <команда или модуль> для подробностей."),
+        core_provenance(),
+    )
+}
+
+fn render_topic(topic: &str, prefix: &str, aliases: &AliasStore) -> RenderedHelp {
+    if let Some(command) = canonical_command(topic) {
+        return render_command_card(command, prefix);
     }
     if let Some(rendered) = render_alias(topic, prefix, aliases) {
         return rendered;
     }
     if let Some(module) = module_by_name(topic) {
-        return render_quote(
-            format!("{} {} module", module.icon, module.name),
-            format!(
-                "{}\n\n{}",
-                module.description,
-                commands_for_module(module.id)
-                    .map(|definition| format!(
-                        "{prefix}{} — {}",
-                        definition.usage, definition.summary
-                    ))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            ),
-        );
+        return render_module_card(module, prefix);
     }
+    plain(format!(
+        "❓ Неизвестная команда или модуль: {topic}\nИспользуйте {prefix}help для списка команд."
+    ))
+}
+
+fn render_command_card(command: &CommandDefinition, prefix: &str) -> RenderedHelp {
+    let Some(module) = module_for_command(command) else {
+        return plain(format!("⚠️ Метаданные команды {prefix}{} недоступны", command.name));
+    };
+    let primary = if command.name == "fastfetch" {
+        fastfetch_primary(prefix, command, module.name)
+    } else {
+        generic_command_primary(command, prefix, module.name)
+    };
+    documentation(
+        format!("{} {prefix}{}", command.icon, command.usage),
+        primary,
+        module_provenance(module),
+    )
+}
+
+fn generic_command_primary(command: &CommandDefinition, prefix: &str, module_name: &str) -> String {
+    let examples = command
+        .examples
+        .iter()
+        .map(|example| format!("{prefix}{example}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "{}\n\nИспользование: {prefix}{}\nМодуль: {module_name}\nРиск: {}\nПримеры:\n{examples}",
+        command.description_ru,
+        command.usage,
+        risk_label(command.risk)
+    )
+}
+
+fn fastfetch_primary(prefix: &str, command: &CommandDefinition, module_name: &str) -> String {
+    format!(
+        "{}\n\nИспользование: {prefix}{}\nМодуль: {module_name}\nРиск: {}\nПримеры: {prefix}fastfetch --logo arch; {prefix}fastfetch --structure OS:Kernel:CPU.\n\nЛоготипы: none, Alpine, Arch, Debian, Fedora, FreeBSD, Linux, MacOS, NixOS, OpenBSD, Ubuntu, Windows.\nСтруктура: title, separator, os, kernel, uptime, cpu, memory, gpu, packages, shell, terminal, terminalsize, host, display, wm, de, theme, icons, font, cursor, disk, swap, localip, battery, poweradapter, locale.\nРазделитель: 1–64 печатных ASCII-символа.\n\n{prefix}fastfetch --no-profile не читает профиль. Профиль: $XDG_CONFIG_HOME/lavis/fastfetch.json или $HOME/.config/lavis/fastfetch.json.\nМинимальный JSON: {{ \"version\": 1 }}\nПриоритет: значения Fastfetch по умолчанию < профиль < параметры команды.\nПсевдоним: {prefix}alias add sys fastfetch --logo arch; затем {prefix}sys.\n\nКавычки группируют аргументы для разбора shell-words; оболочка не запускается, а shell-метасимволы остаются данными. Каждый процесс запускается только с --config none --pipe; нативные конфиги и пресеты Fastfetch запрещены. Вывод может раскрыть данные хоста, сети, дисплея, питания и оборудования.",
+        command.description_ru,
+        command.usage,
+        risk_label(command.risk)
+    )
+}
+
+fn render_alias(topic: &str, prefix: &str, aliases: &AliasStore) -> Option<RenderedHelp> {
+    let alias = aliases.lookup(topic)?;
+    let command = command_by_name(&alias.target)?;
+    let module = module_for_command(command)?;
+    let stored = if alias.args.is_empty() {
+        "нет".to_owned()
+    } else {
+        shell_words::join(&alias.args)
+    };
+    Some(documentation(
+        format!("🔗 {prefix}{topic}"),
+        format!(
+            "Псевдоним вызывает {prefix}{}; аргументы вызова добавляются после сохранённых аргументов.\nСохранённые аргументы: {stored}\nЦелевой модуль: {}\nРиск цели: {}",
+            command.name,
+            module.name,
+            risk_label(command.risk)
+        ),
+        module_provenance(module),
+    ))
+}
+
+fn capability_labels(capabilities: &[ModuleCapability]) -> String {
+    capabilities
+        .iter()
+        .map(|capability| match capability {
+            ModuleCapability::TelegramRpc => "Telegram RPC",
+            ModuleCapability::PersistentStateRead => "чтение постоянного состояния",
+            ModuleCapability::PersistentStateWrite => "изменение постоянного состояния",
+            ModuleCapability::HostInformation => "сведения о хосте",
+            ModuleCapability::RestrictedProcess => "ограниченный процесс",
+            ModuleCapability::Network => "сеть",
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn module_policy(module: &ModuleSpec) -> String {
+    format!(
+        "выгрузка: {}; замена: {}",
+        if module.unloadable { "разрешена" } else { "запрещена" },
+        if module.replaceable { "разрешена" } else { "запрещена" }
+    )
+}
+
+fn module_provenance(module: &ModuleSpec) -> String {
+    match module.origin {
+        ModuleOrigin::Builtin => {
+            "Это встроенный модуль Lavis. Его нельзя выгрузить или заменить.".to_owned()
+        }
+        ModuleOrigin::External {
+            author,
+            version,
+            source,
+        } => format!(
+            "Внешний модуль. Автор: {author}; версия: {version}; источник: {source}; возможности: {}; {}.",
+            capability_labels(module.capabilities),
+            module_policy(module)
+        ),
+    }
+}
+
+fn core_provenance() -> String {
+    "Это встроенный модуль Lavis. Его нельзя выгрузить или заменить.".to_owned()
+}
+
+fn risk_label(risk: CommandRisk) -> &'static str {
+    match risk {
+        CommandRisk::ReadOnly => "только чтение",
+        CommandRisk::PersistentStateChange => "изменение постоянного состояния",
+        CommandRisk::RestrictedProcess => "ограниченный процесс",
+        CommandRisk::ArbitraryProcess => "произвольный процесс",
+        CommandRisk::Privileged => "привилегированная операция",
+    }
+}
+
+fn documentation(heading: String, primary: String, provenance: String) -> RenderedHelp {
+    let RenderedResponse {
+        response,
+        entity_fallback,
+    } = Response::documentation_card(heading, primary, provenance);
     RenderedHelp {
-        response: Response::plain(format!(
-            "❓ Unknown command: {topic}\nUse {prefix}help to list available commands."
-        )),
+        response,
+        entity_fallback,
+    }
+}
+
+fn plain(text: String) -> RenderedHelp {
+    RenderedHelp {
+        response: Response::plain(text),
         entity_fallback: false,
-    }
-}
-
-fn render_command(
-    definition: &crate::commands::CommandDefinition,
-    prefix: &str,
-    fastfetch_profile_path: &Path,
-) -> RenderedHelp {
-    if definition.kind == CommandKind::Fastfetch {
-        return render_fastfetch_help(prefix, fastfetch_profile_path);
-    }
-    render_quote(
-        format!("{} {prefix}{}", definition.icon, definition.usage),
-        format!(
-            "{}\n\nUsage: {prefix}{}",
-            definition.description, definition.usage
-        ),
-    )
-}
-
-fn render_fastfetch_help(prefix: &str, profile_path: &Path) -> RenderedHelp {
-    render_quote(
-        format!("🖥 {prefix}fastfetch"),
-        format!(
-            "Безопасный вывод Fastfetch. Примеры: {prefix}fastfetch --logo arch; {prefix}fastfetch --structure OS:Kernel:CPU.\n\nЛоготипы: none, Alpine, Arch, Debian, Fedora, FreeBSD, Linux, MacOS, NixOS, OpenBSD, Ubuntu, Windows (регистр ASCII не важен).\nСтруктура: title, separator, os, kernel, uptime, cpu, memory, gpu, packages, shell, terminal, terminalsize, host, display, wm, de, theme, icons, font, cursor, disk, swap, localip, battery, poweradapter, locale.\n\n{prefix}fastfetch --no-profile не читает профиль. Профиль: {profile_path:?}\nМинимальный JSON: {{ \"version\": 1 }}\nПриоритет: Fastfetch по умолчанию < профиль < параметры команды.\nПсевдоним: {prefix}alias add sys fastfetch --logo arch; затем {prefix}sys.\n\nКаждый процесс запускается только с --config none --pipe; нативные конфиги и пресеты Fastfetch запрещены. Кавычки разбираются как литералы, оболочка не запускается. Вывод может раскрыть сведения о хосте (включая дисплей, сеть, питание и оборудование)."
-        ),
-    )
-}
-
-fn render_quote(heading: String, body: String) -> RenderedHelp {
-    let rendered = Response::collapsed(heading, body);
-    RenderedHelp {
-        response: rendered.response,
-        entity_fallback: rendered.entity_fallback,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{RenderedHelp, Response, render as render_with_path};
+    use super::{render, render_module_card, render_modules_overview};
     use crate::{
         aliases::{Alias, AliasStore},
-        commands::{CommandKind, HelpRequest, definition},
+        commands::HelpRequest,
+        modules::{ModuleCapability, ModuleId, ModuleOrigin, ModuleSpec},
     };
-    use std::{
-        fs,
-        path::{Path, PathBuf},
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
-    fn render(request: &HelpRequest, prefix: &str, aliases: &AliasStore) -> RenderedHelp {
-        render_with_path(
-            request,
-            prefix,
-            aliases,
-            Path::new("/tmp/lavis-help-fastfetch.json"),
-        )
-    }
+    use std::{fs, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
 
     async fn aliases() -> AliasStore {
         AliasStore::load(PathBuf::from("/nonexistent/lavis-help-aliases.json"))
@@ -169,23 +255,17 @@ mod tests {
             .unwrap()
     }
 
-    async fn aliases_with_mini() -> (AliasStore, PathBuf) {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let directory =
-            std::env::temp_dir().join(format!("lavis-help-alias-{}-{nonce}", std::process::id()));
+    async fn aliases_with_core_alias() -> (AliasStore, PathBuf) {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let directory = std::env::temp_dir().join(format!("lavis-help-{nonce}"));
         fs::create_dir_all(&directory).unwrap();
-        let mut aliases = AliasStore::load(directory.join("aliases.json"))
-            .await
-            .unwrap();
+        let mut aliases = AliasStore::load(directory.join("aliases.json")).await.unwrap();
         aliases
             .add(
-                "mini",
+                "core",
                 Alias {
                     target: "fastfetch".to_owned(),
-                    args: Vec::new(),
+                    args: vec!["--logo".to_owned(), "arch".to_owned()],
                 },
             )
             .await
@@ -194,163 +274,146 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn overview_uses_registry_order_and_configured_prefix_once_per_command() {
-        let response = render(&HelpRequest::Overview, "!", &aliases().await).response;
-
-        assert_eq!(
-            response.text,
-            "🛠 Lavis commands\n\n🧩 core (5)\n!help [command] — Show command help\n!modules — List internal modules\n!ping — Measure Telegram latency\n!prefix [new-prefix|reset] — Show or change the command prefix\n!stats — Show runtime statistics\n\n🖥 system (1)\n!fastfetch [--no-profile] [--logo <...>] [--structure <...>] [--separator <text>] — Показать системную информацию\n\n🔗 aliases (1)\n!alias [list|add <name> <command> [arguments...]|show <name>|del <name>] — Manage command aliases"
-        );
-        for command in [
-            "help",
-            "modules",
-            "ping",
-            "prefix",
-            "stats",
-            "fastfetch",
-            "alias",
-        ] {
-            assert_eq!(response.text.matches(&format!("!{command}")).count(), 1);
-        }
-        assert_eq!(response.entities.len(), 1);
+    async fn overview_has_stable_counts_order_and_active_prefix() {
+        let response = render(&HelpRequest::Overview, "🦀", &aliases().await).response;
+        assert!(response.text.starts_with("🛠 Справка Lavis: 3 модулей, 7 команд"));
+        assert!(response.text.find("🧩 core").unwrap() < response.text.find("🖥 system").unwrap());
+        assert!(response.text.contains("🦀fastfetch"));
+        assert!(response.text.ends_with("Используйте 🦀help <команда или модуль> для подробностей."));
+        assert_eq!(response.entities.len(), 2);
     }
 
     #[tokio::test]
-    async fn command_details_keep_titles_outside_a_single_entity() {
-        for (kind, title) in [
-            (CommandKind::Ping, "🏓 ,ping\n\n"),
-            (CommandKind::Stats, "📊 ,stats\n\n"),
-            (CommandKind::Help, "🛠 ,help [command]\n\n"),
-        ] {
-            let response = render(
-                &HelpRequest::Topic(definition(kind).name.to_owned()),
-                ",",
-                &aliases().await,
-            )
-            .response;
-            let definition = definition(kind);
-
-            assert!(response.text.starts_with(title));
-            assert!(response.text.ends_with(&format!(
-                "{}\n\nUsage: ,{}",
-                definition.description, definition.usage
-            )));
-            assert_eq!(response.entities.len(), 1);
-        }
-    }
-
-    #[tokio::test]
-    async fn fastfetch_help_uses_active_prefix_and_escaped_profile_path() {
-        let profile_path = PathBuf::from("/tmp/профиль\nfastfetch.json");
-        let response = render_with_path(
-            &HelpRequest::Topic("fastfetch".to_owned()),
-            "🦀",
-            &aliases().await,
-            &profile_path,
-        )
-        .response;
-
-        assert!(response.text.contains("🦀fastfetch --logo arch"));
+    async fn command_cards_use_documentation_entities_and_symbolic_fastfetch_paths() {
+        let response = render(&HelpRequest::Topic("fastfetch".to_owned()), "🦀", &aliases().await).response;
+        assert_eq!(response.entities.len(), 2);
+        assert!(response.text.contains("$XDG_CONFIG_HOME/lavis/fastfetch.json"));
+        assert!(response.text.contains("$HOME/.config/lavis/fastfetch.json"));
+        assert!(response.text.contains("--config none"));
         assert!(response.text.contains("🦀fastfetch --no-profile"));
-        assert!(response.text.contains(&format!("{profile_path:?}")));
-        assert!(!response.text.contains("/tmp/профиль\nfastfetch.json"));
-        assert_eq!(response.entities.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn renders_unknown_and_invalid_help_plainly() {
-        let unknown = render(&HelpRequest::Topic("foo".to_owned()), ",", &aliases().await).response;
-        let invalid = render(&HelpRequest::Invalid, "!", &aliases().await).response;
-
+        assert!(response.text.contains("shell-words"));
+        assert!(response.text.contains("shell-метасимволы остаются данными"));
+        assert!(!response.text.contains("/tmp/"));
+        let grammers_client::tl::enums::MessageEntity::Blockquote(primary) = &response.entities[0]
+        else {
+            panic!("expected primary blockquote");
+        };
+        let grammers_client::tl::enums::MessageEntity::Blockquote(provenance) = &response.entities[1]
+        else {
+            panic!("expected provenance blockquote");
+        };
+        let units = response.text.encode_utf16().collect::<Vec<_>>();
+        let primary_end = usize::try_from(primary.offset).unwrap()
+            + usize::try_from(primary.length).unwrap();
+        let provenance_start = usize::try_from(provenance.offset).unwrap();
+        let provenance_end = provenance_start + usize::try_from(provenance.length).unwrap();
+        assert!(primary.collapsed);
+        assert!(!provenance.collapsed);
+        assert!(primary_end <= provenance_start);
         assert_eq!(
-            unknown,
-            Response::plain("❓ Unknown command: foo\nUse ,help to list available commands.")
+            String::from_utf16(&units[provenance_start..provenance_end]).unwrap(),
+            "Это встроенный модуль Lavis. Его нельзя выгрузить или заменить."
         );
-        assert_eq!(invalid, Response::plain("⚠️ Usage: !help [command]"));
     }
 
     #[tokio::test]
-    async fn alias_help_uses_the_configured_alias_target() {
-        let (aliases, directory) = aliases_with_mini().await;
-        let response = render(&HelpRequest::Topic("mini".to_owned()), "!", &aliases).response;
-
-        assert!(response.text.starts_with("🔗 !mini\n\n"));
-        assert!(response.text.contains("Alias for !fastfetch"));
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[tokio::test]
-    async fn module_topics_are_case_insensitive_and_aliases_take_precedence() {
-        let (mut store, directory) = aliases_with_mini().await;
-        store
-            .add(
-                "core",
-                Alias {
-                    target: "ping".to_owned(),
-                    args: Vec::new(),
-                },
-            )
-            .await
-            .unwrap();
-        let alias = render(&HelpRequest::Topic("CORE".to_owned()), "!", &store).response;
+    async fn canonical_commands_precede_aliases_and_aliases_precede_modules() {
+        let (aliases, directory) = aliases_with_core_alias().await;
+        let canonical = render(&HelpRequest::Topic("help".to_owned()), "!", &aliases).response;
+        assert!(canonical.text.starts_with("🛠 !help"));
+        let alias = render(&HelpRequest::Topic("CORE".to_owned()), "!", &aliases).response;
         assert!(alias.text.starts_with("🔗 !CORE"));
-        let modules = aliases().await;
-        let system = render(&HelpRequest::Topic("SyStEm".to_owned()), "!", &modules).response;
-        assert_eq!(
-            system.text,
-            "🖥 system module\n\nSystem information commands.\n\n!fastfetch [--no-profile] [--logo <...>] [--structure <...>] [--separator <text>] — Показать системную информацию"
-        );
-        assert_eq!(system.entities.len(), 1);
-        let grammers_client::tl::enums::MessageEntity::Blockquote(entity) = &system.entities[0]
-        else {
-            panic!("expected a blockquote entity");
-        };
-        let units: Vec<u16> = system.text.encode_utf16().collect();
-        let offset = usize::try_from(entity.offset).unwrap();
-        let length = usize::try_from(entity.length).unwrap();
-        assert_eq!(
-            String::from_utf16(&units[offset..offset + length]).unwrap(),
-            "System information commands.\n\n!fastfetch [--no-profile] [--logo <...>] [--structure <...>] [--separator <text>] — Показать системную информацию"
-        );
-        assert_eq!(
-            length,
-            "System information commands.\n\n!fastfetch [--no-profile] [--logo <...>] [--structure <...>] [--separator <text>] — Показать системную информацию"
-                .encode_utf16()
-                .count()
-        );
-        assert!(entity.collapsed);
+        assert!(alias.text.contains("Целевой модуль: system"));
         fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
-    async fn blockquote_uses_utf16_body_bounds() {
-        let response = render(
-            &HelpRequest::Topic("help".to_owned()),
-            "🦀",
-            &aliases().await,
-        )
-        .response;
-        let text_units: Vec<u16> = response.text.encode_utf16().collect();
-        let grammers_client::tl::enums::MessageEntity::Blockquote(entity) = &response.entities[0]
-        else {
-            panic!("expected a blockquote entity");
-        };
-        assert!(entity.collapsed);
-        let offset = usize::try_from(entity.offset).unwrap();
-        let length = usize::try_from(entity.length).unwrap();
-
-        assert_eq!(
-            String::from_utf16(&text_units[..offset]).unwrap(),
-            "🛠 🦀help [command]\n\n"
-        );
-        assert_eq!(
-            String::from_utf16(&text_units[offset..offset + length]).unwrap(),
-            "Shows the command overview or detailed help for a command, alias, or module.\n\nUsage: 🦀help [command]"
-        );
+    async fn module_card_is_case_insensitive_and_has_deterministic_policy() {
+        let response = render(&HelpRequest::Topic("SyStEm".to_owned()), "!", &aliases().await).response;
+        assert!(response.text.contains("Безопасно ограниченная системная информация."));
+        assert!(response.text.contains("Возможности: сведения о хосте, ограниченный процесс"));
+        assert!(response.text.contains("выгрузка: запрещена; замена: запрещена"));
+        assert!(response.text.ends_with("Это встроенный модуль Lavis. Его нельзя выгрузить или заменить."));
+        assert_eq!(response.entities.len(), 2);
     }
 
     #[test]
-    fn plain_response_has_no_entities() {
-        assert!(Response::plain("plain").entities.is_empty());
+    fn external_fixture_uses_external_provenance() {
+        let fixture = ModuleSpec {
+            id: ModuleId::Core,
+            name: "fixture",
+            description_ru: "Тестовый модуль.",
+            icon: "🧪",
+            origin: ModuleOrigin::External {
+                author: "Автор",
+                version: "1.0.0",
+                source: "https://example.invalid/module",
+            },
+            capabilities: &[ModuleCapability::Network],
+            unloadable: true,
+            replaceable: true,
+        };
+        let response = render_module_card(&fixture, ",").response;
+        assert!(response.text.contains("Внешний модуль. Автор: Автор; версия: 1.0.0"));
+        assert!(response.text.contains("возможности: сеть"));
+        assert!(!response.text.contains("Это встроенный модуль"));
+    }
+
+    #[test]
+    fn invalid_external_fixture_never_renders_external_provenance() {
+        let fixture = ModuleSpec {
+            id: ModuleId::Core,
+            name: "invalid",
+            description_ru: "Тестовый модуль.",
+            icon: "🧪",
+            origin: ModuleOrigin::External {
+                author: "Автор\n",
+                version: "1.0.0",
+                source: "https://example.invalid/module",
+            },
+            capabilities: &[ModuleCapability::Network],
+            unloadable: true,
+            replaceable: true,
+        };
+        let rendered = render_module_card(&fixture, ",");
+        assert!(!rendered.entity_fallback);
+        assert_eq!(rendered.response.entities.len(), 2);
+        assert!(rendered.response.text.contains("Внешние данные модуля не отображаются."));
+        assert!(rendered
+            .response
+            .text
+            .contains("Метаданные происхождения отклонены ядром Lavis."));
+        assert!(!rendered.response.text.contains("Внешний модуль"));
+    }
+
+    #[tokio::test]
+    async fn modules_overview_matches_help_registry_counts() {
+        let rendered = render_modules_overview(".");
+        assert!(rendered.response.text.contains("Модули (3)"));
+        assert!(rendered.response.text.contains("Команды (7)"));
+        assert!(rendered.response.text.contains(".modules"));
+        assert_eq!(rendered.response.entities.len(), 2);
+        let grammers_client::tl::enums::MessageEntity::Blockquote(primary) =
+            &rendered.response.entities[0]
+        else {
+            panic!("expected primary blockquote");
+        };
+        let grammers_client::tl::enums::MessageEntity::Blockquote(provenance) =
+            &rendered.response.entities[1]
+        else {
+            panic!("expected provenance blockquote");
+        };
+        let units = rendered.response.text.encode_utf16().collect::<Vec<_>>();
+        let primary_start = usize::try_from(primary.offset).unwrap();
+        let primary_end = primary_start + usize::try_from(primary.length).unwrap();
+        let provenance_start = usize::try_from(provenance.offset).unwrap();
+        let provenance_end = provenance_start + usize::try_from(provenance.length).unwrap();
+        assert!(primary.collapsed);
+        assert!(!provenance.collapsed);
+        assert!(primary_end <= provenance_start);
+        assert_eq!(
+            String::from_utf16(&units[provenance_start..provenance_end]).unwrap(),
+            "Это встроенный модуль Lavis. Его нельзя выгрузить или заменить."
+        );
     }
 }
