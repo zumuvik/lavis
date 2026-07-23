@@ -1,4 +1,4 @@
-use crate::commands::{commands, CommandDefinition};
+use crate::commands::{CommandDefinition, commands};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModuleId {
@@ -102,7 +102,9 @@ pub fn module_definition(id: ModuleId) -> &'static ModuleSpec {
 }
 
 pub fn commands_for_module(id: ModuleId) -> impl Iterator<Item = &'static CommandDefinition> {
-    commands().iter().filter(move |command| command.module == id)
+    commands()
+        .iter()
+        .filter(move |command| command.module == id)
 }
 
 const EXTERNAL_AUTHOR_MAX: usize = 64;
@@ -128,7 +130,9 @@ pub fn validate_external_origin(origin: &ModuleOrigin) -> bool {
 fn valid_external_value(value: &str, max_chars: usize) -> bool {
     !value.is_empty()
         && value.chars().count() <= max_chars
-        && !value.chars().any(|character| character.is_control() || is_bidi_control(character))
+        && !value
+            .chars()
+            .any(|character| character.is_control() || is_bidi_control(character))
 }
 
 fn is_absolute_local_source(source: &str) -> bool {
@@ -191,7 +195,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(module_names, ["core", "system", "aliases"]);
         assert_eq!(
-            modules().iter().map(|module| module.id).collect::<HashSet<_>>().len(),
+            modules()
+                .iter()
+                .map(|module| module.id)
+                .collect::<HashSet<_>>()
+                .len(),
             modules().len()
         );
         assert_eq!(
@@ -223,7 +231,12 @@ mod tests {
     #[test]
     fn external_fixture_carries_renderable_provenance_without_joining_production_registry() {
         let fixture = external_fixture();
-        let ModuleOrigin::External { author, version, source } = fixture.origin else {
+        let ModuleOrigin::External {
+            author,
+            version,
+            source,
+        } = fixture.origin
+        else {
             panic!("expected external fixture");
         };
         assert_eq!(
@@ -231,9 +244,11 @@ mod tests {
             ("Тест", "1.0.0", "https://example.invalid/module")
         );
         assert!(validate_external_origin(&fixture.origin));
-        assert!(!modules()
-            .iter()
-            .any(|module| matches!(module.origin, ModuleOrigin::External { .. })));
+        assert!(
+            !modules()
+                .iter()
+                .any(|module| matches!(module.origin, ModuleOrigin::External { .. }))
+        );
     }
 
     #[test]
@@ -253,9 +268,7 @@ mod tests {
             "",
             "https://example.invalid"
         )));
-        assert!(!validate_external_origin(&external(
-            "Автор", "1", ""
-        )));
+        assert!(!validate_external_origin(&external("Автор", "1", "")));
         assert!(!validate_external_origin(&external(
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "1",
@@ -320,10 +333,18 @@ mod tests {
             match command.risk {
                 CommandRisk::ReadOnly => {}
                 CommandRisk::PersistentStateChange => {
-                    assert!(module.capabilities.contains(&ModuleCapability::PersistentStateWrite));
+                    assert!(
+                        module
+                            .capabilities
+                            .contains(&ModuleCapability::PersistentStateWrite)
+                    );
                 }
                 CommandRisk::RestrictedProcess => {
-                    assert!(module.capabilities.contains(&ModuleCapability::RestrictedProcess));
+                    assert!(
+                        module
+                            .capabilities
+                            .contains(&ModuleCapability::RestrictedProcess)
+                    );
                 }
                 CommandRisk::ArbitraryProcess | CommandRisk::Privileged => {
                     panic!("production command has prohibited risk");

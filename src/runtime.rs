@@ -591,19 +591,14 @@ mod tests {
         runtime
             .execute_prefix(&crate::commands::PrefixRequest::Set("🦀".to_owned()))
             .await;
-        let overview = runtime.execute_modules(
-            &crate::commands::ModulesRequest::Overview,
-            runtime.prefix(),
-        );
+        let overview =
+            runtime.execute_modules(&crate::commands::ModulesRequest::Overview, runtime.prefix());
         assert!(overview.text.starts_with("🧩 Модули Lavis: 3\n\n"));
         assert!(overview.text.contains("🦀fastfetch"));
         assert!(overview.text.contains("Команды (7)"));
         assert_eq!(overview.entities.len(), 2);
         assert_eq!(
-            runtime.execute_modules(
-                &crate::commands::ModulesRequest::Invalid,
-                runtime.prefix(),
-            ),
+            runtime.execute_modules(&crate::commands::ModulesRequest::Invalid, runtime.prefix(),),
             Response::plain("⚠️ Использование: 🦀modules")
         );
         let grammers_client::tl::enums::MessageEntity::Blockquote(entity) = &overview.entities[0]
@@ -629,10 +624,8 @@ mod tests {
         let provenance_offset = usize::try_from(provenance.offset).unwrap();
         let provenance_length = usize::try_from(provenance.length).unwrap();
         assert_eq!(
-            String::from_utf16(
-                &units[provenance_offset..provenance_offset + provenance_length]
-            )
-            .unwrap(),
+            String::from_utf16(&units[provenance_offset..provenance_offset + provenance_length])
+                .unwrap(),
             "Это встроенный модуль Lavis. Его нельзя выгрузить или заменить."
         );
         fs::remove_dir_all(directory).unwrap();

@@ -350,7 +350,12 @@ mod tests {
         );
         assert!(!rendered.entity_fallback);
         assert!(rendered.response.text.contains(&provenance));
-        assert!(rendered.response.text.contains(DOCUMENTATION_TRUNCATION_SUFFIX));
+        assert!(
+            rendered
+                .response
+                .text
+                .contains(DOCUMENTATION_TRUNCATION_SUFFIX)
+        );
         assert!(rendered.response.text.encode_utf16().count() <= MAX_UTF16_UNITS);
         let grammers_client::tl::enums::MessageEntity::Blockquote(primary) =
             &rendered.response.entities[0]
@@ -366,8 +371,8 @@ mod tests {
         let start = usize::try_from(entity.offset).unwrap();
         let end = start + usize::try_from(entity.length).unwrap();
         assert_eq!(String::from_utf16(&units[start..end]).unwrap(), provenance);
-        let primary_end = usize::try_from(primary.offset).unwrap()
-            + usize::try_from(primary.length).unwrap();
+        let primary_end =
+            usize::try_from(primary.offset).unwrap() + usize::try_from(primary.length).unwrap();
         assert!(primary_end <= start);
         assert!(end <= units.len());
     }
@@ -400,10 +405,12 @@ mod tests {
         );
         assert!(primary_and_heading.entity_fallback);
         assert!(primary_and_heading.response.entities.is_empty());
-        assert!(primary_and_heading
-            .response
-            .text
-            .ends_with("Источник: полный источник"));
+        assert!(
+            primary_and_heading
+                .response
+                .text
+                .ends_with("Источник: полный источник")
+        );
         assert!(primary_and_heading.response.text.encode_utf16().count() <= MAX_UTF16_UNITS);
     }
 }
