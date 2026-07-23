@@ -23,13 +23,6 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 const DRAIN_GRACE: Duration = Duration::from_secs(1);
 const PROFILE_MAX_BYTES: usize = 16 * 1024;
 const MAX_STRUCTURE_COMPONENTS: usize = 26;
-const DEFAULT_STRUCTURE: &[Module] = &[
-    Module::Os,
-    Module::Kernel,
-    Module::Cpu,
-    Module::Gpu,
-    Module::Memory,
-];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FastfetchInputError {
@@ -127,8 +120,8 @@ struct PartialOptions {
 
 #[derive(Debug)]
 struct EffectiveOptions {
-    logo: Logo,
-    structure: Vec<Module>,
+    logo: Option<Logo>,
+    structure: Option<Vec<Module>>,
     separator: Option<String>,
 }
 
@@ -381,11 +374,8 @@ fn read_profile(path: &Path) -> Result<PartialOptions, FastfetchProfileError> {
 
 fn compile(profile: PartialOptions, command: PartialOptions) -> Invocation {
     let effective = EffectiveOptions {
-        logo: command.logo.or(profile.logo).unwrap_or(Logo::None),
-        structure: command
-            .structure
-            .or(profile.structure)
-            .unwrap_or_else(|| DEFAULT_STRUCTURE.to_vec()),
+        logo: command.logo.or(profile.logo),
+        structure: command.structure.or(profile.structure),
         separator: command.separator.or(profile.separator),
     };
     let mut arguments = vec![
@@ -393,24 +383,27 @@ fn compile(profile: PartialOptions, command: PartialOptions) -> Invocation {
         "none".to_owned(),
         "--pipe".to_owned(),
     ];
-    match effective.logo {
-        Logo::None => arguments.extend(["--logo".to_owned(), "none".to_owned()]),
-        Logo::Builtin(logo) => arguments.extend([
-            "--logo-type".to_owned(),
-            "builtin".to_owned(),
-            "--logo".to_owned(),
-            logo.as_str().to_owned(),
-        ]),
+    if let Some(logo) = effective.logo {
+        match logo {
+            Logo::None => arguments.extend(["--logo".to_owned(), "none".to_owned()]),
+            Logo::Builtin(logo) => arguments.extend([
+                "--logo-type".to_owned(),
+                "builtin".to_owned(),
+                "--logo".to_owned(),
+                logo.as_str().to_owned(),
+            ]),
+        }
     }
-    arguments.extend([
-        "--structure".to_owned(),
-        effective
-            .structure
-            .iter()
-            .map(|module| module.as_str())
-            .collect::<Vec<_>>()
-            .join(":"),
-    ]);
+    if let Some(structure) = effective.structure {
+        arguments.extend([
+            "--structure".to_owned(),
+            structure
+                .iter()
+                .map(|module| module.as_str())
+                .collect::<Vec<_>>()
+                .join(":"),
+        ]);
+    }
     if let Some(separator) = effective.separator {
         arguments.push(format!("--separator={separator}"));
     }
@@ -760,15 +753,7 @@ mod tests {
         );
         assert_eq!(
             compile(parse_options(&[]).unwrap(), parse_options(&[]).unwrap()).arguments,
-            [
-                "--config",
-                "none",
-                "--pipe",
-                "--logo",
-                "none",
-                "--structure",
-                "os:kernel:cpu:gpu:memory",
-            ]
+            ["--config", "none", "--pipe"]
         );
     }
 
@@ -794,8 +779,6 @@ mod tests {
                     "builtin",
                     "--logo",
                     expected,
-                    "--structure",
-                    "os:kernel:cpu:gpu:memory",
                 ]
             );
         }
@@ -804,8 +787,8 @@ mod tests {
                 parse_options(&[]).unwrap(),
                 parse_options(&["--logo".to_owned(), "NoNe".to_owned()]).unwrap(),
             )
-            .arguments[3..],
-            ["--logo", "none", "--structure", "os:kernel:cpu:gpu:memory"]
+            .arguments,
+            ["--config", "none", "--pipe", "--logo", "none"]
         );
     }
 
@@ -895,15 +878,7 @@ mod tests {
         fs::write(&path, r#"{"version":1}"#).unwrap();
         assert_eq!(
             compile(read_profile(&path).unwrap(), parse_options(&[]).unwrap()).arguments,
-            [
-                "--config",
-                "none",
-                "--pipe",
-                "--logo",
-                "none",
-                "--structure",
-                "os:kernel:cpu:gpu:memory",
-            ]
+            ["--config", "none", "--pipe"]
         );
         fs::write(&path, r#"{"version":1,"logo":"arch"}"#).unwrap();
         assert_eq!(
@@ -916,8 +891,6 @@ mod tests {
                 "builtin",
                 "--logo",
                 "Arch",
-                "--structure",
-                "os:kernel:cpu:gpu:memory",
             ]
         );
         fs::write(
@@ -979,6 +952,34 @@ mod tests {
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
+    #[tokio::test]
+    async fn leaves_unset_logo_and_structure_out_of_the_fixed_prefix() {
+        let path = test_path("unset-options");
+        let fixed = ["--config", "none", "--pipe"];
+
+        assert_eq!(prepare("", &path).await.unwrap().arguments, fixed);
+        assert_eq!(
+            prepare("--no-profile", &path).await.unwrap().arguments,
+            fixed
+        );
+        fs::write(&path, r#"{"version":1}"#).unwrap();
+        assert_eq!(prepare("", &path).await.unwrap().arguments, fixed);
+        fs::write(&path, r#"{"version":1,"logo":"arch"}"#).unwrap();
+        assert_eq!(
+            prepare("", &path).await.unwrap().arguments,
+            [
+                "--config",
+                "none",
+                "--pipe",
+                "--logo-type",
+                "builtin",
+                "--logo",
+                "Arch",
+            ]
+        );
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn reports_unreadable_profile_paths_without_exposing_os_errors() {
@@ -1005,15 +1006,7 @@ mod tests {
         ));
         assert_eq!(
             prepare("--no-profile", &path).await.unwrap().arguments,
-            [
-                "--config",
-                "none",
-                "--pipe",
-                "--logo",
-                "none",
-                "--structure",
-                "os:kernel:cpu:gpu:memory",
-            ]
+            ["--config", "none", "--pipe"]
         );
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
