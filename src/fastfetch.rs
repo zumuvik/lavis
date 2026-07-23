@@ -776,9 +776,8 @@ fn truncate_excerpt(text: &str) -> String {
 mod tests {
     use super::{
         Capture, FastfetchInputError, FastfetchProfileError, FastfetchResult, LogoPadding,
-        PartialOptions, PROFILE_MAX_BYTES, append_capture, compile, parse_logo_padding,
-        parse_options, prepare,
-        read_profile, sanitize_capture, tokenize,
+        PROFILE_MAX_BYTES, PartialOptions, append_capture, compile, parse_logo_padding,
+        parse_options, prepare, read_profile, sanitize_capture, tokenize,
     };
     use std::{
         fs,
