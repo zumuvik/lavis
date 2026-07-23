@@ -356,7 +356,9 @@ fn validate_separator(value: &str) -> Result<(), FastfetchInputError> {
 }
 
 fn parse_logo_padding(value: &str) -> Result<u8, FastfetchInputError> {
-    let n = value.parse::<u8>().map_err(|_| FastfetchInputError::InvalidLogoPadding)?;
+    let n = value
+        .parse::<u8>()
+        .map_err(|_| FastfetchInputError::InvalidLogoPadding)?;
     if n > 32 {
         return Err(FastfetchInputError::InvalidLogoPadding);
     }
@@ -1159,7 +1161,11 @@ mod tests {
             parse_options(&[]).unwrap(),
             parse_options(&["--separator".to_owned(), " -> ".to_owned()]).unwrap(),
         );
-        let sep_idx = cmd.arguments.iter().position(|a| a == "--separator").unwrap();
+        let sep_idx = cmd
+            .arguments
+            .iter()
+            .position(|a| a == "--separator")
+            .unwrap();
         assert_eq!(cmd.arguments.get(sep_idx + 1), Some(&" -> ".to_owned()));
         assert!(!cmd.arguments.iter().any(|a| a.starts_with("--separator=")));
     }
@@ -1170,7 +1176,11 @@ mod tests {
             parse_options(&[]).unwrap(),
             parse_options(&["--logo-padding-left".to_owned(), "4".to_owned()]).unwrap(),
         );
-        let idx = cmd.arguments.iter().position(|a| a == "--logo-padding-left").unwrap();
+        let idx = cmd
+            .arguments
+            .iter()
+            .position(|a| a == "--logo-padding-left")
+            .unwrap();
         assert_eq!(cmd.arguments.get(idx + 1), Some(&"4".to_owned()));
     }
 
@@ -1180,7 +1190,11 @@ mod tests {
             parse_options(&[]).unwrap(),
             parse_options(&["--logo-padding-right".to_owned(), "5".to_owned()]).unwrap(),
         );
-        let idx = cmd.arguments.iter().position(|a| a == "--logo-padding-right").unwrap();
+        let idx = cmd
+            .arguments
+            .iter()
+            .position(|a| a == "--logo-padding-right")
+            .unwrap();
         assert_eq!(cmd.arguments.get(idx + 1), Some(&"5".to_owned()));
     }
 
@@ -1190,7 +1204,11 @@ mod tests {
             parse_options(&[]).unwrap(),
             parse_options(&["--logo-padding-top".to_owned(), "1".to_owned()]).unwrap(),
         );
-        let idx = cmd.arguments.iter().position(|a| a == "--logo-padding-top").unwrap();
+        let idx = cmd
+            .arguments
+            .iter()
+            .position(|a| a == "--logo-padding-top")
+            .unwrap();
         assert_eq!(cmd.arguments.get(idx + 1), Some(&"1".to_owned()));
     }
 
@@ -1262,19 +1280,10 @@ mod tests {
             },
             ..PartialOptions::default()
         };
-        let cmd = compile(
-            profile,
-            parse_options(&[]).unwrap(),
-        );
+        let cmd = compile(profile, parse_options(&[]).unwrap());
         assert_eq!(
             cmd.arguments,
-            [
-                "--config",
-                "none",
-                "--pipe",
-                "--logo-padding-left",
-                "2",
-            ]
+            ["--config", "none", "--pipe", "--logo-padding-left", "2",]
         );
     }
 
