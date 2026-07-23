@@ -300,18 +300,18 @@ fn fastfetch_response(result: FastfetchResult, prefix: &str) -> Response {
             fastfetch_failure(&format!("failed (exit code {code})"), prefix)
         }
         FastfetchResult::UnexpectedStatus => fastfetch_failure("ended unexpectedly", prefix),
-        FastfetchResult::InvalidArguments(error) => {
-            fastfetch_failure(
-                &format!("input error: {}", fastfetch_input_message(error)),
-                prefix,
-            )
-        }
+        FastfetchResult::InvalidArguments(error) => fastfetch_failure(
+            &format!("input error: {}", fastfetch_input_message(error)),
+            prefix,
+        ),
         FastfetchResult::ProfileError => fastfetch_failure("profile error", prefix),
     }
 }
 
 fn fastfetch_failure(message: &str, prefix: &str) -> Response {
-    Response::plain(format!("⚠️ Fastfetch {message}. See {prefix}help fastfetch"))
+    Response::plain(format!(
+        "⚠️ Fastfetch {message}. See {prefix}help fastfetch"
+    ))
 }
 
 fn fastfetch_input_message(error: FastfetchInputError) -> &'static str {
@@ -729,9 +729,7 @@ mod tests {
                 FastfetchResult::InvalidArguments(FastfetchInputError::InvalidLogo),
                 "🦀",
             ),
-            Response::plain(
-                "⚠️ Fastfetch input error: invalid --logo value. See 🦀help fastfetch"
-            )
+            Response::plain("⚠️ Fastfetch input error: invalid --logo value. See 🦀help fastfetch")
         );
         assert_eq!(
             runtime.resolve_alias("mini", "'"),

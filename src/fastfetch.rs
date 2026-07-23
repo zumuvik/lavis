@@ -172,7 +172,9 @@ fn parse_options(tokens: &[String]) -> Result<PartialOptions, FastfetchInputErro
                 if options.logo.is_some() {
                     return Err(FastfetchInputError::DuplicateOption);
                 }
-                let value = tokens.get(index + 1).ok_or(FastfetchInputError::MissingValue)?;
+                let value = tokens
+                    .get(index + 1)
+                    .ok_or(FastfetchInputError::MissingValue)?;
                 options.logo = Some(parse_logo(value)?);
                 index += 2;
             }
@@ -180,7 +182,9 @@ fn parse_options(tokens: &[String]) -> Result<PartialOptions, FastfetchInputErro
                 if options.structure.is_some() {
                     return Err(FastfetchInputError::DuplicateOption);
                 }
-                let value = tokens.get(index + 1).ok_or(FastfetchInputError::MissingValue)?;
+                let value = tokens
+                    .get(index + 1)
+                    .ok_or(FastfetchInputError::MissingValue)?;
                 options.structure = Some(parse_structure(value)?);
                 index += 2;
             }
@@ -188,7 +192,9 @@ fn parse_options(tokens: &[String]) -> Result<PartialOptions, FastfetchInputErro
                 if options.separator.is_some() {
                     return Err(FastfetchInputError::DuplicateOption);
                 }
-                let value = tokens.get(index + 1).ok_or(FastfetchInputError::MissingValue)?;
+                let value = tokens
+                    .get(index + 1)
+                    .ok_or(FastfetchInputError::MissingValue)?;
                 validate_separator(value)?;
                 options.separator = Some(value.clone());
                 index += 2;
@@ -768,11 +774,7 @@ mod tests {
         )
         .unwrap();
         assert!(read_profile(&path).is_err());
-        fs::write(
-            &path,
-            r#"{"version":1,"structure":["os","os"]}"#,
-        )
-        .unwrap();
+        fs::write(&path, r#"{"version":1,"structure":["os","os"]}"#).unwrap();
         assert!(read_profile(&path).is_err());
         fs::write(&path, vec![b'x'; PROFILE_MAX_BYTES + 1]).unwrap();
         assert!(read_profile(&path).is_err());
