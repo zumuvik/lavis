@@ -92,7 +92,14 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
                 Начало работы:\n  {prefix}help\n  {prefix}modules\n  {prefix}help fastfetch\n  {prefix}help alias"
             );
             let input = grammers_client::message::InputMessage::new().text(quick_start);
-            if let Err(error) = client.client().send_message(self_user_id, input).await {
+            if let Err(error) = client
+                .client()
+                .send_message(
+                    &grammers_client::tl::types::InputPeerSelf,
+                    input,
+                )
+                .await
+            {
                 tracing::warn!(
                     event = "quick_start_send_failed",
                     error = %error,
