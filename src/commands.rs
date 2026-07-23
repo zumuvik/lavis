@@ -136,7 +136,9 @@ pub fn command_by_name(name: &str) -> Option<&'static CommandDefinition> {
         .find(|command| command.name.eq_ignore_ascii_case(name))
 }
 
-pub fn module_for_command(command: &CommandDefinition) -> Option<&'static crate::modules::ModuleSpec> {
+pub fn module_for_command(
+    command: &CommandDefinition,
+) -> Option<&'static crate::modules::ModuleSpec> {
     crate::modules::module_by_id(command.module)
 }
 
@@ -367,7 +369,10 @@ mod tests {
 
     #[test]
     fn registry_invariants_and_ownership_are_complete() {
-        let names = commands().iter().map(|definition| definition.name).collect::<Vec<_>>();
+        let names = commands()
+            .iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
         assert_eq!(
             names,
             [
@@ -380,7 +385,10 @@ mod tests {
                 "alias"
             ]
         );
-        let module_names = modules().iter().map(|module| module.name).collect::<Vec<_>>();
+        let module_names = modules()
+            .iter()
+            .map(|module| module.name)
+            .collect::<Vec<_>>();
         assert_eq!(module_names, ["core", "system", "aliases"]);
         assert_eq!(
             module_names.iter().copied().collect::<HashSet<_>>().len(),
@@ -406,7 +414,9 @@ mod tests {
                 .len(),
             names.len()
         );
-        assert!(modules().iter().all(|module| !module.description_ru.is_empty()));
+        assert!(modules()
+            .iter()
+            .all(|module| !module.description_ru.is_empty()));
         assert!(
             modules()
                 .iter()
@@ -456,7 +466,10 @@ mod tests {
 
     #[test]
     fn static_registry_api_has_complete_safe_metadata() {
-        let command_names = commands().iter().map(|command| command.name).collect::<Vec<_>>();
+        let command_names = commands()
+            .iter()
+            .map(|command| command.name)
+            .collect::<Vec<_>>();
         assert_eq!(
             command_names
                 .iter()
@@ -473,8 +486,14 @@ mod tests {
                 .len(),
             commands().len()
         );
-        assert_eq!(command_by_name("PING").map(|command| command.kind), Some(CommandKind::Ping));
-        assert_eq!(command_by_kind(CommandKind::Fastfetch).map(|command| command.name), Some("fastfetch"));
+        assert_eq!(
+            command_by_name("PING").map(|command| command.kind),
+            Some(CommandKind::Ping)
+        );
+        assert_eq!(
+            command_by_kind(CommandKind::Fastfetch).map(|command| command.name),
+            Some("fastfetch")
+        );
 
         for command in commands() {
             assert!(!command.usage.is_empty());
@@ -488,7 +507,10 @@ mod tests {
                     && example.split_whitespace().next() == Some(command.name)
             }));
             assert!(module_for_command(command).is_some());
-            assert!(!matches!(command.risk, CommandRisk::ArbitraryProcess | CommandRisk::Privileged));
+            assert!(!matches!(
+                command.risk,
+                CommandRisk::ArbitraryProcess | CommandRisk::Privileged
+            ));
         }
         assert_eq!(
             crate::modules::modules()

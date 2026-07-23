@@ -99,7 +99,8 @@ impl Response {
         let Some(heading_units) = utf16_i32_len(&heading).map(|length| length as usize) else {
             return documentation_fallback(heading, primary, provenance);
         };
-        let Some(provenance_units) = utf16_i32_len(&provenance).map(|length| length as usize) else {
+        let Some(provenance_units) = utf16_i32_len(&provenance).map(|length| length as usize)
+        else {
             return documentation_fallback(heading, primary, provenance);
         };
         let separator_units = separators.encode_utf16().count();
@@ -134,7 +135,10 @@ impl Response {
         let Some(provenance_length) = utf16_i32_len(&provenance) else {
             return documentation_fallback(heading, rendered_primary, provenance);
         };
-        if text.encode_utf16().count() > MAX_UTF16_UNITS || primary_length == 0 || provenance_length == 0 {
+        if text.encode_utf16().count() > MAX_UTF16_UNITS
+            || primary_length == 0
+            || provenance_length == 0
+        {
             return documentation_fallback(heading, rendered_primary, provenance);
         }
 
@@ -161,7 +165,11 @@ impl Response {
     }
 }
 
-fn documentation_fallback(heading: String, primary: String, provenance: String) -> RenderedResponse {
+fn documentation_fallback(
+    heading: String,
+    primary: String,
+    provenance: String,
+) -> RenderedResponse {
     let provenance_line = format!("Источник: {provenance}");
     let provenance_units = provenance_line.encode_utf16().count();
     if provenance_units > MAX_UTF16_UNITS {

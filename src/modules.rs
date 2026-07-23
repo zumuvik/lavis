@@ -1,4 +1,4 @@
-use crate::commands::{CommandDefinition, commands};
+use crate::commands::{commands, CommandDefinition};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModuleId {
@@ -185,7 +185,10 @@ mod tests {
 
     #[test]
     fn module_registry_metadata_is_complete_and_builtin_only() {
-        let module_names = modules().iter().map(|module| module.name).collect::<Vec<_>>();
+        let module_names = modules()
+            .iter()
+            .map(|module| module.name)
+            .collect::<Vec<_>>();
         assert_eq!(module_names, ["core", "system", "aliases"]);
         assert_eq!(
             modules().iter().map(|module| module.id).collect::<HashSet<_>>().len(),
@@ -250,7 +253,9 @@ mod tests {
             "",
             "https://example.invalid"
         )));
-        assert!(!validate_external_origin(&external("Автор", "1", "")));
+        assert!(!validate_external_origin(&external(
+            "Автор", "1", ""
+        )));
         assert!(!validate_external_origin(&external(
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "1",
@@ -286,10 +291,26 @@ mod tests {
             "1\u{2029}",
             "https://example.invalid"
         )));
-        assert!(!validate_external_origin(&external("Автор", "1", "/tmp/module")));
-        assert!(!validate_external_origin(&external("Автор", "1", "C:\\module")));
-        assert!(!validate_external_origin(&external("Автор", "1", "file:///tmp/module")));
-        assert!(!validate_external_origin(&external("Автор", "1", "FILE:///etc/passwd")));
+        assert!(!validate_external_origin(&external(
+            "Автор",
+            "1",
+            "/tmp/module"
+        )));
+        assert!(!validate_external_origin(&external(
+            "Автор",
+            "1",
+            "C:\\module"
+        )));
+        assert!(!validate_external_origin(&external(
+            "Автор",
+            "1",
+            "file:///tmp/module"
+        )));
+        assert!(!validate_external_origin(&external(
+            "Автор",
+            "1",
+            "FILE:///etc/passwd"
+        )));
     }
 
     #[test]
