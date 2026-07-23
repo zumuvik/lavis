@@ -22,7 +22,7 @@ const STDERR_EXCERPT_UNITS: usize = 1024;
 const TIMEOUT: Duration = Duration::from_secs(5);
 const DRAIN_GRACE: Duration = Duration::from_secs(1);
 const PROFILE_MAX_BYTES: usize = 16 * 1024;
-const MAX_STRUCTURE_COMPONENTS: usize = 12;
+const MAX_STRUCTURE_COMPONENTS: usize = 26;
 const DEFAULT_STRUCTURE: &[Module] = &[
     Module::Os,
     Module::Kernel,
@@ -51,7 +51,19 @@ pub enum FastfetchResult {
     NonZero { code: i32, stderr: String },
     UnexpectedStatus,
     InvalidArguments(FastfetchInputError),
-    ProfileError,
+    ProfileError(FastfetchProfileError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FastfetchProfileError {
+    NotReadable,
+    Malformed,
+    UnsupportedVersion,
+    TooLarge,
+    UnsafePath,
+    InvalidLogo,
+    InvalidStructure,
+    InvalidSeparator,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +101,20 @@ enum Module {
     Shell,
     Terminal,
     TerminalSize,
+    Host,
+    Display,
+    Wm,
+    De,
+    Theme,
+    Icons,
+    Font,
+    Cursor,
+    Disk,
+    Swap,
+    LocalIp,
+    Battery,
+    PowerAdapter,
+    Locale,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -116,7 +142,7 @@ struct Invocation {
 struct Profile {
     version: u32,
     logo: Option<String>,
-    structure: Vec<String>,
+    structure: Option<Vec<String>>,
     separator: Option<String>,
 }
 
@@ -146,7 +172,7 @@ async fn prepare(arguments: &str, profile_path: &Path) -> Result<Invocation, Fas
     } else {
         match load_profile(profile_path).await {
             Ok(profile) => profile,
-            Err(()) => return Err(FastfetchResult::ProfileError),
+            Err(error) => return Err(FastfetchResult::ProfileError(error)),
         }
     };
     Ok(compile(profile, command))
@@ -206,27 +232,40 @@ fn parse_options(tokens: &[String]) -> Result<PartialOptions, FastfetchInputErro
 }
 
 fn parse_logo(value: &str) -> Result<Logo, FastfetchInputError> {
-    Ok(match value {
-        "none" => Logo::None,
-        "Alpine" => Logo::Builtin(BuiltinLogo::Alpine),
-        "Arch" => Logo::Builtin(BuiltinLogo::Arch),
-        "Debian" => Logo::Builtin(BuiltinLogo::Debian),
-        "Fedora" => Logo::Builtin(BuiltinLogo::Fedora),
-        "FreeBSD" => Logo::Builtin(BuiltinLogo::FreeBSD),
-        "Linux" => Logo::Builtin(BuiltinLogo::Linux),
-        "MacOS" => Logo::Builtin(BuiltinLogo::MacOS),
-        "NixOS" => Logo::Builtin(BuiltinLogo::NixOS),
-        "OpenBSD" => Logo::Builtin(BuiltinLogo::OpenBSD),
-        "Ubuntu" => Logo::Builtin(BuiltinLogo::Ubuntu),
-        "Windows" => Logo::Builtin(BuiltinLogo::Windows),
-        _ => return Err(FastfetchInputError::InvalidLogo),
-    })
+    let logo = if value.eq_ignore_ascii_case("none") {
+        Logo::None
+    } else if value.eq_ignore_ascii_case("Alpine") {
+        Logo::Builtin(BuiltinLogo::Alpine)
+    } else if value.eq_ignore_ascii_case("Arch") {
+        Logo::Builtin(BuiltinLogo::Arch)
+    } else if value.eq_ignore_ascii_case("Debian") {
+        Logo::Builtin(BuiltinLogo::Debian)
+    } else if value.eq_ignore_ascii_case("Fedora") {
+        Logo::Builtin(BuiltinLogo::Fedora)
+    } else if value.eq_ignore_ascii_case("FreeBSD") {
+        Logo::Builtin(BuiltinLogo::FreeBSD)
+    } else if value.eq_ignore_ascii_case("Linux") {
+        Logo::Builtin(BuiltinLogo::Linux)
+    } else if value.eq_ignore_ascii_case("MacOS") {
+        Logo::Builtin(BuiltinLogo::MacOS)
+    } else if value.eq_ignore_ascii_case("NixOS") {
+        Logo::Builtin(BuiltinLogo::NixOS)
+    } else if value.eq_ignore_ascii_case("OpenBSD") {
+        Logo::Builtin(BuiltinLogo::OpenBSD)
+    } else if value.eq_ignore_ascii_case("Ubuntu") {
+        Logo::Builtin(BuiltinLogo::Ubuntu)
+    } else if value.eq_ignore_ascii_case("Windows") {
+        Logo::Builtin(BuiltinLogo::Windows)
+    } else {
+        return Err(FastfetchInputError::InvalidLogo);
+    };
+    Ok(logo)
 }
 
 fn parse_structure(value: &str) -> Result<Vec<Module>, FastfetchInputError> {
     let mut components = Vec::new();
     for component in value.split(':') {
-        let module = match component {
+        let module = match component.to_ascii_lowercase().as_str() {
             "title" => Module::Title,
             "separator" => Module::Separator,
             "os" => Module::Os,
@@ -239,6 +278,20 @@ fn parse_structure(value: &str) -> Result<Vec<Module>, FastfetchInputError> {
             "shell" => Module::Shell,
             "terminal" => Module::Terminal,
             "terminalsize" => Module::TerminalSize,
+            "host" => Module::Host,
+            "display" => Module::Display,
+            "wm" => Module::Wm,
+            "de" => Module::De,
+            "theme" => Module::Theme,
+            "icons" => Module::Icons,
+            "font" => Module::Font,
+            "cursor" => Module::Cursor,
+            "disk" => Module::Disk,
+            "swap" => Module::Swap,
+            "localip" => Module::LocalIp,
+            "battery" => Module::Battery,
+            "poweradapter" => Module::PowerAdapter,
+            "locale" => Module::Locale,
             _ => return Err(FastfetchInputError::InvalidStructure),
         };
         if components.contains(&module) {
@@ -262,58 +315,65 @@ fn validate_separator(value: &str) -> Result<(), FastfetchInputError> {
     Ok(())
 }
 
-async fn load_profile(path: &Path) -> Result<PartialOptions, ()> {
+async fn load_profile(path: &Path) -> Result<PartialOptions, FastfetchProfileError> {
     let path = path.to_owned();
     tokio::task::spawn_blocking(move || read_profile(&path))
         .await
-        .map_err(|_| ())?
+        .map_err(|_| FastfetchProfileError::NotReadable)?
 }
 
-fn read_profile(path: &Path) -> Result<PartialOptions, ()> {
+fn read_profile(path: &Path) -> Result<PartialOptions, FastfetchProfileError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(PartialOptions::default());
         }
-        Err(_) => return Err(()),
+        Err(_) => return Err(FastfetchProfileError::NotReadable),
     };
     if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(());
+        return Err(FastfetchProfileError::UnsafePath);
+    }
+    if metadata.len() > PROFILE_MAX_BYTES as u64 {
+        return Err(FastfetchProfileError::TooLarge);
     }
     let mut bytes = Vec::new();
     File::open(path)
-        .map_err(|_| ())?
+        .map_err(|_| FastfetchProfileError::NotReadable)?
         .take((PROFILE_MAX_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
-        .map_err(|_| ())?;
+        .map_err(|_| FastfetchProfileError::NotReadable)?;
     if bytes.len() > PROFILE_MAX_BYTES {
-        return Err(());
+        return Err(FastfetchProfileError::TooLarge);
     }
-    let profile: Profile = serde_json::from_slice(&bytes).map_err(|_| ())?;
+    let profile: Profile = serde_json::from_slice(&bytes).map_err(|_| FastfetchProfileError::Malformed)?;
     if profile.version != 1 {
-        return Err(());
+        return Err(FastfetchProfileError::UnsupportedVersion);
     }
     let logo = profile
         .logo
         .as_deref()
         .map(parse_logo)
         .transpose()
-        .map_err(|_| ())?;
-    if profile
-        .structure
-        .iter()
-        .any(|component| component.contains(':'))
-    {
-        return Err(());
-    }
-    let structure = parse_structure(&profile.structure.join(":")).map_err(|_| ())?;
+        .map_err(|_| FastfetchProfileError::InvalidLogo)?;
+    let structure = match profile.structure {
+        Some(structure) => {
+            if structure.iter().any(|component| component.contains(':')) {
+                return Err(FastfetchProfileError::InvalidStructure);
+            }
+            Some(
+                parse_structure(&structure.join(":"))
+                    .map_err(|_| FastfetchProfileError::InvalidStructure)?,
+            )
+        }
+        None => None,
+    };
     if let Some(separator) = &profile.separator {
-        validate_separator(separator).map_err(|_| ())?;
+        validate_separator(separator).map_err(|_| FastfetchProfileError::InvalidSeparator)?;
     }
     Ok(PartialOptions {
         no_profile: false,
         logo,
-        structure: Some(structure),
+        structure,
         separator: profile.separator,
     })
 }
@@ -377,18 +437,32 @@ impl BuiltinLogo {
 impl Module {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Title => "Title",
-            Self::Separator => "Separator",
-            Self::Os => "OS",
-            Self::Kernel => "Kernel",
-            Self::Uptime => "Uptime",
-            Self::Cpu => "CPU",
-            Self::Memory => "Memory",
-            Self::Gpu => "GPU",
-            Self::Packages => "Packages",
-            Self::Shell => "Shell",
-            Self::Terminal => "Terminal",
-            Self::TerminalSize => "TerminalSize",
+            Self::Title => "title",
+            Self::Separator => "separator",
+            Self::Os => "os",
+            Self::Kernel => "kernel",
+            Self::Uptime => "uptime",
+            Self::Cpu => "cpu",
+            Self::Memory => "memory",
+            Self::Gpu => "gpu",
+            Self::Packages => "packages",
+            Self::Shell => "shell",
+            Self::Terminal => "terminal",
+            Self::TerminalSize => "terminalsize",
+            Self::Host => "host",
+            Self::Display => "display",
+            Self::Wm => "wm",
+            Self::De => "de",
+            Self::Theme => "theme",
+            Self::Icons => "icons",
+            Self::Font => "font",
+            Self::Cursor => "cursor",
+            Self::Disk => "disk",
+            Self::Swap => "swap",
+            Self::LocalIp => "localip",
+            Self::Battery => "battery",
+            Self::PowerAdapter => "poweradapter",
+            Self::Locale => "locale",
         }
     }
 }
@@ -622,8 +696,8 @@ fn truncate_excerpt(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Capture, FastfetchInputError, FastfetchResult, PROFILE_MAX_BYTES, append_capture, compile,
-        parse_options, prepare, read_profile, sanitize_capture, tokenize,
+        Capture, FastfetchInputError, FastfetchProfileError, FastfetchResult, PROFILE_MAX_BYTES,
+        append_capture, compile, parse_options, prepare, read_profile, sanitize_capture, tokenize,
     };
     use std::{
         fs,
@@ -660,9 +734,9 @@ mod tests {
             parse_options(&[]).unwrap(),
             parse_options(&[
                 "--logo".to_owned(),
-                "NixOS".to_owned(),
+                "nIxOs".to_owned(),
                 "--structure".to_owned(),
-                "title:separator:os:terminalsize".to_owned(),
+                "Title:SEPARATOR:os:TerminalSize".to_owned(),
                 "--separator".to_owned(),
                 " -> ".to_owned(),
             ])
@@ -679,7 +753,7 @@ mod tests {
                 "--logo",
                 "NixOS",
                 "--structure",
-                "Title:Separator:OS:TerminalSize",
+                "title:separator:os:terminalsize",
                 "--separator= -> ",
             ]
         );
@@ -692,8 +766,45 @@ mod tests {
                 "--logo",
                 "none",
                 "--structure",
-                "OS:Kernel:CPU:GPU:Memory",
+                "os:kernel:cpu:gpu:memory",
             ]
+        );
+    }
+
+    #[test]
+    fn canonicalizes_ascii_case_insensitive_logos() {
+        for (input, expected) in [
+            ("arch", "Arch"),
+            ("Windows", "Windows"),
+            ("nIxOs", "NixOS"),
+            ("UBUNTU", "Ubuntu"),
+        ] {
+            let invocation = compile(
+                parse_options(&[]).unwrap(),
+                parse_options(&["--logo".to_owned(), input.to_owned()]).unwrap(),
+            );
+            assert_eq!(
+                invocation.arguments,
+                [
+                    "--config",
+                    "none",
+                    "--pipe",
+                    "--logo-type",
+                    "builtin",
+                    "--logo",
+                    expected,
+                    "--structure",
+                    "os:kernel:cpu:gpu:memory",
+                ]
+            );
+        }
+        assert_eq!(
+            compile(
+                parse_options(&[]).unwrap(),
+                parse_options(&["--logo".to_owned(), "NoNe".to_owned()]).unwrap(),
+            )
+            .arguments[3..],
+            ["--logo", "none", "--structure", "os:kernel:cpu:gpu:memory"]
         );
     }
 
@@ -725,7 +836,7 @@ mod tests {
             vec!["positional".to_owned()],
             vec!["--logo".to_owned()],
             vec!["--no-profile".to_owned(), "--no-profile".to_owned()],
-            vec!["--structure".to_owned(), "OS".to_owned()],
+            vec!["--structure".to_owned(), "сpu".to_owned()],
         ] {
             assert!(parse_options(&tokens).is_err());
         }
@@ -740,9 +851,72 @@ mod tests {
     }
 
     #[test]
+    fn preserves_mixed_case_structure_order_and_allows_exactly_26_modules() {
+        let structure = "Locale:PowerAdapter:Battery:LocalIP:Swap:Disk:Cursor:Font:Icons:Theme:DE:WM:Display:Host:TerminalSize:Terminal:Shell:Packages:GPU:Memory:CPU:Uptime:Kernel:OS:Separator:Title";
+        let invocation = compile(
+            parse_options(&[]).unwrap(),
+            parse_options(&["--structure".to_owned(), structure.to_owned()]).unwrap(),
+        );
+        assert_eq!(
+            invocation.arguments.last(),
+            Some(&"locale:poweradapter:battery:localip:swap:disk:cursor:font:icons:theme:de:wm:display:host:terminalsize:terminal:shell:packages:gpu:memory:cpu:uptime:kernel:os:separator:title".to_owned())
+        );
+        assert_eq!(
+            parse_options(&["--structure".to_owned(), "command".to_owned()]),
+            Err(FastfetchInputError::InvalidStructure)
+        );
+    }
+
+    #[test]
+    fn aliases_and_direct_commands_compile_through_the_same_parser() {
+        let direct = compile(
+            parse_options(&[]).unwrap(),
+            parse_options(&[
+                "--logo".to_owned(),
+                "arch".to_owned(),
+                "--structure".to_owned(),
+                "OS:Kernel:CPU".to_owned(),
+            ])
+            .unwrap(),
+        );
+        let alias_arguments = shell_words::join([
+            "--logo",
+            "arch",
+            "--structure",
+            "OS:Kernel:CPU",
+        ]);
+        let alias = compile(
+            parse_options(&[]).unwrap(),
+            parse_options(&shell_words::split(&alias_arguments).unwrap()).unwrap(),
+        );
+        assert_eq!(direct.arguments, alias.arguments);
+    }
+
+    #[test]
     fn profile_is_strict_and_merges_before_command_options() {
         let path = test_path("profile");
         assert_eq!(read_profile(&path).unwrap().structure, None);
+        fs::write(&path, r#"{"version":1}"#).unwrap();
+        assert_eq!(
+            compile(read_profile(&path).unwrap(), parse_options(&[]).unwrap()).arguments,
+            [
+                "--config",
+                "none",
+                "--pipe",
+                "--logo",
+                "none",
+                "--structure",
+                "os:kernel:cpu:gpu:memory",
+            ]
+        );
+        fs::write(&path, r#"{"version":1,"logo":"arch"}"#).unwrap();
+        assert_eq!(
+            compile(read_profile(&path).unwrap(), parse_options(&[]).unwrap()).arguments,
+            [
+                "--config", "none", "--pipe", "--logo-type", "builtin", "--logo", "Arch",
+                "--structure", "os:kernel:cpu:gpu:memory",
+            ]
+        );
         fs::write(
             &path,
             r#"{"version":1,"logo":"Arch","structure":["title","os"],"separator":" :: "}"#,
@@ -764,24 +938,34 @@ mod tests {
                 "--logo",
                 "Ubuntu",
                 "--structure",
-                "Title:OS",
+                "title:os",
                 "--separator= :: ",
             ]
         );
-        fs::write(
-            &path,
-            r#"{"version":1,"structure":["os"],"unexpected":true}"#,
-        )
-        .unwrap();
-        assert!(read_profile(&path).is_err());
-        fs::write(&path, r#"{"version":1,"structure":["os","os"]}"#).unwrap();
-        assert!(read_profile(&path).is_err());
+        assert_profile_error(&path, b"not json", FastfetchProfileError::Malformed);
+        assert_profile_error(&path, br#"{"version":2}"#, FastfetchProfileError::UnsupportedVersion);
+        assert_profile_error(&path, br#"{"version":1,"logo":"bad"}"#, FastfetchProfileError::InvalidLogo);
+        assert_profile_error(&path, br#"{"version":1,"structure":[]}"#, FastfetchProfileError::InvalidStructure);
+        assert_profile_error(&path, br#"{"version":1,"structure":["os:kernel"]}"#, FastfetchProfileError::InvalidStructure);
+        assert_profile_error(&path, br#"{"version":1,"separator":"\n"}"#, FastfetchProfileError::InvalidSeparator);
         fs::write(&path, vec![b'x'; PROFILE_MAX_BYTES + 1]).unwrap();
-        assert!(read_profile(&path).is_err());
+        assert_eq!(read_profile(&path), Err(FastfetchProfileError::TooLarge));
         fs::remove_file(&path).unwrap();
         fs::create_dir(&path).unwrap();
-        assert!(read_profile(&path).is_err());
+        assert_eq!(read_profile(&path), Err(FastfetchProfileError::UnsafePath));
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reports_unreadable_profile_paths_without_exposing_os_errors() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        let path = std::path::PathBuf::from(OsString::from_vec(b"invalid\0profile".to_vec()));
+        assert_eq!(
+            read_profile(&path),
+            Err(FastfetchProfileError::NotReadable)
+        );
     }
 
     #[cfg(unix)]
@@ -792,10 +976,10 @@ mod tests {
         let target = path.with_file_name("target.json");
         fs::write(&target, r#"{"version":1,"structure":["os"]}"#).unwrap();
         symlink(&target, &path).unwrap();
-        assert!(read_profile(&path).is_err());
+        assert_eq!(read_profile(&path), Err(FastfetchProfileError::UnsafePath));
         assert!(matches!(
             prepare("", &path).await,
-            Err(FastfetchResult::ProfileError)
+            Err(FastfetchResult::ProfileError(FastfetchProfileError::UnsafePath))
         ));
         assert_eq!(
             prepare("--no-profile", &path).await.unwrap().arguments,
@@ -806,10 +990,31 @@ mod tests {
                 "--logo",
                 "none",
                 "--structure",
-                "OS:Kernel:CPU:GPU:Memory",
+                "os:kernel:cpu:gpu:memory",
             ]
         );
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn no_profile_bypasses_a_malformed_profile() {
+        let path = test_path("no-profile-malformed");
+        fs::write(&path, "not json").unwrap();
+        assert!(matches!(
+            prepare("", &path).await,
+            Err(FastfetchResult::ProfileError(FastfetchProfileError::Malformed))
+        ));
+        assert!(prepare("--no-profile", &path).await.is_ok());
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    fn assert_profile_error(
+        path: &std::path::Path,
+        bytes: &[u8],
+        expected: FastfetchProfileError,
+    ) {
+        fs::write(path, bytes).unwrap();
+        assert_eq!(read_profile(path), Err(expected));
     }
 
     fn test_path(label: &str) -> std::path::PathBuf {

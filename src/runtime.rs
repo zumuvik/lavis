@@ -11,7 +11,7 @@ use crate::{
     aliases::{Alias, AliasStore, DeleteResult},
     command::Command,
     commands::{Action, AliasRequest, ModulesRequest, PrefixRequest, dispatch},
-    fastfetch::{self, FastfetchInputError, FastfetchResult},
+    fastfetch::{self, FastfetchInputError, FastfetchProfileError, FastfetchResult},
     help::render,
     modules::{MODULES, commands_for_module},
     response::Response,
@@ -140,7 +140,12 @@ impl RuntimeState {
                 ))
             }
             Action::Help(request) => {
-                let rendered = render(request, &prefix, &self.aliases);
+                let rendered = render(
+                    request,
+                    &prefix,
+                    &self.aliases,
+                    &self.fastfetch_profile_path,
+                );
                 if rendered.entity_fallback {
                     tracing::warn!(
                         event = "help_entity_fallback",
@@ -152,6 +157,7 @@ impl RuntimeState {
             Action::Fastfetch(arguments) => fastfetch_response(
                 fastfetch::run(arguments, &self.fastfetch_profile_path).await,
                 &prefix,
+                &self.fastfetch_profile_path,
             ),
             Action::Alias(request) => self.execute_alias(request, &prefix).await,
             Action::Prefix(request) => self.execute_prefix(request).await,
@@ -290,7 +296,7 @@ impl RuntimeState {
     }
 }
 
-fn fastfetch_response(result: FastfetchResult, prefix: &str) -> Response {
+fn fastfetch_response(result: FastfetchResult, prefix: &str, profile_path: &std::path::Path) -> Response {
     match result {
         FastfetchResult::Success(response) => response,
         FastfetchResult::Empty => fastfetch_failure("produced no output", prefix),
@@ -304,7 +310,23 @@ fn fastfetch_response(result: FastfetchResult, prefix: &str) -> Response {
             &format!("input error: {}", fastfetch_input_message(error)),
             prefix,
         ),
-        FastfetchResult::ProfileError => fastfetch_failure("profile error", prefix),
+        FastfetchResult::ProfileError(error) => Response::plain(format!(
+            "⚠️ Fastfetch profile error: {} at {profile_path:?}. See {prefix}help fastfetch",
+            fastfetch_profile_error_message(error)
+        )),
+    }
+}
+
+fn fastfetch_profile_error_message(error: FastfetchProfileError) -> &'static str {
+    match error {
+        FastfetchProfileError::NotReadable => "NotReadable",
+        FastfetchProfileError::Malformed => "Malformed",
+        FastfetchProfileError::UnsupportedVersion => "UnsupportedVersion",
+        FastfetchProfileError::TooLarge => "TooLarge",
+        FastfetchProfileError::UnsafePath => "UnsafePath",
+        FastfetchProfileError::InvalidLogo => "InvalidLogo",
+        FastfetchProfileError::InvalidStructure => "InvalidStructure",
+        FastfetchProfileError::InvalidSeparator => "InvalidSeparator",
     }
 }
 
@@ -715,6 +737,7 @@ mod tests {
                     stderr: "sensitive diagnostic".to_owned(),
                 },
                 "!",
+                std::path::Path::new("/tmp/fastfetch.json"),
             )
             .text,
             "⚠️ Fastfetch failed (exit code 1). See !help fastfetch"
@@ -728,9 +751,20 @@ mod tests {
             fastfetch_response(
                 FastfetchResult::InvalidArguments(FastfetchInputError::InvalidLogo),
                 "🦀",
+                std::path::Path::new("/tmp/fastfetch.json"),
             ),
             Response::plain("⚠️ Fastfetch input error: invalid --logo value. See 🦀help fastfetch")
         );
+        let profile_path = PathBuf::from("/tmp/profile\nfastfetch.json");
+        let response = fastfetch_response(
+            FastfetchResult::ProfileError(FastfetchProfileError::Malformed),
+            "🦀",
+            &profile_path,
+        );
+        assert!(response.text.contains("Malformed"));
+        assert!(response.text.contains(&format!("{profile_path:?}")));
+        assert!(!response.text.contains("/tmp/profile\nfastfetch.json"));
+        assert!(response.text.contains("🦀help fastfetch"));
         assert_eq!(
             runtime.resolve_alias("mini", "'"),
             Some(Action::Fastfetch("'".to_owned()))
