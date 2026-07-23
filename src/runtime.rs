@@ -506,7 +506,7 @@ mod tests {
     use crate::{
         aliases::{Alias, AliasStore},
         commands::{Action, AliasRequest},
-        fastfetch::{FastfetchInputError, FastfetchResult},
+        fastfetch::{FastfetchInputError, FastfetchProfileError, FastfetchResult},
     };
     use std::{
         fs,
