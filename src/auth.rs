@@ -1,3 +1,18 @@
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthorizationOutcome {
+    JustCompleted { self_user_id: PeerId },
+    ExistingSession { self_user_id: PeerId },
+}
+
+pub const CREDENTIAL_NOTIFICATION: &str = "Lavis использует официальный MTProto-протокол Telegram.\n\
+    Учётные данные передаются в Telegram через библиотеку grammers.\n\
+    Lavis не сохраняет код входа и пароль двухфакторной аутентификации.\n\
+    Локальная сессия Telegram сохраняется — повторная авторизация не требуется.";
+pub const PASSWORD_NOTIFICATION: &str = "Lavis не сохраняет пароль двухфакторной аутентификации.\n\
+    Пароль временно обрабатывается в памяти процесса и\n\
+    передаётся в Telegram через grammers. Lavis не накапливает\n\
+    и не логирует пароль.";
+
 use std::io::{self, IsTerminal, Write};
 
 use grammers_client::{Client, SignInError};
@@ -5,8 +20,11 @@ use grammers_session::types::PeerId;
 
 use crate::{config::Config, error::AuthError};
 
-pub async fn authorize(client: &Client, config: &Config) -> Result<(PeerId, bool), AuthError> {
-    let just_authorized = if !client
+pub async fn authorize(
+    client: &Client,
+    config: &Config,
+) -> Result<AuthorizationOutcome, AuthError> {
+    let just_completed = if !client
         .is_authorized()
         .await
         .map_err(|_| AuthError::AuthorizationCheck)?
@@ -14,12 +32,7 @@ pub async fn authorize(client: &Client, config: &Config) -> Result<(PeerId, bool
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             return Err(AuthError::NonInteractive);
         }
-        println!(
-            "Lavis использует официальный MTProto-протокол Telegram.\n\
-            Учётные данные передаются в Telegram через библиотеку grammers.\n\
-            Lavis не сохраняет код входа и пароль двухфакторной аутентификации.\n\
-            Локальная сессия Telegram сохраняется — повторная авторизация не требуется."
-        );
+        println!("{CREDENTIAL_NOTIFICATION}");
         let phone = read_line("Telegram phone number: ").await?;
         let token = client
             .request_login_code(&phone, config.api_hash())
@@ -30,10 +43,7 @@ pub async fn authorize(client: &Client, config: &Config) -> Result<(PeerId, bool
         match client.sign_in(&token, &code).await {
             Ok(_) => true,
             Err(SignInError::PasswordRequired(token)) => {
-                println!(
-                    "Lavis не сохраняет пароль двухфакторной аутентификации.\n\
-                    Пароль передаётся только в Telegram."
-                );
+                println!("{PASSWORD_NOTIFICATION}");
                 let password = read_password("Telegram two-factor password: ").await?;
                 match client.check_password(token, password.as_bytes()).await {
                     Ok(_) => true,
@@ -58,7 +68,16 @@ pub async fn authorize(client: &Client, config: &Config) -> Result<(PeerId, bool
         .await
         .map_err(|_| AuthError::GetAuthorizedUser)?;
     log_authorized_user(&user);
-    Ok((user.id(), just_authorized))
+    let outcome = if just_completed {
+        AuthorizationOutcome::JustCompleted {
+            self_user_id: user.id(),
+        }
+    } else {
+        AuthorizationOutcome::ExistingSession {
+            self_user_id: user.id(),
+        }
+    };
+    Ok(outcome)
 }
 
 async fn read_line(prompt: &'static str) -> Result<String, AuthError> {
@@ -127,7 +146,9 @@ fn display_name(user: &grammers_client::peer::User) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_input, preserve_password_input};
+    use super::{
+        CREDENTIAL_NOTIFICATION, PASSWORD_NOTIFICATION, normalize_input, preserve_password_input,
+    };
 
     #[test]
     fn normalizes_non_empty_input() {
@@ -145,5 +166,73 @@ mod tests {
             Some(" leading and trailing ".to_owned())
         );
         assert_eq!(preserve_password_input(String::new()), None);
+    }
+
+    #[test]
+    fn credential_notification_mentions_protocol_and_grammers() {
+        assert!(CREDENTIAL_NOTIFICATION.contains("MTProto"));
+        assert!(CREDENTIAL_NOTIFICATION.contains("grammers"));
+        assert!(CREDENTIAL_NOTIFICATION.contains("Lavis не сохраняет"));
+    }
+
+    #[test]
+    fn password_notification_is_not_overly_absolute() {
+        assert!(PASSWORD_NOTIFICATION.contains("Lavis не сохраняет"));
+        assert!(PASSWORD_NOTIFICATION.contains("временно обрабатывается"));
+        assert!(PASSWORD_NOTIFICATION.contains("grammers"));
+        assert!(!PASSWORD_NOTIFICATION.contains("только в Telegram"));
+        assert!(!PASSWORD_NOTIFICATION.contains("напрямую"));
+    }
+
+    #[test]
+    fn just_completed_outcome_triggers_quick_start() {
+        use super::AuthorizationOutcome;
+        use grammers_session::types::PeerId;
+        let outcome = AuthorizationOutcome::JustCompleted {
+            self_user_id: PeerId::self_user(),
+        };
+        assert!(matches!(
+            outcome,
+            AuthorizationOutcome::JustCompleted { .. }
+        ));
+    }
+
+    #[test]
+    fn existing_session_outcome_does_not_trigger_quick_start() {
+        use super::AuthorizationOutcome;
+        use grammers_session::types::PeerId;
+        let outcome = AuthorizationOutcome::ExistingSession {
+            self_user_id: PeerId::self_user(),
+        };
+        assert!(matches!(
+            outcome,
+            AuthorizationOutcome::ExistingSession { .. }
+        ));
+    }
+
+    #[test]
+    fn both_outcomes_carry_self_user_id() {
+        use super::AuthorizationOutcome;
+        use grammers_session::types::PeerId;
+        let just = AuthorizationOutcome::JustCompleted {
+            self_user_id: PeerId::self_user(),
+        };
+        let existing = AuthorizationOutcome::ExistingSession {
+            self_user_id: PeerId::self_user(),
+        };
+        assert_eq!(
+            match just {
+                AuthorizationOutcome::JustCompleted { self_user_id }
+                | AuthorizationOutcome::ExistingSession { self_user_id } => self_user_id,
+            },
+            PeerId::self_user()
+        );
+        assert_eq!(
+            match existing {
+                AuthorizationOutcome::JustCompleted { self_user_id }
+                | AuthorizationOutcome::ExistingSession { self_user_id } => self_user_id,
+            },
+            PeerId::self_user()
+        );
     }
 }

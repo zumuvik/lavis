@@ -1382,4 +1382,36 @@ mod tests {
         assert_eq!(cmd.arguments, ["--config", "none", "--pipe"]);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
+
+    #[test]
+    fn documented_examples_are_accepted_by_the_real_parser() {
+        {
+            let tokens = tokenize("--logo NixOS").unwrap();
+            let options = parse_options(&tokens).unwrap();
+            assert!(matches!(
+                options.logo,
+                Some(super::Logo::Builtin(super::BuiltinLogo::NixOS))
+            ));
+        }
+        {
+            let tokens = tokenize("--logo-padding-right 3").unwrap();
+            let options = parse_options(&tokens).unwrap();
+            assert_eq!(options.logo_padding.right, Some(3));
+        }
+        {
+            let tokens = tokenize("--structure OS:Kernel:CPU").unwrap();
+            let options = parse_options(&tokens).unwrap();
+            assert!(options.structure.is_some());
+        }
+        {
+            let tokens = tokenize("--no-profile").unwrap();
+            let options = parse_options(&tokens).unwrap();
+            assert!(options.no_profile);
+        }
+        {
+            let tokens = tokenize("--separator \" -> \"").unwrap();
+            let options = parse_options(&tokens).unwrap();
+            assert_eq!(options.separator, Some(" -> ".to_owned()));
+        }
+    }
 }

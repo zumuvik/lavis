@@ -24,6 +24,8 @@ pub mod runtime;
 pub mod settings;
 pub mod updates;
 
+use auth::AuthorizationOutcome;
+
 pub async fn run() -> anyhow::Result<()> {
     match parse_cli(env::args_os().skip(1))? {
         CliCommand::Run => run_command(false).await,
@@ -75,28 +77,27 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
         .await
         .context("failed to open the Telegram session")?;
 
+    let settings = settings::SettingsStore::load(config.settings_path.clone())
+        .await
+        .context("failed to load persistent settings")?;
+    let prefix = settings.prefix().to_owned();
+
     let run_result = async {
-        let (self_user_id, just_authorized) = auth::authorize(client.client(), &config)
+        let outcome = auth::authorize(client.client(), &config)
             .await
             .context("Telegram authorization failed")
             .map_err(|error| authorization_failure(error, newly_saved))?;
 
-        if just_authorized {
-            let prefix = settings::SettingsStore::load(config.settings_path.clone())
-                .await
-                .context("failed to load prefix for quick start")?
-                .prefix()
-                .to_owned();
+        if let AuthorizationOutcome::JustCompleted { .. } = outcome {
             let quick_start = format!(
                 "✅ Авторизация завершена\n\n\
                 Начало работы:\n  {prefix}help\n  {prefix}modules\n  {prefix}help fastfetch\n  {prefix}help alias"
             );
-            let input = grammers_client::message::InputMessage::new().text(quick_start);
             if let Err(error) = client
                 .client()
                 .send_message(
                     &grammers_client::tl::types::InputPeerSelf {},
-                    input,
+                    grammers_client::message::InputMessage::new().text(quick_start.clone()),
                 )
                 .await
             {
@@ -105,15 +106,20 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
                     error = %error,
                     "Failed to send post-auth quick start message"
                 );
+                let _ = writeln!(
+                    io::stdout().lock(),
+                    "Quick-start message could not be sent to Telegram:\n{quick_start}"
+                );
             }
         }
 
         if auth_only {
             return Ok(());
         }
-        let settings = settings::SettingsStore::load(config.settings_path.clone())
-            .await
-            .context("failed to load persistent settings")?;
+        let self_user_id = match outcome {
+            AuthorizationOutcome::JustCompleted { self_user_id }
+            | AuthorizationOutcome::ExistingSession { self_user_id } => self_user_id,
+        };
         initialize_dialog_cache(client.client()).await?;
         let receiver = client
             .take_updates()
