@@ -296,7 +296,11 @@ impl RuntimeState {
     }
 }
 
-fn fastfetch_response(result: FastfetchResult, prefix: &str, profile_path: &std::path::Path) -> Response {
+fn fastfetch_response(
+    result: FastfetchResult,
+    prefix: &str,
+    profile_path: &std::path::Path,
+) -> Response {
     match result {
         FastfetchResult::Success(response) => response,
         FastfetchResult::Empty => fastfetch_failure("produced no output", prefix),

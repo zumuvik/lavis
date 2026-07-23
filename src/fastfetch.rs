@@ -345,7 +345,8 @@ fn read_profile(path: &Path) -> Result<PartialOptions, FastfetchProfileError> {
     if bytes.len() > PROFILE_MAX_BYTES {
         return Err(FastfetchProfileError::TooLarge);
     }
-    let profile: Profile = serde_json::from_slice(&bytes).map_err(|_| FastfetchProfileError::Malformed)?;
+    let profile: Profile =
+        serde_json::from_slice(&bytes).map_err(|_| FastfetchProfileError::Malformed)?;
     if profile.version != 1 {
         return Err(FastfetchProfileError::UnsupportedVersion);
     }
@@ -879,12 +880,7 @@ mod tests {
             ])
             .unwrap(),
         );
-        let alias_arguments = shell_words::join([
-            "--logo",
-            "arch",
-            "--structure",
-            "OS:Kernel:CPU",
-        ]);
+        let alias_arguments = shell_words::join(["--logo", "arch", "--structure", "OS:Kernel:CPU"]);
         let alias = compile(
             parse_options(&[]).unwrap(),
             parse_options(&shell_words::split(&alias_arguments).unwrap()).unwrap(),
@@ -913,8 +909,15 @@ mod tests {
         assert_eq!(
             compile(read_profile(&path).unwrap(), parse_options(&[]).unwrap()).arguments,
             [
-                "--config", "none", "--pipe", "--logo-type", "builtin", "--logo", "Arch",
-                "--structure", "os:kernel:cpu:gpu:memory",
+                "--config",
+                "none",
+                "--pipe",
+                "--logo-type",
+                "builtin",
+                "--logo",
+                "Arch",
+                "--structure",
+                "os:kernel:cpu:gpu:memory",
             ]
         );
         fs::write(
@@ -943,11 +946,31 @@ mod tests {
             ]
         );
         assert_profile_error(&path, b"not json", FastfetchProfileError::Malformed);
-        assert_profile_error(&path, br#"{"version":2}"#, FastfetchProfileError::UnsupportedVersion);
-        assert_profile_error(&path, br#"{"version":1,"logo":"bad"}"#, FastfetchProfileError::InvalidLogo);
-        assert_profile_error(&path, br#"{"version":1,"structure":[]}"#, FastfetchProfileError::InvalidStructure);
-        assert_profile_error(&path, br#"{"version":1,"structure":["os:kernel"]}"#, FastfetchProfileError::InvalidStructure);
-        assert_profile_error(&path, br#"{"version":1,"separator":"\n"}"#, FastfetchProfileError::InvalidSeparator);
+        assert_profile_error(
+            &path,
+            br#"{"version":2}"#,
+            FastfetchProfileError::UnsupportedVersion,
+        );
+        assert_profile_error(
+            &path,
+            br#"{"version":1,"logo":"bad"}"#,
+            FastfetchProfileError::InvalidLogo,
+        );
+        assert_profile_error(
+            &path,
+            br#"{"version":1,"structure":[]}"#,
+            FastfetchProfileError::InvalidStructure,
+        );
+        assert_profile_error(
+            &path,
+            br#"{"version":1,"structure":["os:kernel"]}"#,
+            FastfetchProfileError::InvalidStructure,
+        );
+        assert_profile_error(
+            &path,
+            br#"{"version":1,"separator":"\n"}"#,
+            FastfetchProfileError::InvalidSeparator,
+        );
         fs::write(&path, vec![b'x'; PROFILE_MAX_BYTES + 1]).unwrap();
         assert_eq!(read_profile(&path), Err(FastfetchProfileError::TooLarge));
         fs::remove_file(&path).unwrap();
@@ -962,10 +985,7 @@ mod tests {
         use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 
         let path = std::path::PathBuf::from(OsString::from_vec(b"invalid\0profile".to_vec()));
-        assert_eq!(
-            read_profile(&path),
-            Err(FastfetchProfileError::NotReadable)
-        );
+        assert_eq!(read_profile(&path), Err(FastfetchProfileError::NotReadable));
     }
 
     #[cfg(unix)]
@@ -979,7 +999,9 @@ mod tests {
         assert_eq!(read_profile(&path), Err(FastfetchProfileError::UnsafePath));
         assert!(matches!(
             prepare("", &path).await,
-            Err(FastfetchResult::ProfileError(FastfetchProfileError::UnsafePath))
+            Err(FastfetchResult::ProfileError(
+                FastfetchProfileError::UnsafePath
+            ))
         ));
         assert_eq!(
             prepare("--no-profile", &path).await.unwrap().arguments,
@@ -1002,17 +1024,15 @@ mod tests {
         fs::write(&path, "not json").unwrap();
         assert!(matches!(
             prepare("", &path).await,
-            Err(FastfetchResult::ProfileError(FastfetchProfileError::Malformed))
+            Err(FastfetchResult::ProfileError(
+                FastfetchProfileError::Malformed
+            ))
         ));
         assert!(prepare("--no-profile", &path).await.is_ok());
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
-    fn assert_profile_error(
-        path: &std::path::Path,
-        bytes: &[u8],
-        expected: FastfetchProfileError,
-    ) {
+    fn assert_profile_error(path: &std::path::Path, bytes: &[u8], expected: FastfetchProfileError) {
         fs::write(path, bytes).unwrap();
         assert_eq!(read_profile(path), Err(expected));
     }
