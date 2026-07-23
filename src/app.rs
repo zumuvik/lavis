@@ -95,7 +95,7 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
             if let Err(error) = client
                 .client()
                 .send_message(
-                    &grammers_client::tl::types::InputPeerSelf,
+                    &grammers_client::tl::types::InputPeerSelf {},
                     input,
                 )
                 .await
