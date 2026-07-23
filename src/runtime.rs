@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
@@ -22,6 +23,7 @@ pub struct RuntimeState {
     recognized_commands: u64,
     aliases: AliasStore,
     settings: SettingsStore,
+    fastfetch_profile_path: PathBuf,
     expected_self_edits: VecDeque<ExpectedSelfEdit>,
 }
 
@@ -35,12 +37,18 @@ struct ExpectedSelfEdit {
 }
 
 impl RuntimeState {
-    pub fn new(started_at: Instant, aliases: AliasStore, settings: SettingsStore) -> Self {
+    pub fn new(
+        started_at: Instant,
+        aliases: AliasStore,
+        settings: SettingsStore,
+        fastfetch_profile_path: PathBuf,
+    ) -> Self {
         Self {
             started_at,
             recognized_commands: 0,
             aliases,
             settings,
+            fastfetch_profile_path,
             expected_self_edits: VecDeque::new(),
         }
     }
@@ -84,7 +92,18 @@ impl RuntimeState {
     }
 
     pub fn resolve_alias(&self, name: &str, args: &str) -> Option<Action> {
-        let invocation_args = shell_words::split(args).ok()?;
+        let invocation_args = match shell_words::split(args) {
+            Ok(arguments) => arguments,
+            Err(_)
+                if self
+                    .aliases
+                    .lookup(name)
+                    .is_some_and(|alias| alias.target == "fastfetch") =>
+            {
+                return Some(Action::Fastfetch(args.to_owned()));
+            }
+            Err(_) => return None,
+        };
         let invocation = self.aliases.invocation(name, &invocation_args).ok()??;
         dispatch(&Command {
             name: invocation.target,
@@ -130,7 +149,10 @@ impl RuntimeState {
                 }
                 rendered.response
             }
-            Action::Fastfetch(arguments) => fastfetch_response(fastfetch::run(arguments).await),
+            Action::Fastfetch(arguments) => fastfetch_response(
+                fastfetch::run(arguments, &self.fastfetch_profile_path).await,
+                &prefix,
+            ),
             Action::Alias(request) => self.execute_alias(request, &prefix).await,
             Action::Prefix(request) => self.execute_prefix(request).await,
             Action::Modules(request) => self.execute_modules(request, &prefix),
@@ -268,21 +290,28 @@ impl RuntimeState {
     }
 }
 
-fn fastfetch_response(result: FastfetchResult) -> Response {
+fn fastfetch_response(result: FastfetchResult, prefix: &str) -> Response {
     match result {
         FastfetchResult::Success(response) => response,
-        FastfetchResult::Empty => Response::plain("⚠️ Fastfetch produced no output"),
-        FastfetchResult::TimedOut => Response::plain("⚠️ Fastfetch timed out"),
-        FastfetchResult::Unavailable => Response::plain("⚠️ Fastfetch is unavailable"),
+        FastfetchResult::Empty => fastfetch_failure("produced no output", prefix),
+        FastfetchResult::TimedOut => fastfetch_failure("timed out", prefix),
+        FastfetchResult::Unavailable => fastfetch_failure("is unavailable", prefix),
         FastfetchResult::NonZero { code, .. } => {
-            Response::plain(format!("⚠️ Fastfetch failed (exit code {code})"))
+            fastfetch_failure(&format!("failed (exit code {code})"), prefix)
         }
-        FastfetchResult::UnexpectedStatus => Response::plain("⚠️ Fastfetch ended unexpectedly"),
-        FastfetchResult::InvalidArguments(error) => Response::plain(format!(
-            "⚠️ Invalid fastfetch options: {}",
-            fastfetch_input_message(error)
-        )),
+        FastfetchResult::UnexpectedStatus => fastfetch_failure("ended unexpectedly", prefix),
+        FastfetchResult::InvalidArguments(error) => {
+            fastfetch_failure(
+                &format!("input error: {}", fastfetch_input_message(error)),
+                prefix,
+            )
+        }
+        FastfetchResult::ProfileError => fastfetch_failure("profile error", prefix),
     }
+}
+
+fn fastfetch_failure(message: &str, prefix: &str) -> Response {
+    Response::plain(format!("⚠️ Fastfetch {message}. See {prefix}help fastfetch"))
 }
 
 fn fastfetch_input_message(error: FastfetchInputError) -> &'static str {
@@ -290,7 +319,8 @@ fn fastfetch_input_message(error: FastfetchInputError) -> &'static str {
         FastfetchInputError::Tokenization => "invalid quoting",
         FastfetchInputError::UnsupportedOption => "unsupported option",
         FastfetchInputError::MissingValue => "option value is missing",
-        FastfetchInputError::InvalidLogo => "only --logo none is allowed",
+        FastfetchInputError::DuplicateOption => "option is repeated",
+        FastfetchInputError::InvalidLogo => "invalid --logo value",
         FastfetchInputError::InvalidStructure => "invalid --structure value",
         FastfetchInputError::InvalidSeparator => "invalid --separator value",
     }
@@ -449,8 +479,8 @@ mod tests {
     use crate::response::Response;
     use crate::{
         aliases::{Alias, AliasStore},
-        commands::AliasRequest,
-        fastfetch::FastfetchResult,
+        commands::{Action, AliasRequest},
+        fastfetch::{FastfetchInputError, FastfetchResult},
     };
     use std::{
         fs,
@@ -482,7 +512,12 @@ mod tests {
             .await
             .unwrap();
         (
-            super::RuntimeState::new(Instant::now(), aliases, settings),
+            super::RuntimeState::new(
+                Instant::now(),
+                aliases,
+                settings,
+                directory.join("fastfetch.json"),
+            ),
             directory,
         )
     }
@@ -674,13 +709,35 @@ mod tests {
     #[test]
     fn reports_fastfetch_exit_codes_without_stderr() {
         assert_eq!(
-            fastfetch_response(FastfetchResult::NonZero {
-                code: 1,
-                stderr: "sensitive diagnostic".to_owned(),
-            })
+            fastfetch_response(
+                FastfetchResult::NonZero {
+                    code: 1,
+                    stderr: "sensitive diagnostic".to_owned(),
+                },
+                "!",
+            )
             .text,
-            "⚠️ Fastfetch failed (exit code 1)"
+            "⚠️ Fastfetch failed (exit code 1). See !help fastfetch"
         );
+    }
+
+    #[tokio::test]
+    async fn fastfetch_errors_use_prefix_and_malformed_aliases_are_visible() {
+        let (runtime, directory) = runtime_with_alias().await;
+        assert_eq!(
+            fastfetch_response(
+                FastfetchResult::InvalidArguments(FastfetchInputError::InvalidLogo),
+                "🦀",
+            ),
+            Response::plain(
+                "⚠️ Fastfetch input error: invalid --logo value. See 🦀help fastfetch"
+            )
+        );
+        assert_eq!(
+            runtime.resolve_alias("mini", "'"),
+            Some(Action::Fastfetch("'".to_owned()))
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

@@ -162,7 +162,7 @@ mod tests {
 
         assert_eq!(
             response.text,
-            "🛠 Lavis commands\n\n🧩 core (5)\n!help [command] — Show command help\n!modules — List internal modules\n!ping — Measure Telegram latency\n!prefix [new-prefix|reset] — Show or change the command prefix\n!stats — Show runtime statistics\n\n🖥 system (1)\n!fastfetch [options] — Show system information\n\n🔗 aliases (1)\n!alias [list|add <name> <command> [arguments...]|show <name>|del <name>] — Manage command aliases"
+            "🛠 Lavis commands\n\n🧩 core (5)\n!help [command] — Show command help\n!modules — List internal modules\n!ping — Measure Telegram latency\n!prefix [new-prefix|reset] — Show or change the command prefix\n!stats — Show runtime statistics\n\n🖥 system (1)\n!fastfetch [--no-profile] [--logo <...>] [--structure <...>] [--separator <text>] — Показать системную информацию\n\n🔗 aliases (1)\n!alias [list|add <name> <command> [arguments...]|show <name>|del <name>] — Manage command aliases"
         );
         for command in [
             "help",
@@ -243,7 +243,7 @@ mod tests {
         let system = render(&HelpRequest::Topic("SyStEm".to_owned()), "!", &modules).response;
         assert_eq!(
             system.text,
-            "🖥 system module\n\nSystem information commands.\n\n!fastfetch [options] — Show system information"
+            "🖥 system module\n\nSystem information commands.\n\n!fastfetch [--no-profile] [--logo <...>] [--structure <...>] [--separator <text>] — Показать системную информацию"
         );
         assert_eq!(system.entities.len(), 1);
         let grammers_client::tl::enums::MessageEntity::Blockquote(entity) = &system.entities[0]
@@ -255,11 +255,11 @@ mod tests {
         let length = usize::try_from(entity.length).unwrap();
         assert_eq!(
             String::from_utf16(&units[offset..offset + length]).unwrap(),
-            "System information commands.\n\n!fastfetch [options] — Show system information"
+            "System information commands.\n\n!fastfetch [--no-profile] [--logo <...>] [--structure <...>] [--separator <text>] — Показать системную информацию"
         );
         assert_eq!(
             length,
-            "System information commands.\n\n!fastfetch [options] — Show system information"
+            "System information commands.\n\n!fastfetch [--no-profile] [--logo <...>] [--structure <...>] [--separator <text>] — Показать системную информацию"
                 .encode_utf16()
                 .count()
         );

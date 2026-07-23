@@ -90,9 +90,9 @@ pub const COMMANDS: CommandRegistry = CommandRegistry([
     CommandDefinition {
         kind: CommandKind::Fastfetch,
         name: "fastfetch",
-        usage: "fastfetch [options]",
-        summary: "Show system information",
-        description: "Runs fastfetch with a restricted set of display options.",
+        usage: "fastfetch [--no-profile] [--logo <...>] [--structure <...>] [--separator <text>]",
+        summary: "Показать системную информацию",
+        description: "Разрешены только --no-profile, --logo none|Alpine|Arch|Debian|Fedora|FreeBSD|Linux|MacOS|NixOS|OpenBSD|Ubuntu|Windows, --structure из title:separator:os:kernel:uptime:cpu:memory:gpu:packages:shell:terminal:terminalsize и --separator.",
         icon: "🖥",
         aliasable: true,
         module: ModuleId::System,

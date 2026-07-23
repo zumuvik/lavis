@@ -143,6 +143,7 @@ mod tests {
             SettingsStore::load(PathBuf::from("/nonexistent/lavis-updates-settings.json"))
                 .await
                 .unwrap(),
+            PathBuf::from("/nonexistent/lavis-updates-fastfetch.json"),
         )
     }
 
@@ -193,7 +194,12 @@ mod tests {
             .await
             .unwrap();
         settings.set_prefix(".".to_owned()).await.unwrap();
-        let runtime = RuntimeState::new(Instant::now(), aliases, settings);
+        let runtime = RuntimeState::new(
+            Instant::now(),
+            aliases,
+            settings,
+            directory.join("fastfetch.json"),
+        );
         assert_eq!(
             route(true, ".help", &runtime),
             Some(Action::Help(crate::commands::HelpRequest::Overview))
@@ -229,7 +235,12 @@ mod tests {
         let settings = SettingsStore::load(directory.join("settings.json"))
             .await
             .unwrap();
-        let mut runtime = RuntimeState::new(Instant::now(), aliases, settings);
+        let mut runtime = RuntimeState::new(
+            Instant::now(),
+            aliases,
+            settings,
+            directory.join("fastfetch.json"),
+        );
 
         assert_eq!(
             route(true, ",modules", &runtime),

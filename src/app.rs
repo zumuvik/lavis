@@ -65,11 +65,10 @@ fn parse_cli(arguments: impl IntoIterator<Item = OsString>) -> anyhow::Result<Cl
 async fn run_command(auth_only: bool) -> anyhow::Result<()> {
     let started_at = Instant::now();
     let environment = |name: &str| std::env::var_os(name);
-    let session_path = config::ConfigPaths::state_session_path_with(&environment)
-        .context("failed to determine application state path")?;
     let resolved = resolve_or_onboard(&environment).await?;
     let newly_saved = resolved.newly_saved;
-    let paths = config::ConfigPaths::new(session_path);
+    let paths = config::ConfigPaths::default_with(&environment)
+        .context("failed to determine application paths")?;
     let config = config::Config::from_credentials(resolved.credentials, paths)
         .context("failed to load configuration")?;
     let mut client = client::TelegramClient::connect(&config)
@@ -109,7 +108,12 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
             .await
             .context("failed to load persistent aliases")?;
         tracing::info!(event = "application_started", "lavis is running");
-        let mut runtime = runtime::RuntimeState::new(started_at, aliases, settings);
+        let mut runtime = runtime::RuntimeState::new(
+            started_at,
+            aliases,
+            settings,
+            config.fastfetch_profile_path.clone(),
+        );
         updates::run(&mut stream, self_user_id, client.client(), &mut runtime).await?;
         drop(stream);
         Ok(())
