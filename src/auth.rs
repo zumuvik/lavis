@@ -11,22 +11,21 @@ impl AuthorizationOutcome {
 
     pub fn self_user_id(self) -> PeerId {
         match self {
-            Self::JustCompleted { self_user_id }
-            | Self::ExistingSession { self_user_id } => self_user_id,
+            Self::JustCompleted { self_user_id } | Self::ExistingSession { self_user_id } => {
+                self_user_id
+            }
         }
     }
 }
 
-pub const CREDENTIAL_NOTIFICATION: &str =
-    "Lavis использует авторизацию Telegram по MTProto.\n\n\
+pub const CREDENTIAL_NOTIFICATION: &str = "Lavis использует авторизацию Telegram по MTProto.\n\n\
     Код входа временно обрабатывается в памяти процесса и\n\
     передаётся Telegram через библиотеку grammers.\n\
     Lavis намеренно не записывает код в постоянное хранилище\n\
     и не добавляет его в логи или диагностику.\n\n\
     Локальная сессия Telegram сохраняется, чтобы не выполнять\n\
     авторизацию при каждом запуске.";
-pub const PASSWORD_NOTIFICATION: &str =
-    "Пароль 2FA временно обрабатывается в памяти процесса и\n\
+pub const PASSWORD_NOTIFICATION: &str = "Пароль 2FA временно обрабатывается в памяти процесса и\n\
     передаётся Telegram через библиотеку grammers.\n\
     Lavis намеренно не записывает пароль в постоянное хранилище\n\
     и не добавляет его в логи или диагностику.";
