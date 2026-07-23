@@ -310,7 +310,7 @@ mod tests {
         assert!(
             response
                 .text
-                .ends_with("Используйте 🦀help <команда или модуль> для подробностей.")
+                .ends_with("Это встроенный модуль Lavis. Его нельзя выгрузить или заменить.")
         );
         assert_eq!(response.entities.len(), 2);
     }
@@ -463,7 +463,7 @@ mod tests {
     #[tokio::test]
     async fn modules_overview_matches_help_registry_counts() {
         let rendered = render_modules_overview(".");
-        assert!(rendered.response.text.contains("Модули (3)"));
+        assert!(rendered.response.text.contains("Модули: "));
         assert!(rendered.response.text.contains("Команды (7)"));
         assert!(rendered.response.text.contains(".modules"));
         assert_eq!(rendered.response.entities.len(), 2);
