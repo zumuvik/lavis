@@ -146,7 +146,7 @@ fn generic_command_primary(command: &CommandDefinition, prefix: &str, module_nam
 
 fn fastfetch_primary(prefix: &str, command: &CommandDefinition, module_name: &str) -> String {
     format!(
-        "{}\n\nИспользование: {prefix}{}\nМодуль: {module_name}\nРиск: {}\nПримеры: {prefix}fastfetch --logo arch; {prefix}fastfetch --structure OS:Kernel:CPU.\n\nЛоготипы: none, Alpine, Arch, Debian, Fedora, FreeBSD, Linux, MacOS, NixOS, OpenBSD, Ubuntu, Windows.\nСтруктура: title, separator, os, kernel, uptime, cpu, memory, gpu, packages, shell, terminal, terminalsize, host, display, wm, de, theme, icons, font, cursor, disk, swap, localip, battery, poweradapter, locale.\nРазделитель: 1–64 печатных ASCII-символа.\nОтступ логотипа: --logo-padding-left <n>, --logo-padding-right <n>, --logo-padding-top <n>; 0–32.\n\nПоля профиля: logo_padding_left, logo_padding_right, logo_padding_top (0–32, целые числа).\n\n{prefix}fastfetch --no-profile не читает профиль. Профиль: $XDG_CONFIG_HOME/lavis/fastfetch.json или $HOME/.config/lavis/fastfetch.json.\nМинимальный JSON: {{ \"version\": 1 }}\nПриоритет: значения Fastfetch по умолчанию < профиль < параметры команды.\nПсевдоним: {prefix}alias add sys fastfetch --logo arch; затем {prefix}sys.\n\nКавычки группируют аргументы для разбора shell-words; оболочка не запускается, а shell-метасимволы остаются данными. Каждый процесс запускается только с --config none --pipe; нативные конфиги и пресеты Fastfetch запрещены. Вывод может раскрыть данные хоста, сети, дисплея, питания и оборудования.",
+        "{}\n\nИспользование: {prefix}{}\nМодуль: {module_name}\nРиск: {}\n\nПримеры:\n{prefix}fastfetch --logo NixOS\n{prefix}fastfetch --logo-padding-right 3\n{prefix}fastfetch --separator \" -> \"\n{prefix}fastfetch --structure OS:Kernel:CPU\n\nЛоготипы: none, Alpine, Arch, Debian, Fedora, FreeBSD, Linux, MacOS, NixOS, OpenBSD, Ubuntu, Windows.\nСтруктура: title, separator, os, kernel, uptime, cpu, memory, gpu, packages, shell, terminal, terminalsize, host, display, wm, de, theme, icons, font, cursor, disk, swap, localip, battery, poweradapter, locale.\nРазделитель: 1–64 печатных ASCII-символа.\nОтступ логотипа: --logo-padding-left <n>, --logo-padding-right <n>, --logo-padding-top <n>; 0–32.\n\nПоля профиля: logo_padding_left, logo_padding_right, logo_padding_top (0–32, целые числа).\n\n{prefix}fastfetch --no-profile не читает профиль. Профиль: $XDG_CONFIG_HOME/lavis/fastfetch.json или $HOME/.config/lavis/fastfetch.json.\nМинимальный JSON: {{ \"version\": 1 }}\nПриоритет: значения Fastfetch по умолчанию < профиль < параметры команды.\nПсевдоним: {prefix}alias add sys fastfetch --logo arch; затем {prefix}sys.\n\nКавычки группируют аргументы для разбора shell-words; оболочка не запускается, а shell-метасимволы остаются данными. Каждый процесс запускается только с --config none --pipe; нативные конфиги и пресеты Fastfetch запрещены. Вывод может раскрыть данные хоста, сети, дисплея, питания и оборудования.",
         command.description_ru,
         command.usage,
         risk_label(command.risk)
@@ -165,7 +165,8 @@ fn render_alias(topic: &str, prefix: &str, aliases: &AliasStore) -> Option<Rende
     Some(documentation(
         format!("🔗 {prefix}{topic}"),
         format!(
-            "Псевдоним вызывает {prefix}{}; аргументы вызова добавляются после сохранённых аргументов.\nСохранённые аргументы: {stored}\nЦелевой модуль: {}\nРиск цели: {}",
+            "Псевдонимы позволяют вызывать канонические команды под другим именем с заранее заданными аргументами. Канонические команды имеют приоритет над псевдонимами: псевдоним не может переопределить встроенную команду с тем же именем.\n\nПример: {prefix}alias add sys fastfetch --logo arch; затем {prefix}sys.\nСохранённые аргументы: {stored}.\n\n{prefix}{} вызывает {prefix}{}; сохранённые аргументы объединяются с аргументами вызова.\nЦелевой модуль: {}\nРиск цели: {}",
+            topic,
             command.name,
             module.name,
             risk_label(command.risk)
@@ -489,5 +490,71 @@ mod tests {
             String::from_utf16(&units[provenance_start..provenance_end]).unwrap(),
             "Это встроенный модуль Lavis. Его нельзя выгрузить или заменить."
         );
+    }
+
+    #[tokio::test]
+    async fn alias_help_uses_active_prefix_and_explains_canonical_priority() {
+        let (aliases, directory) = aliases_with_core_alias().await;
+        let response = render(&HelpRequest::Topic("core".to_owned()), "🦀", &aliases).response;
+        assert!(response.text.starts_with("🔗 🦀core"));
+        assert!(
+            response
+                .text
+                .contains("Псевдонимы позволяют вызывать канонические команды под другим именем")
+        );
+        assert!(
+            response
+                .text
+                .contains("псевдоним не может переопределить встроенную команду")
+        );
+        assert!(
+            response
+                .text
+                .contains("🦀alias add sys fastfetch --logo arch")
+        );
+        assert!(response.text.contains("🦀sys"));
+        assert!(!response.text.contains(",alias"));
+        assert!(response.text.contains("🦀fastfetch"));
+        assert!(!response.text.contains("/home/"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn fastfetch_help_has_compact_examples_with_active_prefix() {
+        let response = render(
+            &HelpRequest::Topic("fastfetch".to_owned()),
+            "🦀",
+            &aliases().await,
+        )
+        .response;
+        assert!(response.text.contains("🦀fastfetch --logo NixOS"));
+        assert!(response.text.contains("🦀fastfetch --logo-padding-right 3"));
+        assert!(response.text.contains("🦀fastfetch --separator \" -> \""));
+        assert!(
+            response
+                .text
+                .contains("🦀fastfetch --structure OS:Kernel:CPU")
+        );
+        assert!(!response.text.contains("/home/"));
+        assert!(response.text.contains("🦀fastfetch --no-profile"));
+    }
+
+    #[tokio::test]
+    async fn fastfetch_help_preserves_security_and_path_documentation() {
+        let response = render(
+            &HelpRequest::Topic("fastfetch".to_owned()),
+            "🦀",
+            &aliases().await,
+        )
+        .response;
+        assert!(
+            response
+                .text
+                .contains("$XDG_CONFIG_HOME/lavis/fastfetch.json")
+        );
+        assert!(response.text.contains("--config none"));
+        assert!(response.text.contains("shell-words"));
+        assert!(response.text.contains("shell-метасимволы остаются данными"));
+        assert!(!response.text.contains("/tmp/"));
     }
 }

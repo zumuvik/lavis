@@ -5,8 +5,8 @@ use grammers_session::types::PeerId;
 
 use crate::{config::Config, error::AuthError};
 
-pub async fn authorize(client: &Client, config: &Config) -> Result<PeerId, AuthError> {
-    if !client
+pub async fn authorize(client: &Client, config: &Config) -> Result<(PeerId, bool), AuthError> {
+    let just_authorized = if !client
         .is_authorized()
         .await
         .map_err(|_| AuthError::AuthorizationCheck)?
@@ -14,6 +14,12 @@ pub async fn authorize(client: &Client, config: &Config) -> Result<PeerId, AuthE
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             return Err(AuthError::NonInteractive);
         }
+        println!(
+            "Lavis использует официальный MTProto-протокол Telegram.\n\
+            Учётные данные передаются в Telegram через библиотеку grammers.\n\
+            Lavis не сохраняет код входа и пароль двухфакторной аутентификации.\n\
+            Локальная сессия Telegram сохраняется — повторная авторизация не требуется."
+        );
         let phone = read_line("Telegram phone number: ").await?;
         let token = client
             .request_login_code(&phone, config.api_hash())
@@ -22,11 +28,15 @@ pub async fn authorize(client: &Client, config: &Config) -> Result<PeerId, AuthE
         let code = read_secret("Telegram login code: ").await?;
 
         match client.sign_in(&token, &code).await {
-            Ok(_) => {}
+            Ok(_) => true,
             Err(SignInError::PasswordRequired(token)) => {
+                println!(
+                    "Lavis не сохраняет пароль двухфакторной аутентификации.\n\
+                    Пароль передаётся только в Telegram."
+                );
                 let password = read_password("Telegram two-factor password: ").await?;
                 match client.check_password(token, password.as_bytes()).await {
-                    Ok(_) => {}
+                    Ok(_) => true,
                     Err(SignInError::SignUpRequired) => return Err(AuthError::SignUpRequired),
                     Err(SignInError::PasswordRequired(_)) => return Err(AuthError::SignIn),
                     Err(SignInError::InvalidCode) => return Err(AuthError::SignIn),
@@ -39,14 +49,16 @@ pub async fn authorize(client: &Client, config: &Config) -> Result<PeerId, AuthE
             Err(SignInError::InvalidPassword(_)) => return Err(AuthError::InvalidPassword),
             Err(SignInError::Other(_)) => return Err(AuthError::SignIn),
         }
-    }
+    } else {
+        false
+    };
 
     let user = client
         .get_me()
         .await
         .map_err(|_| AuthError::GetAuthorizedUser)?;
     log_authorized_user(&user);
-    Ok(user.id())
+    Ok((user.id(), just_authorized))
 }
 
 async fn read_line(prompt: &'static str) -> Result<String, AuthError> {

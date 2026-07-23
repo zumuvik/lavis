@@ -76,10 +76,30 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
         .context("failed to open the Telegram session")?;
 
     let run_result = async {
-        let self_user_id = auth::authorize(client.client(), &config)
+        let (self_user_id, just_authorized) = auth::authorize(client.client(), &config)
             .await
             .context("Telegram authorization failed")
             .map_err(|error| authorization_failure(error, newly_saved))?;
+
+        if just_authorized {
+            let prefix = settings::SettingsStore::load(config.settings_path.clone())
+                .await
+                .context("failed to load prefix for quick start")?
+                .prefix()
+                .to_owned();
+            let quick_start = format!(
+                "✅ Авторизация завершена\n\n\
+                Начало работы:\n  {prefix}help\n  {prefix}modules\n  {prefix}help fastfetch\n  {prefix}help alias"
+            );
+            let input = grammers_client::message::InputMessage::new().text(quick_start);
+            if let Err(error) = client.client().send_message(self_user_id, input).await {
+                tracing::warn!(
+                    event = "quick_start_send_failed",
+                    error = %error,
+                    "Failed to send post-auth quick start message"
+                );
+            }
+        }
 
         if auth_only {
             return Ok(());
