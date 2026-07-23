@@ -132,19 +132,20 @@ Lavis использует следующие файлы состояния:
 Грамматика команды (с текущим префиксом) только такая:
 
 ```text
-,fastfetch [--no-profile] [--logo <logo>] [--structure <module:...>] [--separator <text>]
+,fastfetch [--no-profile] [--logo <logo>] [--structure <module:...>] [--separator <text>] [--logo-padding-left <n>] [--logo-padding-right <n>] [--logo-padding-top <n>]
 ```
 
 - `--no-profile` отключает **всё** чтение профиля для этого запуска;
 - `--logo` принимает только `none`, `Alpine`, `Arch`, `Debian`, `Fedora`, `FreeBSD`, `Linux`, `MacOS`, `NixOS`, `OpenBSD`, `Ubuntu` или `Windows`; ASCII-регистр не важен, а во внутренний вызов попадает каноническое написание;
 - `--structure` — непустой список без повторов через `:`; ASCII-регистр не важен, порядок сохраняется, а во внутренний вызов попадают строчные ключи `title`, `separator`, `os`, `kernel`, `uptime`, `cpu`, `memory`, `gpu`, `packages`, `shell`, `terminal`, `terminalsize`, `host`, `display`, `wm`, `de`, `theme`, `icons`, `font`, `cursor`, `disk`, `swap`, `localip`, `battery`, `poweradapter`, `locale`.
-- `--separator` — от 1 до 64 печатных ASCII-символов, не начинающихся с `--`.
+- `--separator` — от 1 до 64 печатных ASCII-символов, не начинающихся с `--`;
+- `--logo-padding-left <n>`, `--logo-padding-right <n>`, `--logo-padding-top <n>` — целое число от 0 до 32; каждое измерение независимо.
 
 Пробелы и кавычки разбираются буквально как аргументы (`--separator " -> "`); оболочка не запускается, подстановка команд, переменных и другие shell-конструкции не выполняются. Позиционные аргументы, `--`, формы с `=`, повтор параметра, `--config`, профили/пресеты Fastfetch, произвольные типы логотипов и модули запрещены.
 
 Lavis не добавляет логотип или структуру, если они не указаны явно в профиле либо команде; в таком случае используются собственные значения Fastfetch. Необязательный профиль пользователя находится только в `$XDG_CONFIG_HOME/lavis/fastfetch.json`, а при отсутствии `XDG_CONFIG_HOME` — в `$HOME/.config/lavis/fastfetch.json`. Это обычный локальный файл пользователя, не файл в Nix store и не часть пакета; Lavis его не создаёт.
 
-Схема профиля строгая: версия только `1`, неизвестные поля запрещены, а `logo`, `structure` и `separator` необязательны; отсутствующие поля не добавляются Lavis. Если `structure` задана, она непуста, не содержит повторов и состоит только из перечисленных выше модулей. Файл ограничен 16 КиБ. Минимальный пример:
+Схема профиля строгая: версия только `1`, неизвестные поля запрещены, а `logo`, `structure`, `separator`, `logo_padding_left`, `logo_padding_right` и `logo_padding_top` необязательны; отсутствующие поля не добавляются Lavis. Если `structure` задана, она непуста, не содержит повторов и состоит только из перечисленных выше модулей. Файл ограничен 16 КиБ. Минимальный пример:
 
 ```json
 { "version": 1 }
@@ -157,7 +158,10 @@ Lavis не добавляет логотип или структуру, если
   "version": 1,
   "logo": "NixOS",
   "structure": ["title", "separator", "os", "kernel", "cpu", "memory"],
-  "separator": " -> "
+  "separator": " -> ",
+  "logo_padding_left": 2,
+  "logo_padding_right": 3,
+  "logo_padding_top": 1
 }
 ```
 

@@ -99,7 +99,7 @@ const COMMAND_SPECS: [CommandDefinition; 7] = [
     CommandDefinition {
         kind: CommandKind::Fastfetch,
         name: "fastfetch",
-        usage: "fastfetch [--no-profile] [--logo <...>] [--structure <...>] [--separator <text>]",
+        usage: "fastfetch [--no-profile] [--logo <...>] [--structure <...>] [--separator <text>] [--logo-padding-left <n>] [--logo-padding-right <n>] [--logo-padding-top <n>]",
         summary_ru: "Показать системную информацию",
         description_ru: "Запускает Fastfetch только с ограниченными безопасными параметрами отображения.",
         examples: &[

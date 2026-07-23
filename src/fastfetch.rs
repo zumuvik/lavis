@@ -33,6 +33,7 @@ pub enum FastfetchInputError {
     InvalidLogo,
     InvalidStructure,
     InvalidSeparator,
+    InvalidLogoPadding,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -57,6 +58,14 @@ pub enum FastfetchProfileError {
     InvalidLogo,
     InvalidStructure,
     InvalidSeparator,
+    InvalidLogoPadding,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct LogoPadding {
+    left: Option<u8>,
+    right: Option<u8>,
+    top: Option<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +125,7 @@ struct PartialOptions {
     logo: Option<Logo>,
     structure: Option<Vec<Module>>,
     separator: Option<String>,
+    logo_padding: LogoPadding,
 }
 
 #[derive(Debug)]
@@ -123,6 +133,7 @@ struct EffectiveOptions {
     logo: Option<Logo>,
     structure: Option<Vec<Module>>,
     separator: Option<String>,
+    logo_padding: LogoPadding,
 }
 
 #[derive(Debug)]
@@ -137,6 +148,12 @@ struct Profile {
     logo: Option<String>,
     structure: Option<Vec<String>>,
     separator: Option<String>,
+    #[serde(default)]
+    logo_padding_left: Option<u8>,
+    #[serde(default)]
+    logo_padding_right: Option<u8>,
+    #[serde(default)]
+    logo_padding_top: Option<u8>,
 }
 
 struct Capture {
@@ -216,6 +233,36 @@ fn parse_options(tokens: &[String]) -> Result<PartialOptions, FastfetchInputErro
                     .ok_or(FastfetchInputError::MissingValue)?;
                 validate_separator(value)?;
                 options.separator = Some(value.clone());
+                index += 2;
+            }
+            "--logo-padding-left" => {
+                if options.logo_padding.left.is_some() {
+                    return Err(FastfetchInputError::DuplicateOption);
+                }
+                let value = tokens
+                    .get(index + 1)
+                    .ok_or(FastfetchInputError::MissingValue)?;
+                options.logo_padding.left = Some(parse_logo_padding(value)?);
+                index += 2;
+            }
+            "--logo-padding-right" => {
+                if options.logo_padding.right.is_some() {
+                    return Err(FastfetchInputError::DuplicateOption);
+                }
+                let value = tokens
+                    .get(index + 1)
+                    .ok_or(FastfetchInputError::MissingValue)?;
+                options.logo_padding.right = Some(parse_logo_padding(value)?);
+                index += 2;
+            }
+            "--logo-padding-top" => {
+                if options.logo_padding.top.is_some() {
+                    return Err(FastfetchInputError::DuplicateOption);
+                }
+                let value = tokens
+                    .get(index + 1)
+                    .ok_or(FastfetchInputError::MissingValue)?;
+                options.logo_padding.top = Some(parse_logo_padding(value)?);
                 index += 2;
             }
             _ => return Err(FastfetchInputError::UnsupportedOption),
@@ -308,6 +355,14 @@ fn validate_separator(value: &str) -> Result<(), FastfetchInputError> {
     Ok(())
 }
 
+fn parse_logo_padding(value: &str) -> Result<u8, FastfetchInputError> {
+    let n = value.parse::<u8>().map_err(|_| FastfetchInputError::InvalidLogoPadding)?;
+    if n > 32 {
+        return Err(FastfetchInputError::InvalidLogoPadding);
+    }
+    Ok(n)
+}
+
 async fn load_profile(path: &Path) -> Result<PartialOptions, FastfetchProfileError> {
     let path = path.to_owned();
     tokio::task::spawn_blocking(move || read_profile(&path))
@@ -364,11 +419,25 @@ fn read_profile(path: &Path) -> Result<PartialOptions, FastfetchProfileError> {
     if let Some(separator) = &profile.separator {
         validate_separator(separator).map_err(|_| FastfetchProfileError::InvalidSeparator)?;
     }
+    let validate_padding = |v: Option<u8>| -> Result<(), FastfetchProfileError> {
+        match v {
+            Some(n) if n > 32 => Err(FastfetchProfileError::InvalidLogoPadding),
+            _ => Ok(()),
+        }
+    };
+    validate_padding(profile.logo_padding_left)?;
+    validate_padding(profile.logo_padding_right)?;
+    validate_padding(profile.logo_padding_top)?;
     Ok(PartialOptions {
         no_profile: false,
         logo,
         structure,
         separator: profile.separator,
+        logo_padding: LogoPadding {
+            left: profile.logo_padding_left,
+            right: profile.logo_padding_right,
+            top: profile.logo_padding_top,
+        },
     })
 }
 
@@ -377,6 +446,11 @@ fn compile(profile: PartialOptions, command: PartialOptions) -> Invocation {
         logo: command.logo.or(profile.logo),
         structure: command.structure.or(profile.structure),
         separator: command.separator.or(profile.separator),
+        logo_padding: LogoPadding {
+            left: command.logo_padding.left.or(profile.logo_padding.left),
+            right: command.logo_padding.right.or(profile.logo_padding.right),
+            top: command.logo_padding.top.or(profile.logo_padding.top),
+        },
     };
     let mut arguments = vec![
         "--config".to_owned(),
@@ -405,7 +479,16 @@ fn compile(profile: PartialOptions, command: PartialOptions) -> Invocation {
         ]);
     }
     if let Some(separator) = effective.separator {
-        arguments.push(format!("--separator={separator}"));
+        arguments.extend(["--separator".to_owned(), separator]);
+    }
+    if let Some(left) = effective.logo_padding.left {
+        arguments.extend(["--logo-padding-left".to_owned(), left.to_string()]);
+    }
+    if let Some(right) = effective.logo_padding.right {
+        arguments.extend(["--logo-padding-right".to_owned(), right.to_string()]);
+    }
+    if let Some(top) = effective.logo_padding.top {
+        arguments.extend(["--logo-padding-top".to_owned(), top.to_string()]);
     }
     Invocation { arguments }
 }
@@ -690,8 +773,9 @@ fn truncate_excerpt(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Capture, FastfetchInputError, FastfetchProfileError, FastfetchResult, PROFILE_MAX_BYTES,
-        append_capture, compile, parse_options, prepare, read_profile, sanitize_capture, tokenize,
+        Capture, FastfetchInputError, FastfetchProfileError, FastfetchResult, LogoPadding,
+        PROFILE_MAX_BYTES, append_capture, compile, parse_logo_padding, parse_options, prepare,
+        read_profile, sanitize_capture, tokenize,
     };
     use std::{
         fs,
@@ -748,7 +832,8 @@ mod tests {
                 "NixOS",
                 "--structure",
                 "title:separator:os:terminalsize",
-                "--separator= -> ",
+                "--separator",
+                " -> ",
             ]
         );
         assert_eq!(
@@ -915,7 +1000,8 @@ mod tests {
                 "Ubuntu",
                 "--structure",
                 "title:os",
-                "--separator= :: ",
+                "--separator",
+                " :: ",
             ]
         );
         assert_profile_error(&path, b"not json", FastfetchProfileError::Malformed);
@@ -1065,5 +1151,226 @@ mod tests {
 
         assert_eq!(capture.bytes, b"abc");
         assert!(capture.truncated);
+    }
+
+    #[test]
+    fn separator_compiles_as_two_argv_elements() {
+        let cmd = compile(
+            parse_options(&[]).unwrap(),
+            parse_options(&["--separator".to_owned(), " -> ".to_owned()]).unwrap(),
+        );
+        let sep_idx = cmd.arguments.iter().position(|a| a == "--separator").unwrap();
+        assert_eq!(cmd.arguments.get(sep_idx + 1), Some(&" -> ".to_owned()));
+        assert!(!cmd.arguments.iter().any(|a| a.starts_with("--separator=")));
+    }
+
+    #[test]
+    fn logo_padding_left_from_cli() {
+        let cmd = compile(
+            parse_options(&[]).unwrap(),
+            parse_options(&["--logo-padding-left".to_owned(), "4".to_owned()]).unwrap(),
+        );
+        let idx = cmd.arguments.iter().position(|a| a == "--logo-padding-left").unwrap();
+        assert_eq!(cmd.arguments.get(idx + 1), Some(&"4".to_owned()));
+    }
+
+    #[test]
+    fn logo_padding_right_from_cli() {
+        let cmd = compile(
+            parse_options(&[]).unwrap(),
+            parse_options(&["--logo-padding-right".to_owned(), "5".to_owned()]).unwrap(),
+        );
+        let idx = cmd.arguments.iter().position(|a| a == "--logo-padding-right").unwrap();
+        assert_eq!(cmd.arguments.get(idx + 1), Some(&"5".to_owned()));
+    }
+
+    #[test]
+    fn logo_padding_top_from_cli() {
+        let cmd = compile(
+            parse_options(&[]).unwrap(),
+            parse_options(&["--logo-padding-top".to_owned(), "1".to_owned()]).unwrap(),
+        );
+        let idx = cmd.arguments.iter().position(|a| a == "--logo-padding-top").unwrap();
+        assert_eq!(cmd.arguments.get(idx + 1), Some(&"1".to_owned()));
+    }
+
+    #[test]
+    fn logo_padding_all_three_from_cli() {
+        let cmd = compile(
+            parse_options(&[]).unwrap(),
+            parse_options(&[
+                "--logo-padding-left".to_owned(),
+                "2".to_owned(),
+                "--logo-padding-right".to_owned(),
+                "3".to_owned(),
+                "--logo-padding-top".to_owned(),
+                "1".to_owned(),
+            ])
+            .unwrap(),
+        );
+        assert_eq!(
+            cmd.arguments,
+            [
+                "--config",
+                "none",
+                "--pipe",
+                "--logo-padding-left",
+                "2",
+                "--logo-padding-right",
+                "3",
+                "--logo-padding-top",
+                "1",
+            ]
+        );
+    }
+
+    #[test]
+    fn command_padding_overrides_profile() {
+        let profile = PartialOptions {
+            logo_padding: LogoPadding {
+                left: Some(2),
+                right: Some(3),
+                top: None,
+            },
+            ..PartialOptions::default()
+        };
+        let cmd = compile(
+            profile,
+            parse_options(&["--logo-padding-right".to_owned(), "5".to_owned()]).unwrap(),
+        );
+        assert_eq!(
+            cmd.arguments,
+            [
+                "--config",
+                "none",
+                "--pipe",
+                "--logo-padding-left",
+                "2",
+                "--logo-padding-right",
+                "5",
+            ]
+        );
+    }
+
+    #[test]
+    fn unspecified_dimensions_remain_unset() {
+        let profile = PartialOptions {
+            logo_padding: LogoPadding {
+                left: Some(2),
+                right: None,
+                top: None,
+            },
+            ..PartialOptions::default()
+        };
+        let cmd = compile(
+            profile,
+            parse_options(&[]).unwrap(),
+        );
+        assert_eq!(
+            cmd.arguments,
+            [
+                "--config",
+                "none",
+                "--pipe",
+                "--logo-padding-left",
+                "2",
+            ]
+        );
+    }
+
+    #[test]
+    fn duplicate_logo_padding_option_is_rejected() {
+        assert_eq!(
+            parse_options(&[
+                "--logo-padding-left".to_owned(),
+                "1".to_owned(),
+                "--logo-padding-left".to_owned(),
+                "2".to_owned(),
+            ]),
+            Err(FastfetchInputError::DuplicateOption)
+        );
+    }
+
+    #[test]
+    fn missing_logo_padding_value_is_rejected() {
+        assert_eq!(
+            parse_options(&["--logo-padding-left".to_owned()]),
+            Err(FastfetchInputError::MissingValue)
+        );
+    }
+
+    #[test]
+    fn non_numeric_logo_padding_is_rejected() {
+        assert_eq!(
+            parse_logo_padding("abc"),
+            Err(FastfetchInputError::InvalidLogoPadding)
+        );
+    }
+
+    #[test]
+    fn negative_logo_padding_is_rejected() {
+        assert_eq!(
+            parse_logo_padding("-1"),
+            Err(FastfetchInputError::InvalidLogoPadding)
+        );
+    }
+
+    #[test]
+    fn padding_value_33_is_rejected() {
+        assert_eq!(
+            parse_logo_padding("33"),
+            Err(FastfetchInputError::InvalidLogoPadding)
+        );
+    }
+
+    #[test]
+    fn padding_boundary_values_0_and_32_are_accepted() {
+        assert_eq!(parse_logo_padding("0").unwrap(), 0);
+        assert_eq!(parse_logo_padding("32").unwrap(), 32);
+    }
+
+    #[test]
+    fn malformed_profile_padding_is_rejected() {
+        let path = test_path("malformed-padding");
+        assert_profile_error(
+            &path,
+            br#"{"version":1,"logo_padding_left":"abc"}"#,
+            FastfetchProfileError::Malformed,
+        );
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn out_of_range_profile_padding_is_rejected() {
+        let path = test_path("oor-padding");
+        assert_profile_error(
+            &path,
+            br#"{"version":1,"logo_padding_left":33}"#,
+            FastfetchProfileError::InvalidLogoPadding,
+        );
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn unknown_profile_fields_remain_rejected() {
+        let path = test_path("unknown-field");
+        assert_profile_error(
+            &path,
+            br#"{"version":1,"nonexistent":true}"#,
+            FastfetchProfileError::Malformed,
+        );
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn no_profile_ignores_all_padding() {
+        let path = test_path("no-profile-padding");
+        fs::write(&path, r#"{"version":1,"logo_padding_left":2}"#).unwrap();
+        let cmd = prepare("--no-profile", &path).await.unwrap();
+        assert_eq!(cmd.arguments, ["--config", "none", "--pipe"]);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

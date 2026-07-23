@@ -308,6 +308,7 @@ fn fastfetch_profile_error_message(error: FastfetchProfileError) -> &'static str
         FastfetchProfileError::InvalidLogo => "InvalidLogo",
         FastfetchProfileError::InvalidStructure => "InvalidStructure",
         FastfetchProfileError::InvalidSeparator => "InvalidSeparator",
+        FastfetchProfileError::InvalidLogoPadding => "InvalidLogoPadding",
     }
 }
 
@@ -326,6 +327,7 @@ fn fastfetch_input_message(error: FastfetchInputError) -> &'static str {
         FastfetchInputError::InvalidLogo => "invalid --logo value",
         FastfetchInputError::InvalidStructure => "invalid --structure value",
         FastfetchInputError::InvalidSeparator => "invalid --separator value",
+        FastfetchInputError::InvalidLogoPadding => "invalid --logo-padding value",
     }
 }
 
