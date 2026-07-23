@@ -102,7 +102,11 @@ const COMMAND_SPECS: [CommandDefinition; 7] = [
         usage: "fastfetch [--no-profile] [--logo <...>] [--structure <...>] [--separator <text>]",
         summary_ru: "Показать системную информацию",
         description_ru: "Запускает Fastfetch только с ограниченными безопасными параметрами отображения.",
-        examples: &["fastfetch", "fastfetch --logo arch", "fastfetch --no-profile"],
+        examples: &[
+            "fastfetch",
+            "fastfetch --logo arch",
+            "fastfetch --no-profile",
+        ],
         risk: CommandRisk::RestrictedProcess,
         icon: "🖥",
         aliasable: true,
@@ -213,8 +217,7 @@ pub fn dispatch(command: &Command) -> Option<Action> {
 }
 
 pub fn definition(kind: CommandKind) -> &'static CommandDefinition {
-    command_by_kind(kind)
-        .unwrap_or_else(|| unreachable!("all CommandKind values are registered"))
+    command_by_kind(kind).unwrap_or_else(|| unreachable!("all CommandKind values are registered"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -414,9 +417,11 @@ mod tests {
                 .len(),
             names.len()
         );
-        assert!(modules()
-            .iter()
-            .all(|module| !module.description_ru.is_empty()));
+        assert!(
+            modules()
+                .iter()
+                .all(|module| !module.description_ru.is_empty())
+        );
         assert!(
             modules()
                 .iter()
@@ -433,7 +438,11 @@ mod tests {
             assert!(!definition.summary_ru.is_empty());
             assert!(!definition.description_ru.is_empty());
             assert!(!definition.icon.is_empty());
-            assert!(modules().iter().any(|module| module.id == definition.module));
+            assert!(
+                modules()
+                    .iter()
+                    .any(|module| module.id == definition.module)
+            );
             if matches!(definition.name, "alias" | "prefix") {
                 assert!(!definition.aliasable);
                 continue;

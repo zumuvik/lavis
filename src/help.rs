@@ -3,12 +3,12 @@ pub use crate::response::Response;
 use crate::{
     aliases::AliasStore,
     commands::{
-        canonical_command, command_by_name, commands, module_for_command, CommandDefinition,
-        CommandRisk, HelpRequest,
+        CommandDefinition, CommandRisk, HelpRequest, canonical_command, command_by_name, commands,
+        module_for_command,
     },
     modules::{
-        commands_for_module, module_by_name, modules, validate_external_origin, ModuleCapability,
-        ModuleOrigin, ModuleSpec,
+        ModuleCapability, ModuleOrigin, ModuleSpec, commands_for_module, module_by_name, modules,
+        validate_external_origin,
     },
     response::RenderedResponse,
 };
@@ -85,7 +85,11 @@ fn render_overview(prefix: &str) -> RenderedHelp {
         .collect::<Vec<_>>()
         .join("\n");
     documentation(
-        format!("🛠 Справка Lavis: {} модулей, {} команд", modules().len(), commands().len()),
+        format!(
+            "🛠 Справка Lavis: {} модулей, {} команд",
+            modules().len(),
+            commands().len()
+        ),
         format!("{body}\n\nИспользуйте {prefix}help <команда или модуль> для подробностей."),
         core_provenance(),
     )
@@ -108,7 +112,10 @@ fn render_topic(topic: &str, prefix: &str, aliases: &AliasStore) -> RenderedHelp
 
 fn render_command_card(command: &CommandDefinition, prefix: &str) -> RenderedHelp {
     let Some(module) = module_for_command(command) else {
-        return plain(format!("⚠️ Метаданные команды {prefix}{} недоступны", command.name));
+        return plain(format!(
+            "⚠️ Метаданные команды {prefix}{} недоступны",
+            command.name
+        ));
     };
     let primary = if command.name == "fastfetch" {
         fastfetch_primary(prefix, command, module.name)
@@ -122,11 +129,7 @@ fn render_command_card(command: &CommandDefinition, prefix: &str) -> RenderedHel
     )
 }
 
-fn generic_command_primary(
-    command: &CommandDefinition,
-    prefix: &str,
-    module_name: &str,
-) -> String {
+fn generic_command_primary(command: &CommandDefinition, prefix: &str, module_name: &str) -> String {
     let examples = command
         .examples
         .iter()
@@ -141,11 +144,7 @@ fn generic_command_primary(
     )
 }
 
-fn fastfetch_primary(
-    prefix: &str,
-    command: &CommandDefinition,
-    module_name: &str,
-) -> String {
+fn fastfetch_primary(prefix: &str, command: &CommandDefinition, module_name: &str) -> String {
     format!(
         "{}\n\nИспользование: {prefix}{}\nМодуль: {module_name}\nРиск: {}\nПримеры: {prefix}fastfetch --logo arch; {prefix}fastfetch --structure OS:Kernel:CPU.\n\nЛоготипы: none, Alpine, Arch, Debian, Fedora, FreeBSD, Linux, MacOS, NixOS, OpenBSD, Ubuntu, Windows.\nСтруктура: title, separator, os, kernel, uptime, cpu, memory, gpu, packages, shell, terminal, terminalsize, host, display, wm, de, theme, icons, font, cursor, disk, swap, localip, battery, poweradapter, locale.\nРазделитель: 1–64 печатных ASCII-символа.\n\n{prefix}fastfetch --no-profile не читает профиль. Профиль: $XDG_CONFIG_HOME/lavis/fastfetch.json или $HOME/.config/lavis/fastfetch.json.\nМинимальный JSON: {{ \"version\": 1 }}\nПриоритет: значения Fastfetch по умолчанию < профиль < параметры команды.\nПсевдоним: {prefix}alias add sys fastfetch --logo arch; затем {prefix}sys.\n\nКавычки группируют аргументы для разбора shell-words; оболочка не запускается, а shell-метасимволы остаются данными. Каждый процесс запускается только с --config none --pipe; нативные конфиги и пресеты Fastfetch запрещены. Вывод может раскрыть данные хоста, сети, дисплея, питания и оборудования.",
         command.description_ru,
@@ -193,8 +192,16 @@ fn capability_labels(capabilities: &[ModuleCapability]) -> String {
 fn module_policy(module: &ModuleSpec) -> String {
     format!(
         "выгрузка: {}; замена: {}",
-        if module.unloadable { "разрешена" } else { "запрещена" },
-        if module.replaceable { "разрешена" } else { "запрещена" }
+        if module.unloadable {
+            "разрешена"
+        } else {
+            "запрещена"
+        },
+        if module.replaceable {
+            "разрешена"
+        } else {
+            "запрещена"
+        }
     )
 }
 
@@ -274,7 +281,9 @@ mod tests {
             .as_nanos();
         let directory = std::env::temp_dir().join(format!("lavis-help-{nonce}"));
         fs::create_dir_all(&directory).unwrap();
-        let mut aliases = AliasStore::load(directory.join("aliases.json")).await.unwrap();
+        let mut aliases = AliasStore::load(directory.join("aliases.json"))
+            .await
+            .unwrap();
         aliases
             .add(
                 "core",
@@ -291,10 +300,18 @@ mod tests {
     #[tokio::test]
     async fn overview_has_stable_counts_order_and_active_prefix() {
         let response = render(&HelpRequest::Overview, "🦀", &aliases().await).response;
-        assert!(response.text.starts_with("🛠 Справка Lavis: 3 модулей, 7 команд"));
+        assert!(
+            response
+                .text
+                .starts_with("🛠 Справка Lavis: 3 модулей, 7 команд")
+        );
         assert!(response.text.find("🧩 core").unwrap() < response.text.find("🖥 system").unwrap());
         assert!(response.text.contains("🦀fastfetch"));
-        assert!(response.text.ends_with("Используйте 🦀help <команда или модуль> для подробностей."));
+        assert!(
+            response
+                .text
+                .ends_with("Используйте 🦀help <команда или модуль> для подробностей.")
+        );
         assert_eq!(response.entities.len(), 2);
     }
 
@@ -307,15 +324,18 @@ mod tests {
         )
         .response;
         assert_eq!(response.entities.len(), 2);
-        assert!(response.text.contains("$XDG_CONFIG_HOME/lavis/fastfetch.json"));
+        assert!(
+            response
+                .text
+                .contains("$XDG_CONFIG_HOME/lavis/fastfetch.json")
+        );
         assert!(response.text.contains("$HOME/.config/lavis/fastfetch.json"));
         assert!(response.text.contains("--config none"));
         assert!(response.text.contains("🦀fastfetch --no-profile"));
         assert!(response.text.contains("shell-words"));
         assert!(response.text.contains("shell-метасимволы остаются данными"));
         assert!(!response.text.contains("/tmp/"));
-        let grammers_client::tl::enums::MessageEntity::Blockquote(primary) =
-            &response.entities[0]
+        let grammers_client::tl::enums::MessageEntity::Blockquote(primary) = &response.entities[0]
         else {
             panic!("expected primary blockquote");
         };
@@ -325,8 +345,8 @@ mod tests {
             panic!("expected provenance blockquote");
         };
         let units = response.text.encode_utf16().collect::<Vec<_>>();
-        let primary_end = usize::try_from(primary.offset).unwrap()
-            + usize::try_from(primary.length).unwrap();
+        let primary_end =
+            usize::try_from(primary.offset).unwrap() + usize::try_from(primary.length).unwrap();
         let provenance_start = usize::try_from(provenance.offset).unwrap();
         let provenance_end = provenance_start + usize::try_from(provenance.length).unwrap();
         assert!(primary.collapsed);
@@ -357,16 +377,26 @@ mod tests {
             &aliases().await,
         )
         .response;
-        assert!(response
-            .text
-            .contains("Безопасно ограниченная системная информация."));
-        assert!(response
-            .text
-            .contains("Возможности: сведения о хосте, ограниченный процесс"));
-        assert!(response.text.contains("выгрузка: запрещена; замена: запрещена"));
-        assert!(response
-            .text
-            .ends_with("Это встроенный модуль Lavis. Его нельзя выгрузить или заменить."));
+        assert!(
+            response
+                .text
+                .contains("Безопасно ограниченная системная информация.")
+        );
+        assert!(
+            response
+                .text
+                .contains("Возможности: сведения о хосте, ограниченный процесс")
+        );
+        assert!(
+            response
+                .text
+                .contains("выгрузка: запрещена; замена: запрещена")
+        );
+        assert!(
+            response
+                .text
+                .ends_with("Это встроенный модуль Lavis. Его нельзя выгрузить или заменить.")
+        );
         assert_eq!(response.entities.len(), 2);
     }
 
@@ -387,9 +417,11 @@ mod tests {
             replaceable: true,
         };
         let response = render_module_card(&fixture, ",").response;
-        assert!(response
-            .text
-            .contains("Внешний модуль. Автор: Автор; версия: 1.0.0"));
+        assert!(
+            response
+                .text
+                .contains("Внешний модуль. Автор: Автор; версия: 1.0.0")
+        );
         assert!(response.text.contains("возможности: сеть"));
         assert!(!response.text.contains("Это встроенный модуль"));
     }
@@ -413,11 +445,18 @@ mod tests {
         let rendered = render_module_card(&fixture, ",");
         assert!(!rendered.entity_fallback);
         assert_eq!(rendered.response.entities.len(), 2);
-        assert!(rendered.response.text.contains("Внешние данные модуля не отображаются."));
-        assert!(rendered
-            .response
-            .text
-            .contains("Метаданные происхождения отклонены ядром Lavis."));
+        assert!(
+            rendered
+                .response
+                .text
+                .contains("Внешние данные модуля не отображаются.")
+        );
+        assert!(
+            rendered
+                .response
+                .text
+                .contains("Метаданные происхождения отклонены ядром Lavis.")
+        );
         assert!(!rendered.response.text.contains("Внешний модуль"));
     }
 
