@@ -77,22 +77,19 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
         .await
         .context("failed to open the Telegram session")?;
 
-    let settings = settings::SettingsStore::load(config.settings_path.clone())
-        .await
-        .context("failed to load persistent settings")?;
-    let prefix = settings.prefix().to_owned();
-
     let run_result = async {
+        let settings = settings::SettingsStore::load(config.settings_path.clone())
+            .await
+            .context("failed to load persistent settings")?;
+        let prefix = settings.prefix().to_owned();
+
         let outcome = auth::authorize(client.client(), &config)
             .await
             .context("Telegram authorization failed")
             .map_err(|error| authorization_failure(error, newly_saved))?;
 
-        if let AuthorizationOutcome::JustCompleted { .. } = outcome {
-            let quick_start = format!(
-                "✅ Авторизация завершена\n\n\
-                Начало работы:\n  {prefix}help\n  {prefix}modules\n  {prefix}help fastfetch\n  {prefix}help alias"
-            );
+        if should_show_quick_start(&outcome) {
+            let quick_start = render_quick_start(&prefix);
             if let Err(error) = client
                 .client()
                 .send_message(
@@ -106,20 +103,15 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
                     error = %error,
                     "Failed to send post-auth quick start message"
                 );
-                let _ = writeln!(
-                    io::stdout().lock(),
-                    "Quick-start message could not be sent to Telegram:\n{quick_start}"
-                );
+                let fallback = render_quick_start_fallback(&quick_start);
+                let _ = writeln!(io::stdout().lock(), "{fallback}");
             }
         }
 
         if auth_only {
             return Ok(());
         }
-        let self_user_id = match outcome {
-            AuthorizationOutcome::JustCompleted { self_user_id }
-            | AuthorizationOutcome::ExistingSession { self_user_id } => self_user_id,
-        };
+        let self_user_id = outcome.self_user_id();
         initialize_dialog_cache(client.client()).await?;
         let receiver = client
             .take_updates()
@@ -326,6 +318,24 @@ fn remove_session_files(session: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn should_show_quick_start(outcome: &AuthorizationOutcome) -> bool {
+    outcome.is_just_completed()
+}
+
+fn render_quick_start(prefix: &str) -> String {
+    format!(
+        "✅ Авторизация завершена\n\n\
+        Начало работы:\n  {prefix}help\n  {prefix}modules\n  {prefix}help fastfetch\n  {prefix}help alias"
+    )
+}
+
+fn render_quick_start_fallback(quick_start: &str) -> String {
+    format!(
+        "Не удалось отправить подсказку в Telegram.\n\n\
+        {quick_start}"
+    )
+}
+
 async fn initialize_dialog_cache(client: &grammers_client::Client) -> anyhow::Result<()> {
     let mut dialogs = client.iter_dialogs();
     while dialogs
@@ -340,8 +350,9 @@ async fn initialize_dialog_cache(client: &grammers_client::Client) -> anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::{
-        CliCommand, NONINTERACTIVE_LOGOUT, NONINTERACTIVE_MISSING_CREDENTIALS,
+        AuthorizationOutcome, CliCommand, NONINTERACTIVE_LOGOUT, NONINTERACTIVE_MISSING_CREDENTIALS,
         authorization_failure, logout_confirmed, parse_cli, remove_session_files,
+        render_quick_start, render_quick_start_fallback, should_show_quick_start,
     };
     use std::{
         ffi::OsString,
@@ -444,5 +455,61 @@ mod tests {
             );
         }
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn should_show_quick_start_is_true_for_just_completed() {
+        use grammers_session::types::PeerId;
+        let outcome = AuthorizationOutcome::JustCompleted {
+            self_user_id: PeerId::self_user(),
+        };
+        assert!(should_show_quick_start(&outcome));
+    }
+
+    #[test]
+    fn should_show_quick_start_is_false_for_existing_session() {
+        use grammers_session::types::PeerId;
+        let outcome = AuthorizationOutcome::ExistingSession {
+            self_user_id: PeerId::self_user(),
+        };
+        assert!(!should_show_quick_start(&outcome));
+    }
+
+    #[test]
+    fn render_quick_start_uses_non_default_prefix() {
+        let text = render_quick_start("🦀");
+        assert!(text.contains("🦀help"));
+        assert!(text.contains("🦀modules"));
+        assert!(text.contains("🦀help fastfetch"));
+        assert!(text.contains("🦀help alias"));
+        assert!(!text.contains(",help"));
+    }
+
+    #[test]
+    fn render_quick_start_preserves_russian_and_emoji() {
+        let text = render_quick_start(",");
+        assert!(text.contains("✅"));
+        assert!(text.contains("Авторизация завершена"));
+        assert!(text.contains("Начало работы"));
+    }
+
+    #[test]
+    fn render_quick_start_contains_no_sensitive_data() {
+        let text = render_quick_start(",");
+        assert!(!text.contains("/home/"));
+        assert!(!text.contains("api_id"));
+        assert!(!text.contains("api_hash"));
+        assert!(!text.contains("session"));
+        assert!(!text.contains("credentials"));
+    }
+
+    #[test]
+    fn render_quick_start_fallback_is_russian_and_includes_text() {
+        let inner = render_quick_start(",");
+        let fallback = render_quick_start_fallback(&inner);
+        assert!(fallback.starts_with("Не удалось отправить подсказку в Telegram."));
+        assert!(fallback.contains(inner.as_str()));
+        assert!(fallback.contains("✅"));
+        assert!(fallback.contains("Авторизация завершена"));
     }
 }

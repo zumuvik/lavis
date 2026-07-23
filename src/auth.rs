@@ -4,14 +4,32 @@ pub enum AuthorizationOutcome {
     ExistingSession { self_user_id: PeerId },
 }
 
-pub const CREDENTIAL_NOTIFICATION: &str = "Lavis использует официальный MTProto-протокол Telegram.\n\
-    Учётные данные передаются в Telegram через библиотеку grammers.\n\
-    Lavis не сохраняет код входа и пароль двухфакторной аутентификации.\n\
-    Локальная сессия Telegram сохраняется — повторная авторизация не требуется.";
-pub const PASSWORD_NOTIFICATION: &str = "Lavis не сохраняет пароль двухфакторной аутентификации.\n\
-    Пароль временно обрабатывается в памяти процесса и\n\
-    передаётся в Telegram через grammers. Lavis не накапливает\n\
-    и не логирует пароль.";
+impl AuthorizationOutcome {
+    pub fn is_just_completed(self) -> bool {
+        matches!(self, Self::JustCompleted { .. })
+    }
+
+    pub fn self_user_id(self) -> PeerId {
+        match self {
+            Self::JustCompleted { self_user_id }
+            | Self::ExistingSession { self_user_id } => self_user_id,
+        }
+    }
+}
+
+pub const CREDENTIAL_NOTIFICATION: &str =
+    "Lavis использует авторизацию Telegram по MTProto.\n\n\
+    Код входа временно обрабатывается в памяти процесса и\n\
+    передаётся Telegram через библиотеку grammers.\n\
+    Lavis намеренно не записывает код в постоянное хранилище\n\
+    и не добавляет его в логи или диагностику.\n\n\
+    Локальная сессия Telegram сохраняется, чтобы не выполнять\n\
+    авторизацию при каждом запуске.";
+pub const PASSWORD_NOTIFICATION: &str =
+    "Пароль 2FA временно обрабатывается в памяти процесса и\n\
+    передаётся Telegram через библиотеку grammers.\n\
+    Lavis намеренно не записывает пароль в постоянное хранилище\n\
+    и не добавляет его в логи или диагностику.";
 
 use std::io::{self, IsTerminal, Write};
 
@@ -169,49 +187,58 @@ mod tests {
     }
 
     #[test]
-    fn credential_notification_mentions_protocol_and_grammers() {
+    fn credential_notification_is_technically_precise() {
         assert!(CREDENTIAL_NOTIFICATION.contains("MTProto"));
         assert!(CREDENTIAL_NOTIFICATION.contains("grammers"));
-        assert!(CREDENTIAL_NOTIFICATION.contains("Lavis не сохраняет"));
+        assert!(CREDENTIAL_NOTIFICATION.contains("временно обрабатывается"));
+        assert!(CREDENTIAL_NOTIFICATION.contains("постоянное хранилище"));
+        assert!(CREDENTIAL_NOTIFICATION.contains("логи"));
+        assert!(CREDENTIAL_NOTIFICATION.contains("Локальная сессия"));
+        assert!(!CREDENTIAL_NOTIFICATION.contains("только в Telegram"));
+        assert!(!CREDENTIAL_NOTIFICATION.contains("напрямую"));
+        assert!(!CREDENTIAL_NOTIFICATION.contains("никогда"));
+        assert!(!CREDENTIAL_NOTIFICATION.contains("api_id"));
+        assert!(!CREDENTIAL_NOTIFICATION.contains("api_hash"));
+        assert!(!CREDENTIAL_NOTIFICATION.contains("/home/"));
     }
 
     #[test]
-    fn password_notification_is_not_overly_absolute() {
-        assert!(PASSWORD_NOTIFICATION.contains("Lavis не сохраняет"));
-        assert!(PASSWORD_NOTIFICATION.contains("временно обрабатывается"));
+    fn password_notification_is_technically_precise() {
         assert!(PASSWORD_NOTIFICATION.contains("grammers"));
+        assert!(PASSWORD_NOTIFICATION.contains("временно обрабатывается"));
+        assert!(PASSWORD_NOTIFICATION.contains("постоянное хранилище"));
+        assert!(PASSWORD_NOTIFICATION.contains("логи"));
         assert!(!PASSWORD_NOTIFICATION.contains("только в Telegram"));
         assert!(!PASSWORD_NOTIFICATION.contains("напрямую"));
+        assert!(!PASSWORD_NOTIFICATION.contains("не накапливает"));
+        assert!(!PASSWORD_NOTIFICATION.contains("никогда"));
+        assert!(!PASSWORD_NOTIFICATION.contains("api_id"));
+        assert!(!PASSWORD_NOTIFICATION.contains("api_hash"));
+        assert!(!PASSWORD_NOTIFICATION.contains("/home/"));
     }
 
     #[test]
-    fn just_completed_outcome_triggers_quick_start() {
+    fn just_completed_causes_is_just_completed_true() {
         use super::AuthorizationOutcome;
         use grammers_session::types::PeerId;
         let outcome = AuthorizationOutcome::JustCompleted {
             self_user_id: PeerId::self_user(),
         };
-        assert!(matches!(
-            outcome,
-            AuthorizationOutcome::JustCompleted { .. }
-        ));
+        assert!(outcome.is_just_completed());
     }
 
     #[test]
-    fn existing_session_outcome_does_not_trigger_quick_start() {
+    fn existing_session_causes_is_just_completed_false() {
         use super::AuthorizationOutcome;
         use grammers_session::types::PeerId;
         let outcome = AuthorizationOutcome::ExistingSession {
             self_user_id: PeerId::self_user(),
         };
-        assert!(matches!(
-            outcome,
-            AuthorizationOutcome::ExistingSession { .. }
-        ));
+        assert!(!outcome.is_just_completed());
     }
 
     #[test]
-    fn both_outcomes_carry_self_user_id() {
+    fn both_outcomes_provide_self_user_id() {
         use super::AuthorizationOutcome;
         use grammers_session::types::PeerId;
         let just = AuthorizationOutcome::JustCompleted {
@@ -220,19 +247,7 @@ mod tests {
         let existing = AuthorizationOutcome::ExistingSession {
             self_user_id: PeerId::self_user(),
         };
-        assert_eq!(
-            match just {
-                AuthorizationOutcome::JustCompleted { self_user_id }
-                | AuthorizationOutcome::ExistingSession { self_user_id } => self_user_id,
-            },
-            PeerId::self_user()
-        );
-        assert_eq!(
-            match existing {
-                AuthorizationOutcome::JustCompleted { self_user_id }
-                | AuthorizationOutcome::ExistingSession { self_user_id } => self_user_id,
-            },
-            PeerId::self_user()
-        );
+        assert_eq!(just.self_user_id(), PeerId::self_user());
+        assert_eq!(existing.self_user_id(), PeerId::self_user());
     }
 }
