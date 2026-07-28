@@ -271,10 +271,10 @@ impl ModuleInstallPlan {
         // executable below the module root. The descriptor intentionally keeps
         // a lexical entrypoint and a canonical module root, so compare their
         // canonical forms before exposing a relative review value.
-        let module_dir = fs::canonicalize(&d.module_dir)
-            .map_err(|_| SourceInspectionError::InvalidManifest)?;
-        let canonical_entrypoint = fs::canonicalize(&d.entrypoint)
-            .map_err(|_| SourceInspectionError::InvalidManifest)?;
+        let module_dir =
+            fs::canonicalize(&d.module_dir).map_err(|_| SourceInspectionError::InvalidManifest)?;
+        let canonical_entrypoint =
+            fs::canonicalize(&d.entrypoint).map_err(|_| SourceInspectionError::InvalidManifest)?;
         let entrypoint = canonical_entrypoint
             .strip_prefix(&module_dir)
             .map_err(|_| SourceInspectionError::InvalidManifest)?;
