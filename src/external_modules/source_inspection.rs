@@ -267,9 +267,16 @@ impl ModuleInstallPlan {
         now: SystemTime,
         expires: SystemTime,
     ) -> Result<Self, SourceInspectionError> {
-        let entrypoint = d
-            .entrypoint
-            .strip_prefix(&d.module_dir)
+        // The manifest validator has already established that this is an
+        // executable below the module root. The descriptor intentionally keeps
+        // a lexical entrypoint and a canonical module root, so compare their
+        // canonical forms before exposing a relative review value.
+        let module_dir = fs::canonicalize(&d.module_dir)
+            .map_err(|_| SourceInspectionError::InvalidManifest)?;
+        let canonical_entrypoint = fs::canonicalize(&d.entrypoint)
+            .map_err(|_| SourceInspectionError::InvalidManifest)?;
+        let entrypoint = canonical_entrypoint
+            .strip_prefix(&module_dir)
             .map_err(|_| SourceInspectionError::InvalidManifest)?;
         if entrypoint.as_os_str().is_empty()
             || entrypoint.is_absolute()
@@ -875,11 +882,17 @@ fn validate_entry(
             .as_bytes()
             .first()
             .is_some_and(|byte| byte.is_ascii_alphabetic());
+    // `Path::components` normalizes dot components on Unix, so reject them
+    // directly from the archive spelling before constructing a host path.
+    let dot_component = key
+        .split('/')
+        .any(|component| component == "." || component == "..");
     if key.is_empty()
         || key.len() > limits.max_path_bytes
         || e.name.contains('\0')
         || e.name.contains('\\')
         || platform_prefix
+        || dot_component
         || path.is_absolute()
         || path
             .components()
@@ -1154,7 +1167,7 @@ mod tests {
         }
     }
     fn manifest() -> Entry {
-        file("module.json", br#"{"schema_version":2,"id":"test","name":"Test","version":"1","author":"A","entrypoint":"run","commands":[{"name":"go","summary_ru":"x","description_ru":"x","usage":""}]}"#)
+        file("module.json", br#"{"schema_version":2,"id":"test","name":"Test","version":"1","author":"A","entrypoint":"run","commands":[{"name":"go","summary_ru":"x","description_ru":"x","usage":"<value>"}]}"#)
     }
     fn limits() -> InspectionLimits {
         InspectionLimits {
@@ -1382,7 +1395,7 @@ mod tests {
         let mut run = file("run", b"#!/bin/sh");
         run.mode = 0o100755;
         let body = format!(
-            r#"{{"schema_version":{schema},"id":"test","name":"Test","version":"1","author":"A","entrypoint":"run","commands":[{{"name":"go","summary_ru":"x","description_ru":"x","usage":""}}]}}"#
+            r#"{{"schema_version":{schema},"id":"test","name":"Test","version":"1","author":"A","entrypoint":"run","commands":[{{"name":"go","summary_ru":"x","description_ru":"x","usage":"<value>"}}]}}"#
         );
         zip(&[file("module.json", body.as_bytes()), run])
     }
@@ -1413,7 +1426,7 @@ mod tests {
     fn missing_entrypoint_and_entrypoint_traversal_are_invalid_manifest() {
         for entrypoint in ["missing", "../run"] {
             let body = format!(
-                r#"{{"schema_version":2,"id":"test","name":"Test","version":"1","author":"A","entrypoint":"{entrypoint}","commands":[{{"name":"go","summary_ru":"x","description_ru":"x","usage":""}}]}}"#
+                r#"{{"schema_version":2,"id":"test","name":"Test","version":"1","author":"A","entrypoint":"{entrypoint}","commands":[{{"name":"go","summary_ru":"x","description_ru":"x","usage":"<value>"}}]}}"#
             );
             let path = root(entrypoint.replace('/', "-").as_str());
             let config = InspectionConfig {
@@ -1460,7 +1473,7 @@ mod tests {
             r#""capabilities":["not.an.api"]"#,
         ] {
             let body = format!(
-                r#"{{"schema_version":3,"id":"test","name":"Test","version":"1","author":"A","entrypoint":"run",{field},"commands":[{{"name":"go","summary_ru":"x","description_ru":"x","usage":""}}]}}"#
+                r#"{{"schema_version":3,"id":"test","name":"Test","version":"1","author":"A","entrypoint":"run",{field},"commands":[{{"name":"go","summary_ru":"x","description_ru":"x","usage":"<value>"}}]}}"#
             );
             let mut run = file("run", b"x");
             run.mode = 0o100755;
