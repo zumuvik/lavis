@@ -5,6 +5,7 @@ pub mod manifest;
 pub mod process;
 pub mod protocol;
 pub mod state;
+pub mod source_inspection;
 
 pub const MAX_ENABLED_MODULES: usize = 32;
 pub const MAX_COMMANDS_PER_MODULE: usize = 32;
