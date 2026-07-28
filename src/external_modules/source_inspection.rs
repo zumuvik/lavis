@@ -108,6 +108,9 @@ impl AcquiredLmod {
     pub fn len(&self) -> usize {
         self.bytes.len()
     }
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
     pub fn source_identity(&self) -> &SourceIdentity {
         &self.identity
     }
@@ -144,7 +147,7 @@ impl std::fmt::Debug for ArchiveDigest {
     }
 }
 impl Serialize for ArchiveDigest {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error>
+    fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
