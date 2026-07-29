@@ -1,0 +1,28 @@
+name: Export agent source
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Pack source
+        run: tar --exclude=.git -czf /tmp/lavis-source.tar.gz .
+
+      - name: Upload source
+        uses: actions/upload-artifact@v4
+        with:
+          name: lavis-source
+          path: /tmp/lavis-source.tar.gz
+          if-no-files-found: error
+          retention-days: 1
