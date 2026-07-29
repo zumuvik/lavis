@@ -21,18 +21,19 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
 
-      - name: Apply patch
-        run: |
-          python3 .github/apply_gaf_audit.py
-          python3 .github/apply_credentials_test_audit.py
-
-      - name: Format and validate GAF artifact
+      - name: Apply, validate, and report
         shell: bash
         run: |
-          nix develop -c gofmt -w modules/gaf/main.go modules/gaf/main_test.go
-          nix develop -c cargo fmt --all
-          nix develop -c bash -c 'set -euo pipefail; cd modules/gaf; go test ./...; go vet ./...; ./build-lmod.sh; cp dist/gaf.lmod /tmp/gaf.lmod; ./build-lmod.sh; cmp /tmp/gaf.lmod dist/gaf.lmod'
-          python3 - <<'PY'
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          set +e
+          {
+            python3 .github/apply_gaf_audit.py
+            python3 .github/apply_credentials_test_audit.py
+            nix develop -c gofmt -w modules/gaf/main.go modules/gaf/main_test.go
+            nix develop -c cargo fmt --all
+            nix develop -c bash -c 'set -euo pipefail; cd modules/gaf; go test ./...; go vet ./...; ./build-lmod.sh; cp dist/gaf.lmod /tmp/gaf.lmod; ./build-lmod.sh; cmp /tmp/gaf.lmod dist/gaf.lmod'
+            python3 - <<'PY'
           import zipfile
           with zipfile.ZipFile('modules/gaf/dist/gaf.lmod') as archive:
               assert archive.namelist() == ['module.json', 'gaf']
@@ -41,13 +42,21 @@ jobs:
               modes = {item.filename: (item.external_attr >> 16) & 0o777 for item in archive.infolist()}
               assert modes == {'module.json': 0o600, 'gaf': 0o700}, modes
           PY
+          } > /tmp/gaf-audit.log 2>&1
+          status=$?
+          set -e
 
-      - name: Commit audited fixes
-        shell: bash
-        run: |
+          if [ "$status" -ne 0 ]; then
+            git reset --hard HEAD
+            cp /tmp/gaf-audit.log .github/gaf-audit-failure.log
+            git add .github/gaf-audit-failure.log
+            git commit -m 'chore: capture gaf audit failure'
+            git push origin HEAD:agent/gaf-module
+            exit 0
+          fi
+
+          rm -f .github/gaf-audit-failure.log
           git rm .github/apply_gaf_audit.py .github/apply_credentials_test_audit.py .github/workflows/apply-gaf-audit.yml
           git add -A
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git commit -m 'fix: address gaf audit findings'
           git push origin HEAD:agent/gaf-module
