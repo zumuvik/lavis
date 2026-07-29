@@ -28,6 +28,32 @@ jobs:
           echo '62e07f7b3d8eb78a91dbb0c65cbe8342445b6e22d77ad12b64ee9120affcf92e  /tmp/gaf.patch' | sha256sum --check
           git apply --check /tmp/gaf.patch
           git apply /tmp/gaf.patch
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/external_modules/source_inspection.rs')
+          text = path.read_text()
+          old = '''            .map(|x| match x {
+                          super::manifest::ExternalSubscription::MessageCreated => "message.created".into(),
+                      })'''
+          new = '''            .map(|x| match x {
+                          super::manifest::ExternalSubscription::MessageCreated => "message.created".into(),
+                          super::manifest::ExternalSubscription::MessageEdited => "message.edited".into(),
+                      })'''
+          if old not in text:
+              raise SystemExit('source inspection subscription mapping not found')
+          path.write_text(text.replace(old, new, 1))
+
+          path = Path('src/runtime.rs')
+          text = path.read_text()
+          old = '''                PeerId::user(7),
+                          42,'''
+          new = '''                PeerId::user(7).expect("valid test peer"),
+                          42,'''
+          if old not in text:
+              raise SystemExit('runtime test peer call not found')
+          path.write_text(text.replace(old, new, 1))
+          PY
           rm -rf .agent .github/workflows/export-agent-source.yml
           git diff --check
 
