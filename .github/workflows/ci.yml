@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -19,35 +19,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
 
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
-
-      - name: Checkout GAF head for Nix artifact rebuild
-        if: github.event_name == 'pull_request' && github.event.pull_request.number == 23
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event.pull_request.head.ref }}
-          fetch-depth: 0
-
-      - name: Rebuild GAF artifact with Nix toolchain
-        if: github.event_name == 'pull_request' && github.event.pull_request.number == 23
-        shell: bash
-        run: |
-          set -euxo pipefail
-          nix develop -c bash -c 'set -euo pipefail; cd modules/gaf; go test ./...; go vet ./...; ./build-lmod.sh; cp dist/gaf.lmod /tmp/gaf.lmod; ./build-lmod.sh; cmp /tmp/gaf.lmod dist/gaf.lmod'
-          git checkout -- .github/workflows/ci.yml
-          git add modules/gaf/dist/gaf.lmod
-          if git diff --cached --quiet; then
-            echo 'GAF artifact already matches the Nix toolchain'
-            exit 0
-          fi
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git commit -m 'build: rebuild gaf artifact with nix toolchain'
-          git push origin HEAD:agent/gaf-module
 
       - name: Test GAF module and artifact
         run: |
