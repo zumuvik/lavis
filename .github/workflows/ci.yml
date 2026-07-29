@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -19,45 +19,15 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
 
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
 
-      # BEGIN FINAL GAF AUDIT BOOTSTRAP
-      - name: Checkout GAF head for final audit
-        if: github.event_name == 'pull_request' && github.event.pull_request.number == 23
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event.pull_request.head.ref }}
-          fetch-depth: 0
-
-      - name: Install Go for final audit
-        if: github.event_name == 'pull_request' && github.event.pull_request.number == 23
-        uses: actions/setup-go@v6
-        with:
-          go-version: '1.23.x'
-
-      - name: Apply final GAF audit fixes
-        if: github.event_name == 'pull_request' && github.event.pull_request.number == 23
-        shell: bash
+      - name: Test GAF module and artifact
         run: |
-          set -euxo pipefail
-          python3 .github/fix-final-gaf-patch-generator.py
-          python3 .github/apply-final-gaf-audit.py
-          python3 .github/apply-process-test-audit.py
-          gofmt -w modules/gaf/main.go modules/gaf/main_test.go
-          nix develop -c cargo fmt --all
-          (
-            cd modules/gaf
-            go test ./...
-            go vet ./...
-            ./build-lmod.sh
-            cp dist/gaf.lmod /tmp/gaf.lmod
-            ./build-lmod.sh
-            cmp /tmp/gaf.lmod dist/gaf.lmod
-          )
+          cp modules/gaf/dist/gaf.lmod /tmp/gaf.lmod
+          nix develop -c bash -c 'set -euo pipefail; test -z "$(gofmt -l modules/gaf/*.go)"; cd modules/gaf; go test ./...; go vet ./...; ./build-lmod.sh'
+          cmp /tmp/gaf.lmod modules/gaf/dist/gaf.lmod
           python3 - <<'PY'
           import zipfile
           with zipfile.ZipFile('modules/gaf/dist/gaf.lmod') as archive:
@@ -66,13 +36,6 @@ jobs:
               modes = {item.filename: (item.external_attr >> 16) & 0o777 for item in archive.infolist()}
               assert modes == {'module.json': 0o600, 'gaf': 0o700}, modes
           PY
-          git checkout -- .github/workflows/ci.yml .github/workflows/final-gaf-audit.yml .github/apply-final-gaf-audit.py .github/apply-process-test-audit.py .github/cleanup-final-gaf-bootstrap.py .github/fix-final-gaf-patch-generator.py
-          git add -A
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git commit -m 'fix: resolve final gaf audit blockers'
-          git push origin HEAD:agent/gaf-module
-      # END FINAL GAF AUDIT BOOTSTRAP
 
       - name: Check formatting
         run: nix develop -c cargo fmt --check
