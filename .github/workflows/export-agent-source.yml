@@ -37,6 +37,7 @@ jobs:
           git apply --check /tmp/gaf-command-protect.patch
           git apply /tmp/gaf-command-protect.patch
           sed -i 's/matches!(manifest.schema_version, 2 | 3 | 4)/matches!(manifest.schema_version, 2..=4)/' src/external_modules/manifest.rs
+          sed -i '/^        "",$/d' modules/gaf/module.json
           rm -rf .agent .github/workflows/export-agent-source.yml
           git diff --check
 
