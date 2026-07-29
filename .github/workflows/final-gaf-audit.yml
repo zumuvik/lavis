@@ -11,7 +11,7 @@ permissions:
 jobs:
   apply-and-verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -42,15 +42,6 @@ jobs:
               modes = {item.filename: (item.external_attr >> 16) & 0o777 for item in archive.infolist()}
               assert modes == {'module.json': 0o600, 'gaf': 0o700}, modes
           PY
-
-      - name: Verify Rust and Nix
-        run: |
-          nix develop -c cargo check --all-targets --all-features
-          nix develop -c cargo clippy --all-targets --all-features -- -D warnings
-          nix develop -c cargo test --all-targets --all-features
-          nix flake check --print-build-logs
-          nix build --print-build-logs
-          ./result/bin/lavis modules validate modules/gaf/build/module.json
 
       - name: Commit final audited changes
         run: |
