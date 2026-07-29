@@ -26,14 +26,21 @@ jobs:
         uses: DeterminateSystems/determinate-nix-action@v3
 
       # BEGIN FINAL GAF AUDIT BOOTSTRAP
+      - name: Checkout GAF head for final audit
+        if: github.event_name == 'pull_request' && github.event.pull_request.number == 23
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+
       - name: Install Go for final audit
-        if: github.event_name == 'push' && github.ref == 'refs/heads/agent/gaf-module'
+        if: github.event_name == 'pull_request' && github.event.pull_request.number == 23
         uses: actions/setup-go@v6
         with:
           go-version: '1.23.x'
 
       - name: Apply final GAF audit fixes
-        if: github.event_name == 'push' && github.ref == 'refs/heads/agent/gaf-module'
+        if: github.event_name == 'pull_request' && github.event.pull_request.number == 23
         shell: bash
         run: |
           set -euxo pipefail
