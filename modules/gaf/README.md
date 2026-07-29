@@ -29,8 +29,19 @@ go vet ./...
 ./build-lmod.sh
 ```
 
-Send `dist/gaf.lmod` to Saved Messages together with `,lm install`, confirm the
-inspection plan, then enable and restart:
+Send `dist/gaf.lmod` to Saved Messages in a new message with:
+
+```text
+,lm install
+```
+
+Review the inspection plan and confirm its full approval ID within ten minutes:
+
+```text
+,lm confirm XXXX-XXXX-XXXX-XXXX
+```
+
+The installed module remains disabled. Enable it locally and restart Lavis:
 
 ```bash
 lavis modules enable gaf
