@@ -32,6 +32,10 @@ jobs:
           echo 'dd0ed0d60a8682c6893d746c7b194b76bfeef4c9ae3449f3b5b97361a6e72d10  /tmp/gaf-fix.patch' | sha256sum --check
           git apply --check /tmp/gaf-fix.patch
           git apply /tmp/gaf-fix.patch
+          echo 'H4sICNs9amoCA2dhZi1jb21tYW5kLXByb3RlY3QucGF0Y2gAlVPLbtswELzrK1YIUEig5MRIG6Q0WjiHnIpemmNRELS0jlVIpMoliwaJ/72kHo6loEnty1I0Zzg7w83zHOQ5meLctaW0SAtDEWMMNvPN9Rryy4uP2XIJbKjrdQTHv300X+5XUR5qjRYIrWtFa7TFwmIJn6CRttghxck7WdhKqwzudIPJTffB+V0AJCJN04iNJPgblZ2Q9NBFRYICOH3W8PQ03Fmp1tl/nDBO2arBxUQdiQaJ5D0mLaIRVZmBdHanDZZi8yAI6226iqDvrdoC7bSrS4/GVhocwaITm8z6TuGxb+ct3KzVgDsIP1jhDfA8WFbBjMdpHIXx2XGOfywaJWvR6NLVSJwHTl3omvOv/Y23gepLpUrObzuqoyABa0JPHfJ//+EquwbWlzF9H/U+eLFVJ/nAYaN1nUL+uVv4Gzo349mxiL3FO/PpJW/ndjw71osGSQ+qAH/FTqqyHihFWVEb3mbSdX19eZUtL4CFOmm7X5x99xNif/Tyg9hpA6NaEkG60p2Gn/1fVotDOoVBGfY6BZSkoyFj3P0793lPx2MIudBN4zugYfsb/nJeFOc3zup0NWV6ZRDHOXwxgkcUkgiNjZP4pFfvGdhg0LM1g+r/tejIGnaaGmscBgkwh72K2kr/9A+wEPhfGufpCi8FAAA=' | base64 --decode | gzip --decompress > /tmp/gaf-command-protect.patch
+          echo '35f09f0b7360e3bc303ad33b29ba6037fbbb16b7bfd713e61828e88e03bd7cb2  /tmp/gaf-command-protect.patch' | sha256sum --check
+          git apply --check /tmp/gaf-command-protect.patch
+          git apply /tmp/gaf-command-protect.patch
           sed -i 's/matches!(manifest.schema_version, 2 | 3 | 4)/matches!(manifest.schema_version, 2..=4)/' src/external_modules/manifest.rs
           rm -rf .agent .github/workflows/export-agent-source.yml
           git diff --check
