@@ -66,8 +66,7 @@ jobs:
               modes = {item.filename: (item.external_attr >> 16) & 0o777 for item in archive.infolist()}
               assert modes == {'module.json': 0o600, 'gaf': 0o700}, modes
           PY
-          python3 .github/cleanup-final-gaf-bootstrap.py
-          git rm -f .github/apply-final-gaf-audit.py .github/apply-process-test-audit.py .github/cleanup-final-gaf-bootstrap.py .github/fix-final-gaf-patch-generator.py .github/workflows/final-gaf-audit.yml
+          git checkout -- .github/workflows/ci.yml .github/workflows/final-gaf-audit.yml .github/apply-final-gaf-audit.py .github/apply-process-test-audit.py .github/cleanup-final-gaf-bootstrap.py .github/fix-final-gaf-patch-generator.py
           git add -A
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
