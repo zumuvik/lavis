@@ -22,7 +22,9 @@ jobs:
         uses: DeterminateSystems/determinate-nix-action@v3
 
       - name: Apply audited fixes
-        run: python3 .github/apply-final-gaf-audit.py
+        run: |
+          python3 .github/apply-final-gaf-audit.py
+          python3 .github/apply-process-test-audit.py
 
       - name: Format sources
         run: |
@@ -52,7 +54,7 @@ jobs:
 
       - name: Commit final audited changes
         run: |
-          git rm .github/apply-final-gaf-audit.py .github/workflows/final-gaf-audit.yml
+          git rm .github/apply-final-gaf-audit.py .github/apply-process-test-audit.py .github/workflows/final-gaf-audit.yml
           git add -A
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
