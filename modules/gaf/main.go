@@ -226,12 +226,12 @@ func (m *module) menu() string {
 	if !m.state.Enabled {
 		status = "выключен"
 	}
-	return fmt.Sprintf("⚙️ GAF — %s\nТриггеров: %d\n\nКоманды:\n• gaf listt\n• gaf setr <слово> <1–3 реакции>\n• gaf remt <номер|слово>\n• gaf toggle [on|off|номер|слово]\n\nPremium-эмодзи можно вставить прямо в setr.", status, len(m.state.Triggers))
+	return fmt.Sprintf("⚙️ GAF — %s\nТриггеров: %d\n\nКоманды:\n• gaf listt\n• gaf setr <триггер> | <1–3 реакции>\n• gaf remt <номер|слово>\n• gaf toggle [on|off|номер|слово]\n\nPremium-эмодзи можно вставить справа от `|` прямо в setr.", status, len(m.state.Triggers))
 }
 
 func (m *module) list() string {
 	if len(m.state.Triggers) == 0 {
-		return "📭 Триггеров нет. Добавьте: gaf setr лайк 👍"
+		return "📭 Триггеров нет. Добавьте: gaf setr никс | 👍"
 	}
 	triggers := append([]trigger(nil), m.state.Triggers...)
 	sort.Slice(triggers, func(i, j int) bool { return triggers[i].ID < triggers[j].ID })
@@ -242,21 +242,20 @@ func (m *module) list() string {
 		if !item.Enabled {
 			marker = "⏸"
 		}
-		fmt.Fprintf(&b, "%s %d. %s → %s\n", marker, item.ID, item.Word, formatReactions(item.Reactions))
+		fmt.Fprintf(&b, "%s %d. %s | %s\n", marker, item.ID, item.Word, formatReactions(item.Reactions))
 	}
 	return strings.TrimSuffix(b.String(), "\n")
 }
 
 func (m *module) set(arguments string, entities []customEmojiEntity) (string, error) {
-	tokens := tokenize(arguments)
-	if len(tokens) < 2 {
-		return "", errors.New("использование: setr <слово> <реакция> [реакция] [реакция]")
+	word, reactionText, reactionOffset, err := splitTriggerRule(arguments)
+	if err != nil {
+		return "", err
 	}
-	word := strings.TrimSpace(tokens[0].Text)
-	if word == "" || utf8.RuneCountInString(word) > 64 {
-		return "", errors.New("слово должно содержать от 1 до 64 символов")
+	if utf8.RuneCountInString(word) > 64 {
+		return "", errors.New("триггер должен содержать от 1 до 64 символов")
 	}
-	reactions, err := parseReactions(tokens[1:], entities)
+	reactions, err := parseReactions(tokenize(reactionText), shiftEntities(entities, reactionOffset))
 	if err != nil {
 		return "", err
 	}
@@ -286,7 +285,7 @@ func (m *module) set(arguments string, entities []customEmojiEntity) (string, er
 	if err := m.save(); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("✅ Триггер «%s» → %s", word, formatReactions(reactions)), nil
+	return fmt.Sprintf("✅ %s | %s", word, formatReactions(reactions)), nil
 }
 
 func (m *module) remove(arguments string) (string, error) {
@@ -444,6 +443,25 @@ func (m *module) save() error {
 		return fmt.Errorf("replace state: %w", err)
 	}
 	return nil
+}
+
+func splitTriggerRule(value string) (string, string, int, error) {
+	pipe := strings.IndexRune(value, '|')
+	if pipe < 0 {
+		return "", "", 0, errors.New("использование: setr <триггер> | <реакция> [реакция] [реакция]")
+	}
+	word := strings.TrimSpace(value[:pipe])
+	right := value[pipe+1:]
+	reactionText := strings.TrimLeftFunc(right, unicode.IsSpace)
+	if word == "" {
+		return "", "", 0, errors.New("триггер слева от | не может быть пустым")
+	}
+	if strings.TrimSpace(reactionText) == "" {
+		return "", "", 0, errors.New("укажите хотя бы одну реакцию справа от |")
+	}
+	offsetBytes := pipe + 1 + len(right) - len(reactionText)
+	offsetUTF16 := len(utf16.Encode([]rune(value[:offsetBytes])))
+	return word, strings.TrimSpace(reactionText), offsetUTF16, nil
 }
 
 func parseReactions(tokens []token, entities []customEmojiEntity) ([]reaction, error) {

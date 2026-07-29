@@ -7,7 +7,7 @@ is not compiled into Lavis and is distributed as `gaf.lmod`.
 
 - `,gaf` — command menu;
 - `,gaf listt` or `,gaf.listt` — list triggers;
-- `,gaf setr лайк 👍 ❤️` or `,gaf.setr лайк 👍 ❤️` — set one to three reactions;
+- `,gaf setr никс | 👍 ❤️` or `,gaf.setr никс | 👍 ❤️` — set one to three reactions;
 - `,gaf remt лайк` — remove a trigger;
 - `,gaf toggle [on|off]` — toggle the module;
 - `,gaf toggle лайк [on|off]` — toggle one trigger.
@@ -17,7 +17,7 @@ from all matching triggers are de-duplicated and capped at three per message.
 When an edited message no longer matches a trigger that GAF previously applied,
 GAF sends an empty reaction set and removes the account reaction.
 
-Telegram Premium custom emoji can be pasted directly after the trigger word.
+Rules use the explicit `trigger | reactions` format. Telegram Premium custom emoji can be pasted directly on the right side of `|`, for example `,gaf setr никс | <custom-emoji>`.
 For diagnostics, `ce:<document_id>` and `custom:<document_id>` are also accepted.
 
 ## Build, test and install

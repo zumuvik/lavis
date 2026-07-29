@@ -79,8 +79,8 @@ func TestDefaultGAFSubcommandShiftsPremiumEntityOffsets(t *testing.T) {
 		path:  filepath.Join(t.TempDir(), "state.json"),
 		state: state{Enabled: true, NextID: 1, Active: map[string]activeEntry{}},
 	}
-	arguments := "setr лайк x"
-	entityOffset := len(utf16.Encode([]rune("setr лайк ")))
+	arguments := "setr никс | x"
+	entityOffset := len(utf16.Encode([]rune("setr никс | ")))
 	_, err := m.execute("gaf", arguments, []customEmojiEntity{{
 		Type: "custom_emoji", OffsetUTF16: entityOffset, LengthUTF16: 1, DocumentID: "5456140674028019486",
 	}})
@@ -89,5 +89,32 @@ func TestDefaultGAFSubcommandShiftsPremiumEntityOffsets(t *testing.T) {
 	}
 	if len(m.state.Triggers) != 1 || m.state.Triggers[0].Reactions[0].Type != "custom_emoji" {
 		t.Fatalf("trigger: %#v", m.state.Triggers)
+	}
+}
+
+func TestSetUsesPipeRuleAndSupportsMultiwordTrigger(t *testing.T) {
+	m := module{
+		path:  filepath.Join(t.TempDir(), "state.json"),
+		state: state{Enabled: true, NextID: 1, Active: map[string]activeEntry{}},
+	}
+	text, err := m.set("очень никс | 👍 ❤️", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text != "✅ очень никс | 👍 ❤️" {
+		t.Fatalf("unexpected response: %q", text)
+	}
+	if len(m.state.Triggers) != 1 || m.state.Triggers[0].Word != "очень никс" {
+		t.Fatalf("trigger: %#v", m.state.Triggers)
+	}
+}
+
+func TestSetRejectsMissingPipe(t *testing.T) {
+	m := module{
+		path:  filepath.Join(t.TempDir(), "state.json"),
+		state: state{Enabled: true, NextID: 1, Active: map[string]activeEntry{}},
+	}
+	if _, err := m.set("никс 👍", nil); err == nil {
+		t.Fatal("missing pipe must be rejected")
 	}
 }
