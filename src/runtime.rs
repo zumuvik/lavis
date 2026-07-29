@@ -1,5 +1,6 @@
 use std::{
-    collections::VecDeque,
+    collections::{VecDeque, hash_map::DefaultHasher},
+    hash::{Hash, Hasher},
     path::PathBuf,
     time::{Duration, Instant, SystemTime},
 };
@@ -24,10 +25,9 @@ use crate::{
             ApprovalError, ApprovalId, ApprovalLimits, ApprovalStore, DEFAULT_APPROVAL_TTL,
         },
         events::{
-            EventScope, module_can_receive_created_event, opaque_message_ref,
-            validate_reaction_action,
+            EventScope, module_can_receive_event, opaque_message_ref, validate_reaction_action,
         },
-        protocol::{EventAction, MessageCreatedEvent},
+        protocol::{EventAction, MessageEvent, MessageEventKind},
         source_inspection::{
             InspectionConfig, InspectionLimits, ModuleInspector, OsRandom, SystemClock,
         },
@@ -81,7 +81,8 @@ pub struct CreatedEventDispatch {
 struct CreatedEventRequest {
     descriptor: crate::external_modules::manifest::ExternalModuleDescriptor,
     message_ref: String,
-    payload: MessageCreatedEvent,
+    event: MessageEventKind,
+    payload: MessageEvent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,10 +106,11 @@ impl CreatedEventDispatch {
                 let CreatedEventRequest {
                     descriptor,
                     message_ref,
+                    event,
                     payload,
                 } = request;
                 let module_id = descriptor.id.clone();
-                let response = handle.dispatch_created_event(&module_id, payload).await;
+                let response = handle.dispatch_event(&module_id, event, payload).await;
                 (descriptor, message_ref, response)
             }
         });
@@ -212,6 +214,22 @@ impl From<Response> for RuntimeExecution {
             provision: None,
         }
     }
+}
+
+fn stable_message_key(peer_id: PeerId, message_id: i32, module_id: &str) -> String {
+    fn digest(domain: &str, peer_id: PeerId, message_id: i32, module_id: &str) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        domain.hash(&mut hasher);
+        peer_id.hash(&mut hasher);
+        message_id.hash(&mut hasher);
+        module_id.hash(&mut hasher);
+        hasher.finish()
+    }
+    format!(
+        "{:016x}{:016x}",
+        digest("lavis-message-key-v1/a", peer_id, message_id, module_id),
+        digest("lavis-message-key-v1/b", peer_id, message_id, module_id)
+    )
 }
 
 impl RuntimeState {
@@ -390,8 +408,11 @@ impl RuntimeState {
         self.external_snapshot = snapshot;
     }
 
-    pub fn prepare_created_event_dispatch(
+    pub fn prepare_message_event_dispatch(
         &self,
+        peer_id: PeerId,
+        message_id: i32,
+        event: MessageEventKind,
         text: &str,
         outgoing: bool,
         entities: Vec<crate::external_modules::protocol::CustomEmojiEntity>,
@@ -402,16 +423,17 @@ impl RuntimeState {
             .external_snapshot
             .descriptors
             .iter()
-            .filter(|descriptor| module_can_receive_created_event(descriptor))
+            .filter(|descriptor| module_can_receive_event(descriptor, event))
         {
             let event_id = crate::external_modules::protocol::request_id();
             let Ok(message_ref) = opaque_message_ref() else {
                 tracing::warn!(event = "external_event_reference_failed", module_id = %descriptor.id, "Could not create an external event reference");
                 continue;
             };
-            let payload = MessageCreatedEvent {
+            let payload = MessageEvent {
                 event_id,
                 message_ref: message_ref.clone(),
+                message_key: stable_message_key(peer_id, message_id, &descriptor.id),
                 text: text.to_owned(),
                 outgoing,
                 entities: entities.clone(),
@@ -419,6 +441,7 @@ impl RuntimeState {
             requests.push(CreatedEventRequest {
                 descriptor: descriptor.clone(),
                 message_ref,
+                event,
                 payload,
             });
         }
@@ -1818,6 +1841,7 @@ mod tests {
         aliases::{Alias, AliasStore},
         bot_api::{BotApi, BotApiFuture, BotIdentity},
         commands::{Action, AliasRequest},
+        external_modules::protocol::MessageEventKind,
         fastfetch::{FastfetchInputError, FastfetchProfileError, FastfetchResult},
         setup_store::{CompanionToken, PersistedSetupState, SetupStore},
     };
@@ -2404,7 +2428,14 @@ for line in sys.stdin:
         let (mut runtime, state_directory) = runtime_with_alias().await;
         runtime.set_external_manager(handle.clone()).await;
         let dispatch = runtime
-            .prepare_created_event_dispatch("event", true, vec![])
+            .prepare_message_event_dispatch(
+                PeerId::user(7).expect("valid test peer"),
+                42,
+                MessageEventKind::Created,
+                "event",
+                true,
+                vec![],
+            )
             .expect("only subscribed v3 modules should receive events");
 
         let execute = dispatch.execute();

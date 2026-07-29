@@ -924,6 +924,7 @@ dependencies = [
  "libc",
  "reqwest",
  "rpassword",
+ "rustix",
  "serde",
  "serde_json",
  "shell-words",

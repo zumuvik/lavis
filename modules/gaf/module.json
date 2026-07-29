@@ -1,0 +1,73 @@
+{
+  "schema_version": 4,
+  "id": "gaf",
+  "name": "GAF",
+  "version": "0.1.0",
+  "author": "zumuvik",
+  "entrypoint": "gaf",
+  "capabilities": [
+    "persistent_state_read",
+    "persistent_state_write",
+    "message.read",
+    "message.react"
+  ],
+  "default_command": "gaf",
+  "subscriptions": [
+    "message.created",
+    "message.edited"
+  ],
+  "actions": [
+    "message.react"
+  ],
+  "commands": [
+    {
+      "name": "gaf",
+      "summary_ru": "Меню и управление триггерами реакций",
+      "description_ru": "Показывает меню GAF или выполняет подкоманду listt, setr, remt или toggle.",
+      "usage": "[listt|setr|remt|toggle] [аргументы]",
+      "examples": [
+        "listt",
+        "setr лайк 👍",
+        "toggle off"
+      ]
+    },
+    {
+      "name": "listt",
+      "summary_ru": "Список триггеров реакций",
+      "description_ru": "Показывает все настроенные словесные триггеры, их реакции и состояние.",
+      "usage": "[без аргументов]",
+      "examples": []
+    },
+    {
+      "name": "setr",
+      "summary_ru": "Создать или изменить триггер",
+      "description_ru": "Назначает слову от одной до трёх обычных или Premium-реакций.",
+      "usage": "<слово> <реакция> [реакция] [реакция]",
+      "examples": [
+        "лайк 👍",
+        "топ 🔥 ❤️",
+        "премиум <custom-emoji>"
+      ]
+    },
+    {
+      "name": "remt",
+      "summary_ru": "Удалить триггер",
+      "description_ru": "Удаляет триггер по номеру или слову.",
+      "usage": "<номер|слово>",
+      "examples": [
+        "1",
+        "лайк"
+      ]
+    },
+    {
+      "name": "toggle",
+      "summary_ru": "Включить или выключить GAF",
+      "description_ru": "Переключает весь модуль или отдельный триггер.",
+      "usage": "[on|off|<номер|слово> [on|off]]",
+      "examples": [
+        "off",
+        "лайк off"
+      ]
+    }
+  ]
+}

@@ -6,6 +6,7 @@ pub const MAX_RESULT_BYTES: usize = 32 * 1024;
 pub const MAX_ERROR_MESSAGE_CHARS: usize = 256;
 pub const MAX_LOG_MESSAGE_CHARS: usize = 1024;
 pub const MAX_EVENT_ACTIONS: usize = 1;
+pub const MAX_REACTIONS_PER_ACTION: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CustomEmojiEntity {
@@ -14,16 +15,34 @@ pub struct CustomEmojiEntity {
     pub document_id: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageEventKind {
+    Created,
+    Edited,
+}
+
+impl MessageEventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "message.created",
+            Self::Edited => "message.edited",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MessageCreatedEvent {
+pub struct MessageEvent {
     pub event_id: String,
     pub message_ref: String,
+    /// Stable, module-scoped identifier for the same Telegram message across
+    /// create/edit events. It does not grant access to the underlying peer.
+    pub message_key: String,
     pub text: String,
     pub outgoing: bool,
     pub entities: Vec<CustomEmojiEntity>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ReactionSpec {
     Emoji(String),
     CustomEmoji { document_id: String },
@@ -32,7 +51,9 @@ pub enum ReactionSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventAction {
     pub message_ref: String,
-    pub reaction: ReactionSpec,
+    /// The complete desired reaction set. Protocol v4 permits zero to three
+    /// reactions; an empty set removes the account's reactions from a message.
+    pub reactions: Vec<ReactionSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -55,7 +76,8 @@ pub enum CoreMessage {
     },
     Event {
         request_id: String,
-        payload: MessageCreatedEvent,
+        event: MessageEventKind,
+        payload: MessageEvent,
     },
 }
 
@@ -117,7 +139,7 @@ impl CoreMessage {
                     "command": command,
                     "arguments": arguments,
                 });
-                if protocol_version == 3 {
+                if protocol_version >= 3 {
                     message["context"] = serde_json::json!({
                         "argument_entities": argument_entities.iter().map(|entity| serde_json::json!({
                             "type": "custom_emoji",
@@ -141,13 +163,15 @@ impl CoreMessage {
             })),
             Self::Event {
                 request_id,
+                event,
                 payload,
-            } => serde_json::to_string(&serde_json::json!({
-                "protocol_version": protocol_version,
-                "type": "event",
-                "request_id": request_id,
-                "event": "message.created",
-                "payload": {
+            } => {
+                if protocol_version < 3
+                    || (*event == MessageEventKind::Edited && protocol_version < 4)
+                {
+                    return Err(ExternalError::ProtocolEncode);
+                }
+                let mut event_payload = serde_json::json!({
                     "event_id": payload.event_id,
                     "message_ref": payload.message_ref,
                     "text": payload.text,
@@ -158,8 +182,18 @@ impl CoreMessage {
                         "length_utf16": entity.length_utf16,
                         "document_id": entity.document_id,
                     })).collect::<Vec<_>>(),
-                },
-            })),
+                });
+                if protocol_version >= 4 {
+                    event_payload["message_key"] = serde_json::json!(payload.message_key);
+                }
+                serde_json::to_string(&serde_json::json!({
+                    "protocol_version": protocol_version,
+                    "type": "event",
+                    "request_id": request_id,
+                    "event": event.as_str(),
+                    "payload": event_payload,
+                }))
+            }
         }
         .map_err(|_| ExternalError::ProtocolEncode)
     }
@@ -265,6 +299,9 @@ pub fn parse_module_line_for(
             }))
         }
         "event_result" => {
+            if expected_protocol_version < 3 {
+                return Err(ExternalError::ProtocolDecode);
+            }
             let request_id = validate_request_id(&value)?;
             let actions = value
                 .get("actions")
@@ -275,7 +312,7 @@ pub fn parse_module_line_for(
             }
             let actions = actions
                 .iter()
-                .map(parse_event_action)
+                .map(|action| parse_event_action(action, expected_protocol_version))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Some(ModuleMessage::EventResult {
                 request_id,
@@ -286,23 +323,47 @@ pub fn parse_module_line_for(
     }
 }
 
-fn parse_event_action(value: &serde_json::Value) -> Result<EventAction, ExternalError> {
+fn parse_event_action(
+    value: &serde_json::Value,
+    protocol_version: u32,
+) -> Result<EventAction, ExternalError> {
     if value.get("type").and_then(|value| value.as_str()) != Some("message.react") {
         return Err(ExternalError::ProtocolDecode);
     }
     let message_ref = get_string(value, "message_ref")?;
-    let reaction = value.get("reaction").ok_or(ExternalError::ProtocolDecode)?;
-    let reaction = match reaction.get("type").and_then(|value| value.as_str()) {
-        Some("emoji") => ReactionSpec::Emoji(get_string(reaction, "emoji")?),
-        Some("custom_emoji") => ReactionSpec::CustomEmoji {
-            document_id: get_string(reaction, "document_id")?,
-        },
-        _ => return Err(ExternalError::ProtocolDecode),
+    let reactions = if protocol_version == 3 {
+        vec![parse_reaction(
+            value.get("reaction").ok_or(ExternalError::ProtocolDecode)?,
+        )?]
+    } else if protocol_version == 4 {
+        let reactions = value
+            .get("reactions")
+            .and_then(|value| value.as_array())
+            .ok_or(ExternalError::ProtocolDecode)?;
+        if reactions.len() > MAX_REACTIONS_PER_ACTION {
+            return Err(ExternalError::ProtocolDecode);
+        }
+        reactions
+            .iter()
+            .map(parse_reaction)
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        return Err(ExternalError::ProtocolDecode);
     };
     Ok(EventAction {
         message_ref,
-        reaction,
+        reactions,
     })
+}
+
+fn parse_reaction(value: &serde_json::Value) -> Result<ReactionSpec, ExternalError> {
+    match value.get("type").and_then(|value| value.as_str()) {
+        Some("emoji") => Ok(ReactionSpec::Emoji(get_string(value, "emoji")?)),
+        Some("custom_emoji") => Ok(ReactionSpec::CustomEmoji {
+            document_id: get_string(value, "document_id")?,
+        }),
+        _ => Err(ExternalError::ProtocolDecode),
+    }
 }
 
 fn get_string(value: &serde_json::Value, key: &str) -> Result<String, ExternalError> {
@@ -322,6 +383,25 @@ pub fn request_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_event(kind: MessageEventKind) -> CoreMessage {
+        CoreMessage::Event {
+            request_id: "9".to_owned(),
+            event: kind,
+            payload: MessageEvent {
+                event_id: "evt".to_owned(),
+                message_ref: "opaque".to_owned(),
+                message_key: "stable".to_owned(),
+                text: "Привет 🦀".to_owned(),
+                outgoing: false,
+                entities: vec![CustomEmojiEntity {
+                    offset_utf16: 7,
+                    length_utf16: 2,
+                    document_id: "5456140674028019486".to_owned(),
+                }],
+            },
+        }
+    }
 
     #[test]
     fn serialize_initialize() {
@@ -356,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_execute_projects_custom_emoji_context() {
+    fn v3_and_v4_execute_project_custom_emoji_context() {
         let msg = CoreMessage::Execute {
             request_id: "2".to_owned(),
             command: "manage".to_owned(),
@@ -367,14 +447,16 @@ mod tests {
                 document_id: "5456140674028019486".to_owned(),
             }],
         };
-        let parsed: serde_json::Value =
-            serde_json::from_str(&msg.serialize_for(3).unwrap()).unwrap();
-        assert_eq!(parsed["context"]["argument_entities"][0]["offset_utf16"], 9);
-        assert_eq!(parsed["context"]["argument_entities"][0]["length_utf16"], 2);
-        assert_eq!(
-            parsed["context"]["argument_entities"][0]["document_id"],
-            "5456140674028019486"
-        );
+        for version in [3, 4] {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&msg.serialize_for(version).unwrap()).unwrap();
+            assert_eq!(parsed["context"]["argument_entities"][0]["offset_utf16"], 9);
+            assert_eq!(parsed["context"]["argument_entities"][0]["length_utf16"], 2);
+            assert_eq!(
+                parsed["context"]["argument_entities"][0]["document_id"],
+                "5456140674028019486"
+            );
+        }
     }
 
     #[test]
@@ -399,31 +481,63 @@ mod tests {
 
     #[test]
     fn v3_event_result_preserves_custom_emoji_document_id_as_string() {
-        let event = CoreMessage::Event {
-            request_id: "9".to_owned(),
-            payload: MessageCreatedEvent {
-                event_id: "evt".to_owned(),
-                message_ref: "opaque".to_owned(),
-                text: "Привет 🦀".to_owned(),
-                outgoing: false,
-                entities: vec![CustomEmojiEntity {
-                    offset_utf16: 7,
-                    length_utf16: 2,
-                    document_id: "5456140674028019486".to_owned(),
-                }],
-            },
-        };
-        let serialized = event.serialize_for(3).unwrap();
+        let serialized = sample_event(MessageEventKind::Created)
+            .serialize_for(3)
+            .unwrap();
         let value: serde_json::Value = serde_json::from_str(&serialized).unwrap();
         assert_eq!(value["protocol_version"], 3);
+        assert!(value["payload"].get("message_key").is_none());
         assert_eq!(
             value["payload"]["entities"][0]["document_id"],
             "5456140674028019486"
         );
         let reply = r#"{"protocol_version":3,"type":"event_result","request_id":"9","actions":[{"type":"message.react","message_ref":"opaque","reaction":{"type":"custom_emoji","document_id":"5456140674028019486"}}]}"#;
+        let parsed = parse_module_line_for(reply, 3).unwrap().unwrap();
+        let ModuleMessage::EventResult { actions, .. } = parsed else {
+            panic!("expected event result");
+        };
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].reactions.len(), 1);
+    }
+
+    #[test]
+    fn v4_serializes_edited_event_with_stable_key() {
+        let serialized = sample_event(MessageEventKind::Edited)
+            .serialize_for(4)
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(value["event"], "message.edited");
+        assert_eq!(value["payload"]["message_key"], "stable");
+        assert!(
+            sample_event(MessageEventKind::Edited)
+                .serialize_for(3)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn v4_parses_reaction_sets_and_empty_removal() {
+        let reply = r#"{"protocol_version":4,"type":"event_result","request_id":"9","actions":[{"type":"message.react","message_ref":"opaque","reactions":[{"type":"emoji","emoji":"👍"},{"type":"custom_emoji","document_id":"5456140674028019486"}]}]}"#;
+        let parsed = parse_module_line_for(reply, 4).unwrap().unwrap();
+        let ModuleMessage::EventResult { actions, .. } = parsed else {
+            panic!("expected event result");
+        };
+        assert_eq!(actions[0].reactions.len(), 2);
+
+        let remove = r#"{"protocol_version":4,"type":"event_result","request_id":"9","actions":[{"type":"message.react","message_ref":"opaque","reactions":[]}]}"#;
+        let parsed = parse_module_line_for(remove, 4).unwrap().unwrap();
+        let ModuleMessage::EventResult { actions, .. } = parsed else {
+            panic!("expected event result");
+        };
+        assert!(actions[0].reactions.is_empty());
+    }
+
+    #[test]
+    fn v4_rejects_more_than_three_reactions() {
+        let reply = r#"{"protocol_version":4,"type":"event_result","request_id":"9","actions":[{"type":"message.react","message_ref":"opaque","reactions":[{"type":"emoji","emoji":"1"},{"type":"emoji","emoji":"2"},{"type":"emoji","emoji":"3"},{"type":"emoji","emoji":"4"}]}]}"#;
         assert!(matches!(
-            parse_module_line_for(reply, 3),
-            Ok(Some(ModuleMessage::EventResult { .. }))
+            parse_module_line_for(reply, 4),
+            Err(ExternalError::ProtocolDecode)
         ));
     }
 

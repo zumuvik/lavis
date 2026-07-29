@@ -92,10 +92,22 @@ impl ExternalCapability {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExternalSubscription {
     MessageCreated,
+    MessageEdited,
 }
 impl ExternalSubscription {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MessageCreated => "message.created",
+            Self::MessageEdited => "message.edited",
+        }
+    }
+
     fn from_str(value: &str) -> Option<Self> {
-        (value == "message.created").then_some(Self::MessageCreated)
+        match value {
+            "message.created" => Some(Self::MessageCreated),
+            "message.edited" => Some(Self::MessageEdited),
+            _ => None,
+        }
     }
 }
 
@@ -311,7 +323,7 @@ pub fn validate_manifest_at(
     let manifest: ManifestFile =
         serde_json::from_slice(&bytes).map_err(|_| ExternalError::MalformedManifest)?;
 
-    if !matches!(manifest.schema_version, 2 | 3) {
+    if !matches!(manifest.schema_version, 2..=4) {
         return Err(ExternalError::UnsupportedSchemaVersion);
     }
 
@@ -371,6 +383,9 @@ pub fn validate_manifest_at(
     for value in &manifest.subscriptions {
         let subscription =
             ExternalSubscription::from_str(value).ok_or(ExternalError::InvalidArgument)?;
+        if subscription == ExternalSubscription::MessageEdited && manifest.schema_version < 4 {
+            return Err(ExternalError::UnsupportedSchemaVersion);
+        }
         if subscriptions.contains(&subscription) {
             return Err(ExternalError::InvalidArgument);
         }
@@ -450,9 +465,7 @@ pub fn validate_manifest_at(
             return Err(ExternalError::InvalidArgument);
         }
     }
-    if subscriptions.contains(&ExternalSubscription::MessageCreated)
-        && !seen_capabilities.contains(&ExternalCapability::MessageRead)
-    {
+    if !subscriptions.is_empty() && !seen_capabilities.contains(&ExternalCapability::MessageRead) {
         return Err(ExternalError::InvalidCapability);
     }
     if actions.contains(&ExternalAction::MessageReact)
@@ -662,6 +675,43 @@ mod tests {
         assert!(matches!(
             validate_manifest_at(&path, Some("echo")),
             Err(ExternalError::InvalidCapability)
+        ));
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn v4_manifest_accepts_edited_message_subscription() {
+        let base = temp_dir();
+        let dir = create_module_dir(&base, "echo");
+        let mut json = serde_json::from_slice::<serde_json::Value>(&valid_manifest_json()).unwrap();
+        json["schema_version"] = serde_json::json!(4);
+        json["default_command"] = serde_json::json!("repeat");
+        json["subscriptions"] = serde_json::json!(["message.created", "message.edited"]);
+        json["actions"] = serde_json::json!(["message.react"]);
+        json["capabilities"] = serde_json::json!(["message.read", "message.react"]);
+        let path = write_manifest(&dir, &serde_json::to_vec(&json).unwrap());
+        let descriptor = validate_manifest_at(&path, Some("echo")).unwrap();
+        assert_eq!(descriptor.protocol_version, 4);
+        assert!(
+            descriptor
+                .subscriptions
+                .contains(&ExternalSubscription::MessageEdited)
+        );
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn v3_manifest_rejects_edited_message_subscription() {
+        let base = temp_dir();
+        let dir = create_module_dir(&base, "echo");
+        let mut json = serde_json::from_slice::<serde_json::Value>(&valid_manifest_json()).unwrap();
+        json["schema_version"] = serde_json::json!(3);
+        json["subscriptions"] = serde_json::json!(["message.edited"]);
+        json["capabilities"] = serde_json::json!(["message.read"]);
+        let path = write_manifest(&dir, &serde_json::to_vec(&json).unwrap());
+        assert!(matches!(
+            validate_manifest_at(&path, Some("echo")),
+            Err(ExternalError::UnsupportedSchemaVersion)
         ));
         fs::remove_dir_all(&base).unwrap();
     }

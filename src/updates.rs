@@ -1,7 +1,7 @@
 use anyhow::Context;
 use grammers_client::{
     client::UpdateStream,
-    message::InputReactions,
+    tl,
     update::{Message, Update},
 };
 use grammers_session::types::PeerId;
@@ -309,11 +309,16 @@ async fn process_update(
             }
         }
     };
-    let setup_protected = matches!(&action, Some(Action::Setup(_)))
+    let event_protected = action.is_some()
         || setup_input.is_some()
         || runtime.setup_protects_message(peer_id, authored_by_self);
 
-    if should_prepare_created_event(edited, setup_protected) {
+    if should_prepare_message_event(event_protected) {
+        let event = if edited {
+            crate::external_modules::protocol::MessageEventKind::Edited
+        } else {
+            crate::external_modules::protocol::MessageEventKind::Created
+        };
         let entities = crate::external_modules::entities::project_custom_emoji_entities(
             message.fmt_entities(),
             0,
@@ -325,13 +330,19 @@ async fn process_update(
                 capacity = MAX_EVENT_DISPATCH_TASKS,
                 "Skipped external event dispatch because the task queue is full"
             );
-        } else if let Some(dispatch) =
-            runtime.prepare_created_event_dispatch(message.text(), outgoing, entities)
-        {
+        } else if let Some(dispatch) = runtime.prepare_message_event_dispatch(
+            peer_id,
+            message_id,
+            event,
+            message.text(),
+            outgoing,
+            entities,
+        ) {
             let reaction_message = message.clone();
+            let reaction_client = client.clone();
             let spawned = event_dispatches.try_spawn(async move {
                 let result = dispatch.execute().await;
-                handle_event_dispatch(reaction_message, result).await;
+                handle_event_dispatch(reaction_client, reaction_message, result).await;
             });
             debug_assert!(
                 spawned,
@@ -443,11 +454,15 @@ async fn process_update(
     }
 }
 
-fn should_prepare_created_event(edited: bool, setup_protected: bool) -> bool {
-    !edited && !setup_protected
+fn should_prepare_message_event(event_protected: bool) -> bool {
+    !event_protected
 }
 
-async fn handle_event_dispatch(message: Message, result: CreatedEventDispatchResult) {
+async fn handle_event_dispatch(
+    client: grammers_client::Client,
+    message: Message,
+    result: CreatedEventDispatchResult,
+) {
     for failure in result.failures {
         tracing::warn!(
             event = "external_event_failed",
@@ -457,18 +472,48 @@ async fn handle_event_dispatch(message: Message, result: CreatedEventDispatchRes
         );
     }
     for action in result.actions {
-        let reaction = match action.reaction {
-            crate::external_modules::protocol::ReactionSpec::Emoji(emoji) => {
-                InputReactions::emoticon(emoji)
-            }
-            crate::external_modules::protocol::ReactionSpec::CustomEmoji { document_id } => {
-                match document_id.parse::<i64>() {
-                    Ok(document_id) => InputReactions::custom_emoji(document_id),
-                    Err(_) => continue,
+        let mut reactions = Vec::with_capacity(action.reactions.len());
+        for reaction in action.reactions {
+            match reaction {
+                crate::external_modules::protocol::ReactionSpec::Emoji(emoticon) => {
+                    reactions.push(tl::types::ReactionEmoji { emoticon }.into());
+                }
+                crate::external_modules::protocol::ReactionSpec::CustomEmoji { document_id } => {
+                    let Ok(document_id) = document_id.parse::<i64>() else {
+                        continue;
+                    };
+                    reactions.push(tl::types::ReactionCustomEmoji { document_id }.into());
                 }
             }
+        }
+        let peer = match message.peer_ref().await {
+            Ok(Some(peer)) => peer,
+            Ok(None) => {
+                tracing::warn!(
+                    event = "external_reaction_peer_missing",
+                    "External reaction peer reference is unavailable"
+                );
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    event = "external_reaction_peer_failed",
+                    error = %error,
+                    "Could not resolve peer for an external reaction"
+                );
+                continue;
+            }
         };
-        if let Err(error) = message.react(reaction).await {
+        if let Err(error) = client
+            .invoke(&tl::functions::messages::SendReaction {
+                big: false,
+                add_to_recent: false,
+                peer: peer.into(),
+                msg_id: message.id(),
+                reaction: Some(reactions),
+            })
+            .await
+        {
             tracing::warn!(
                 event = "external_reaction_failed",
                 error_category = invocation_error_category(&error),
@@ -584,7 +629,7 @@ mod tests {
 
     use super::{
         EventDispatches, MAX_EVENT_DISPATCH_TASKS, ProvisionTasks, UpdateOrEvent, is_self_authored,
-        provision_completion_text, route, should_prepare_created_event,
+        provision_completion_text, route, should_prepare_message_event,
     };
     use crate::commands::{Action, ExternalInvocation, PrefixRequest};
     use crate::{
@@ -789,12 +834,9 @@ mod tests {
     }
 
     #[test]
-    fn setup_protected_messages_are_not_projected_to_external_created_events() {
-        let action = Action::Setup(crate::commands::SetupRequest::Auto);
-        let setup_protected = matches!(action, Action::Setup(_));
-        assert!(!should_prepare_created_event(false, setup_protected));
-        assert!(!should_prepare_created_event(true, false));
-        assert!(should_prepare_created_event(false, false));
+    fn protected_command_messages_are_not_projected_to_external_events() {
+        assert!(!should_prepare_message_event(true));
+        assert!(should_prepare_message_event(false));
     }
 
     #[tokio::test]

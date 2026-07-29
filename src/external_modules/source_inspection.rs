@@ -306,6 +306,7 @@ impl ModuleInstallPlan {
             .iter()
             .map(|x| match x {
                 super::manifest::ExternalSubscription::MessageCreated => "message.created".into(),
+                super::manifest::ExternalSubscription::MessageEdited => "message.edited".into(),
             })
             .collect();
         let actions = d

@@ -245,10 +245,11 @@ impl ExternalManager {
         Ok(result)
     }
 
-    pub async fn dispatch_created_event(
+    pub async fn dispatch_event(
         &mut self,
         module_id: &str,
-        payload: super::protocol::MessageCreatedEvent,
+        event: super::protocol::MessageEventKind,
+        payload: super::protocol::MessageEvent,
     ) -> Result<(String, Vec<super::protocol::EventAction>), ExternalError> {
         let process = self
             .processes
@@ -256,11 +257,10 @@ impl ExternalManager {
             .cloned()
             .ok_or(ExternalError::Unavailable)?;
         let mut process = process.lock().await;
-        if process.status() != ProcessStatus::Running || process.descriptor().protocol_version != 3
-        {
+        if process.status() != ProcessStatus::Running || process.descriptor().protocol_version < 3 {
             return Err(ExternalError::Unavailable);
         }
-        process.dispatch_created_event(payload).await
+        process.dispatch_event(event, payload).await
     }
 
     pub async fn shutdown_all(&mut self) {
@@ -424,10 +424,11 @@ impl ExternalManagerHandle {
         }
     }
 
-    pub async fn dispatch_created_event(
+    pub async fn dispatch_event(
         &self,
         module_id: &str,
-        payload: super::protocol::MessageCreatedEvent,
+        event: super::protocol::MessageEventKind,
+        payload: super::protocol::MessageEvent,
     ) -> Result<(String, Vec<super::protocol::EventAction>), ExternalError> {
         let process = {
             let manager = self.inner.lock().await;
@@ -435,11 +436,10 @@ impl ExternalManagerHandle {
         }
         .ok_or(ExternalError::Unavailable)?;
         let mut process = process.lock().await;
-        if process.status() != ProcessStatus::Running || process.descriptor().protocol_version != 3
-        {
+        if process.status() != ProcessStatus::Running || process.descriptor().protocol_version < 3 {
             return Err(ExternalError::Unavailable);
         }
-        process.dispatch_created_event(payload).await
+        process.dispatch_event(event, payload).await
     }
 
     pub async fn execute(
