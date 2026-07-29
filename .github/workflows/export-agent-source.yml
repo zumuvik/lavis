@@ -51,8 +51,11 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
 
-      - name: Check formatting
-        run: nix develop -c cargo fmt --check
+      - name: Format Rust
+        run: |
+          nix develop -c cargo fmt
+          nix develop -c cargo fmt --check
+          git diff --check
 
       - name: Check compilation
         run: nix develop -c cargo check --all-targets --all-features
