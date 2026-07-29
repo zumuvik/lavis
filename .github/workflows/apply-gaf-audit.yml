@@ -1,0 +1,57 @@
+name: Apply deterministic GAF audit patch
+
+on:
+  push:
+    branches:
+      - agent/gaf-module
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@v3
+
+      - name: Apply patch
+        run: python3 .github/apply_gaf_audit.py
+
+      - name: Format and validate
+        shell: bash
+        run: |
+          nix develop -c gofmt -w modules/gaf/main.go modules/gaf/main_test.go
+          nix develop -c bash -c 'set -euo pipefail; cd modules/gaf; go test ./...; go vet ./...; ./build-lmod.sh; cp dist/gaf.lmod /tmp/gaf.lmod; ./build-lmod.sh; cmp /tmp/gaf.lmod dist/gaf.lmod'
+          python3 - <<'PY'
+          import zipfile
+          with zipfile.ZipFile('modules/gaf/dist/gaf.lmod') as archive:
+              assert archive.namelist() == ['module.json', 'gaf']
+              for item in archive.infolist():
+                  assert item.compress_type == zipfile.ZIP_STORED
+              modes = {item.filename: (item.external_attr >> 16) & 0o777 for item in archive.infolist()}
+              assert modes == {'module.json': 0o600, 'gaf': 0o700}, modes
+          PY
+          nix develop -c cargo fmt --all
+          nix develop -c cargo check --all-targets --all-features
+          nix develop -c cargo clippy --all-targets --all-features -- -D warnings
+          nix develop -c cargo test --all-targets --all-features
+          nix flake check --print-build-logs
+          nix build --print-build-logs
+          ./result/bin/lavis modules validate modules/gaf/build/module.json
+
+      - name: Commit audited fixes
+        shell: bash
+        run: |
+          git rm .github/apply_gaf_audit.py .github/workflows/apply-gaf-audit.yml
+          git add -A
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git commit -m 'fix: address gaf audit findings'
+          git push origin HEAD:agent/gaf-module
