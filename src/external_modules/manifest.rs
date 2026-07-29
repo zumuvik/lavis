@@ -175,8 +175,13 @@ pub fn validate_command_name(name: &str) -> Result<(), ExternalError> {
     Ok(())
 }
 
-fn validate_single_line(value: &str) -> bool {
+/// Validate display text shared by manifest and source identity boundaries.
+pub(crate) fn validate_display_single_line(value: &str) -> bool {
     !value.is_empty() && !value.chars().any(|c| c.is_control() || is_bidi_control(c))
+}
+
+fn validate_single_line(value: &str) -> bool {
+    validate_display_single_line(value)
 }
 
 fn usage_is_argument_syntax(usage: &str, command_name: &str) -> bool {

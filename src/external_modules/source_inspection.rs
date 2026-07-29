@@ -4,7 +4,9 @@
 //! redeemed.  ZIP is deliberately limited to unencrypted stored entries: accepting
 //! an encoding we cannot decompress and verify would make the inspection meaningless.
 
-use super::manifest::{ExternalModuleDescriptor, validate_manifest_at};
+use super::manifest::{
+    ExternalModuleDescriptor, validate_display_single_line, validate_manifest_at,
+};
 use serde::{Serialize, Serializer};
 use std::{
     collections::BTreeMap,
@@ -43,15 +45,17 @@ impl std::fmt::Debug for PinnedRepository {
 }
 impl PinnedRepository {
     pub fn new(repository: String, revision: String) -> Result<Self, SourceInspectionError> {
-        if repository.is_empty()
-            || !(revision.len() == 40 || revision.len() == 64)
+        if repository.trim().is_empty() || !validate_display_single_line(&repository) {
+            return Err(SourceInspectionError::UnsafeRepositoryIdentity);
+        }
+        if !(revision.len() == 40 || revision.len() == 64)
             || !revision.bytes().all(|b| b.is_ascii_hexdigit())
         {
             return Err(SourceInspectionError::UnpinnedRepository);
         }
         Ok(Self {
             repository,
-            revision,
+            revision: revision.to_ascii_lowercase(),
         })
     }
     pub fn repository(&self) -> &str {
@@ -213,6 +217,12 @@ pub enum SourceInspectionError {
     Staging,
     #[error("repository source must use an immutable revision")]
     UnpinnedRepository,
+    #[error("repository identity is not safe to display")]
+    UnsafeRepositoryIdentity,
+    #[error("pending inspection quota exceeded")]
+    PendingQuotaExceeded,
+    #[error("pending inspection accounting invariant failed")]
+    PendingAccountingInvariant,
     #[error("approval token is invalid, expired, or not bound to this request")]
     InvalidToken,
     #[error("secure randomness failed")]
@@ -532,11 +542,33 @@ struct PendingInspection {
     stage: Stage,
 }
 
-/// In-memory one-shot approvals. Stored state contains only a token digest.
+/// In-memory one-shot approvals with bounded, private staging retention.
+/// Pending bytes are the validated expanded-byte total of staged archives.
+/// Source length is used only as a conservative single-source fail-fast check;
+/// aggregate retention is always charged by this expanded staging metric.
+#[derive(Clone, Debug)]
+pub struct PendingInspectionLimits {
+    /// Maximum number of live, unredeemed inspections.
+    pub max_entries: usize,
+    /// Maximum aggregate validated expanded bytes in live staging directories.
+    pub max_pending_bytes: u64,
+}
+
+impl Default for PendingInspectionLimits {
+    fn default() -> Self {
+        Self {
+            max_entries: 16,
+            max_pending_bytes: 128 * 1024 * 1024,
+        }
+    }
+}
+
 pub struct ApprovalTokens<C, R> {
     clock: C,
     random: R,
     ttl: Duration,
+    pending_limits: PendingInspectionLimits,
+    pending_bytes: u64,
     entries: Vec<TokenEntry>,
 }
 struct TokenEntry {
@@ -546,11 +578,30 @@ struct TokenEntry {
     pending: PendingInspection,
 }
 impl<C: Clock, R: RandomSource> ApprovalTokens<C, R> {
+    /// Create approvals using conservative default pending limits.
     pub fn new(clock: C, random: R, ttl: Duration) -> Self {
         Self {
             clock,
             random,
             ttl,
+            pending_limits: PendingInspectionLimits::default(),
+            pending_bytes: 0,
+            entries: Vec::new(),
+        }
+    }
+    /// Create approvals with explicit limits for concurrently staged inspections.
+    pub fn with_pending_limits(
+        clock: C,
+        random: R,
+        ttl: Duration,
+        pending_limits: PendingInspectionLimits,
+    ) -> Self {
+        Self {
+            clock,
+            random,
+            ttl,
+            pending_limits,
+            pending_bytes: 0,
             entries: Vec::new(),
         }
     }
@@ -559,7 +610,10 @@ impl<C: Clock, R: RandomSource> ApprovalTokens<C, R> {
         config: &InspectionConfig,
         source: AcquiredLmod,
     ) -> Result<IssuedInspection, SourceInspectionError> {
-        self.purge_expired();
+        self.purge_expired()?;
+        if self.entries.len() >= self.pending_limits.max_entries {
+            return Err(SourceInspectionError::PendingQuotaExceeded);
+        }
         let now = self.clock.now();
         let pending = inspect_pending(
             config,
@@ -569,8 +623,20 @@ impl<C: Clock, R: RandomSource> ApprovalTokens<C, R> {
             now,
             &mut self.random,
         )?;
+        let staged_bytes = pending.plan.archive.expanded_bytes;
+        let next_pending_bytes = self
+            .pending_bytes
+            .checked_add(staged_bytes)
+            .ok_or(SourceInspectionError::PendingQuotaExceeded)?;
+        if next_pending_bytes > self.pending_limits.max_pending_bytes {
+            pending.stage.cleanup();
+            return Err(SourceInspectionError::PendingQuotaExceeded);
+        }
         let mut raw = [0; 32];
-        self.random.fill(&mut raw)?;
+        if let Err(error) = self.random.fill(&mut raw) {
+            pending.stage.cleanup();
+            return Err(error);
+        }
         let token = ConfirmationToken(hex(&raw));
         let expires = now
             .checked_add(self.ttl)
@@ -582,6 +648,7 @@ impl<C: Clock, R: RandomSource> ApprovalTokens<C, R> {
             binding: TokenBinding::from_plan(&pending.plan),
             pending,
         });
+        self.pending_bytes = next_pending_bytes;
         Ok(IssuedInspection {
             plan: issued_plan,
             token,
@@ -593,7 +660,7 @@ impl<C: Clock, R: RandomSource> ApprovalTokens<C, R> {
         token: &ConfirmationToken,
         expected: &RedeemExpectation,
     ) -> Result<ModuleInstallPlan, SourceInspectionError> {
-        self.purge_expired();
+        self.purge_expired()?;
         let digest = sha256(token.0.as_bytes());
         let position = self
             .entries
@@ -603,12 +670,14 @@ impl<C: Clock, R: RandomSource> ApprovalTokens<C, R> {
         let entry = self.entries.swap_remove(position);
         if fs::symlink_metadata(&entry.pending.stage.0).is_err() {
             entry.pending.stage.cleanup();
+            self.recompute_pending_bytes()?;
             return Err(SourceInspectionError::InvalidToken);
         }
         entry.pending.stage.cleanup();
+        self.recompute_pending_bytes()?;
         Ok(entry.pending.plan)
     }
-    fn purge_expired(&mut self) {
+    fn purge_expired(&mut self) -> Result<(), SourceInspectionError> {
         let now = self.clock.now();
         let mut kept = Vec::new();
         for entry in self.entries.drain(..) {
@@ -619,6 +688,24 @@ impl<C: Clock, R: RandomSource> ApprovalTokens<C, R> {
             }
         }
         self.entries = kept;
+        self.recompute_pending_bytes()
+    }
+    fn recompute_pending_bytes(&mut self) -> Result<(), SourceInspectionError> {
+        let mut total = 0u64;
+        for entry in &self.entries {
+            match total.checked_add(entry.pending.plan.archive.expanded_bytes) {
+                Some(next) => total = next,
+                None => {
+                    for entry in self.entries.drain(..) {
+                        entry.pending.stage.cleanup();
+                    }
+                    self.pending_bytes = 0;
+                    return Err(SourceInspectionError::PendingAccountingInvariant);
+                }
+            }
+        }
+        self.pending_bytes = total;
+        Ok(())
     }
 }
 
@@ -1675,6 +1762,239 @@ mod tests {
         assert_eq!(format!("{token:?}"), "ConfirmationToken(REDACTED)");
         assert_eq!(token.to_string(), "[redacted]");
         let _ = fs::remove_dir_all(&outside);
+        let _ = fs::remove_dir(&path);
+    }
+    #[test]
+    fn pending_quota_rejects_new_inspection_without_evicting_live_entry() {
+        let path = root("pending-quota");
+        let config = InspectionConfig {
+            staging_root: path.clone(),
+            limits: limits(),
+        };
+        let clock = TestClock(Cell::new(UNIX_EPOCH));
+        let mut tokens = ApprovalTokens::with_pending_limits(
+            clock,
+            TestRandom(18),
+            Duration::from_secs(30),
+            PendingInspectionLimits {
+                max_entries: 1,
+                max_pending_bytes: 100_000,
+            },
+        );
+        let first = tokens
+            .inspect_and_issue(&config, AcquiredLmod::archive(valid_archive(2)))
+            .unwrap();
+        assert!(matches!(
+            tokens.inspect_and_issue(&config, AcquiredLmod::archive(valid_archive(2))),
+            Err(SourceInspectionError::PendingQuotaExceeded)
+        ));
+        let expected = RedeemExpectation::from_plan(first.plan());
+        assert!(tokens.redeem(first.token(), &expected).is_ok());
+        let _ = fs::remove_dir(&path);
+    }
+
+    #[test]
+    fn repository_display_validation_and_canonical_revision_are_strict() {
+        let upper = "A".repeat(40);
+        let repository =
+            PinnedRepository::new("https://example.invalid/team/module".into(), upper).unwrap();
+        assert_eq!(repository.revision(), "a".repeat(40));
+        assert!(
+            serde_json::to_string(&repository)
+                .unwrap()
+                .contains(&"a".repeat(40))
+        );
+        for invalid in [
+            "",
+            "   ",
+            "line\nfeed",
+            "carriage\rreturn",
+            "tab\tvalue",
+            "\u{1c}",
+            "\u{200e}",
+            "\u{200f}",
+            "\u{202a}",
+            "\u{202e}",
+            "\u{2066}",
+            "\u{2069}",
+        ] {
+            assert_eq!(
+                PinnedRepository::new(invalid.into(), "a".repeat(40)),
+                Err(SourceInspectionError::UnsafeRepositoryIdentity)
+            );
+        }
+        assert_eq!(
+            PinnedRepository::new("https://example.invalid/r".into(), "g".repeat(40)),
+            Err(SourceInspectionError::UnpinnedRepository)
+        );
+        assert_eq!(
+            PinnedRepository::new("https://example.invalid/r".into(), "a".repeat(39)),
+            Err(SourceInspectionError::UnpinnedRepository)
+        );
+    }
+
+    #[test]
+    fn expanded_pending_quota_releases_on_redeem_and_expiry() {
+        let path = root("expanded-pending-quota");
+        let config = InspectionConfig {
+            staging_root: path.clone(),
+            limits: limits(),
+        };
+        let archive = valid_archive(2);
+        let expanded = zip_entries(&archive)
+            .unwrap()
+            .iter()
+            .map(|entry| entry.expanded)
+            .sum();
+        let clock = TestClock(Cell::new(UNIX_EPOCH));
+        let mut tokens = ApprovalTokens::with_pending_limits(
+            clock,
+            TestRandom(19),
+            Duration::from_secs(2),
+            PendingInspectionLimits {
+                max_entries: 2,
+                max_pending_bytes: expanded,
+            },
+        );
+        let first = tokens
+            .inspect_and_issue(&config, AcquiredLmod::archive(archive.clone()))
+            .unwrap();
+        assert_eq!(tokens.pending_bytes, expanded);
+        assert!(matches!(
+            tokens.inspect_and_issue(&config, AcquiredLmod::archive(archive.clone())),
+            Err(SourceInspectionError::PendingQuotaExceeded)
+        ));
+        assert_eq!(tokens.entries.len(), 1);
+        let expected = RedeemExpectation::from_plan(first.plan());
+        assert!(tokens.redeem(first.token(), &expected).is_ok());
+        assert_eq!(tokens.pending_bytes, 0);
+        let second = tokens
+            .inspect_and_issue(&config, AcquiredLmod::archive(archive.clone()))
+            .unwrap();
+        tokens.clock.0.set(UNIX_EPOCH + Duration::from_secs(2));
+        assert_eq!(
+            tokens.redeem(second.token(), &RedeemExpectation::from_plan(second.plan())),
+            Err(SourceInspectionError::InvalidToken)
+        );
+        assert_eq!(tokens.pending_bytes, 0);
+        assert!(
+            tokens
+                .inspect_and_issue(&config, AcquiredLmod::archive(archive))
+                .is_ok()
+        );
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn sha256_official_and_block_boundary_vectors() {
+        assert_eq!(
+            sha256(b"").as_hex(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256(b"abc").as_hex(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            sha256(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq").as_hex(),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+        // Padding-boundary vectors are fixed FIPS 180-4 SHA-256 regression
+        // values for ASCII `a` repeated at each boundary length.
+        let boundary = [
+            (
+                55,
+                "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318",
+            ),
+            (
+                56,
+                "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a",
+            ),
+            (
+                63,
+                "7d3e74a05d7db15bce4ad9ec0658ea98e3f06eeecf16b4c6fff2da457ddc2f34",
+            ),
+            (
+                64,
+                "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb",
+            ),
+            (
+                65,
+                "635361c48bb9eab14198e76ea8ab7f1a41685d6ad62aa9146d301d4f17eb0ae0",
+            ),
+        ];
+        for (length, expected) in boundary {
+            assert_eq!(sha256(&vec![b'a'; length]).as_hex(), expected);
+        }
+        assert_eq!(
+            sha256(&vec![b'a'; 1_000_000]).as_hex(),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+    }
+
+    #[test]
+    fn pending_quota_entry_limit_refuses_without_new_stage() {
+        let path = root("entry-limit");
+        let config = InspectionConfig {
+            staging_root: path.clone(),
+            limits: limits(),
+        };
+        let mut tokens = ApprovalTokens::with_pending_limits(
+            TestClock(Cell::new(UNIX_EPOCH)),
+            TestRandom(20),
+            Duration::from_secs(10),
+            PendingInspectionLimits {
+                max_entries: 1,
+                max_pending_bytes: 100_000,
+            },
+        );
+        let first = tokens
+            .inspect_and_issue(&config, AcquiredLmod::archive(valid_archive(2)))
+            .unwrap();
+        let before = fs::read_dir(&path).unwrap().count();
+        assert!(matches!(
+            tokens.inspect_and_issue(&config, AcquiredLmod::archive(valid_archive(2))),
+            Err(SourceInspectionError::PendingQuotaExceeded)
+        ));
+        assert_eq!(fs::read_dir(&path).unwrap().count(), before);
+        assert_eq!(tokens.entries.len(), 1);
+        assert!(
+            tokens
+                .redeem(first.token(), &RedeemExpectation::from_plan(first.plan()))
+                .is_ok()
+        );
+        assert_eq!(tokens.pending_bytes, 0);
+        let _ = fs::remove_dir(&path);
+    }
+
+    #[test]
+    fn pending_quota_single_expanded_entry_cleans_stage_and_retry_releases() {
+        let path = root("single-expanded-limit");
+        let config = InspectionConfig {
+            staging_root: path.clone(),
+            limits: limits(),
+        };
+        let archive = valid_archive(2);
+        let expanded: u64 = zip_entries(&archive)
+            .unwrap()
+            .iter()
+            .map(|entry| entry.expanded)
+            .sum();
+        let mut tokens = ApprovalTokens::with_pending_limits(
+            TestClock(Cell::new(UNIX_EPOCH)),
+            TestRandom(21),
+            Duration::from_secs(1),
+            PendingInspectionLimits {
+                max_entries: 2,
+                max_pending_bytes: expanded - 1,
+            },
+        );
+        assert!(matches!(
+            tokens.inspect_and_issue(&config, AcquiredLmod::archive(archive)),
+            Err(SourceInspectionError::PendingQuotaExceeded)
+        ));
+        assert_eq!(tokens.pending_bytes, 0);
+        assert!(fs::read_dir(&path).unwrap().next().is_none());
         let _ = fs::remove_dir(&path);
     }
 }
