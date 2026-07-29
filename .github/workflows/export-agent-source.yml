@@ -32,6 +32,7 @@ jobs:
           echo 'dd0ed0d60a8682c6893d746c7b194b76bfeef4c9ae3449f3b5b97361a6e72d10  /tmp/gaf-fix.patch' | sha256sum --check
           git apply --check /tmp/gaf-fix.patch
           git apply /tmp/gaf-fix.patch
+          sed -i 's/matches!(manifest.schema_version, 2 | 3 | 4)/matches!(manifest.schema_version, 2..=4)/' src/external_modules/manifest.rs
           rm -rf .agent .github/workflows/export-agent-source.yml
           git diff --check
 
