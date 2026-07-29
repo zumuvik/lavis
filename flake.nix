@@ -48,6 +48,8 @@
           rustfmt
           fastfetch
           python3 # JSON-line external-process fixtures
+          go
+          zip
         ];
       };
       checks.${system}.default = package;

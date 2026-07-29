@@ -446,16 +446,21 @@ mod tests {
     use super::*;
     use std::{
         collections::HashMap,
+        sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    static NEXT_TEST_PATH: AtomicU64 = AtomicU64::new(1);
+
     fn path() -> PathBuf {
         let directory = std::env::temp_dir().join(format!(
-            "lavis-credentials-{}",
+            "lavis-credentials-{}-{}-{}",
+            std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT_TEST_PATH.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&directory).unwrap();
         #[cfg(unix)]

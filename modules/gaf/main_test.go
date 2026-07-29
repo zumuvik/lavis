@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 	"unicode/utf16"
 )
@@ -116,5 +118,90 @@ func TestSetRejectsMissingPipe(t *testing.T) {
 	}
 	if _, err := m.set("никс 👍", nil); err == nil {
 		t.Fatal("missing pipe must be rejected")
+	}
+}
+
+func TestToggleSupportsMultiwordTrigger(t *testing.T) {
+	m := module{
+		path: filepath.Join(t.TempDir(), "state.json"),
+		state: state{
+			Enabled: true,
+			NextID:  2,
+			Triggers: []trigger{{
+				ID: 1, Word: "очень никс", Enabled: true,
+				Reactions: []reaction{{Type: "emoji", Emoji: "👍"}},
+			}},
+			Active: map[string]activeEntry{},
+		},
+	}
+	if _, err := m.toggle("очень никс off"); err != nil {
+		t.Fatal(err)
+	}
+	if m.state.Triggers[0].Enabled {
+		t.Fatal("multiword trigger should be disabled")
+	}
+}
+
+func TestToggleSupportsTriggerEndingInSwitchWord(t *testing.T) {
+	m := module{
+		path: filepath.Join(t.TempDir(), "state.json"),
+		state: state{
+			Enabled: true,
+			NextID:  2,
+			Triggers: []trigger{{
+				ID: 1, Word: "turn off", Enabled: true,
+				Reactions: []reaction{{Type: "emoji", Emoji: "👍"}},
+			}},
+			Active: map[string]activeEntry{},
+		},
+	}
+	if _, err := m.toggle("turn off"); err != nil {
+		t.Fatal(err)
+	}
+	if m.state.Triggers[0].Enabled {
+		t.Fatal("exact trigger name must win over switch parsing")
+	}
+}
+
+func TestRuntimeRevisionIsNotPersisted(t *testing.T) {
+	m := testModule(t)
+	m.state.Active["stable"] = activeEntry{
+		Reactions: []reaction{{Type: "emoji", Emoji: "👍"}},
+		Revision:  999,
+		SeenAt:    1,
+	}
+	data, err := json.Marshal(m.state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), `"revision"`) {
+		t.Fatalf("runtime revision leaked into state: %s", data)
+	}
+	var restored state
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatal(err)
+	}
+	restarted := module{path: filepath.Join(t.TempDir(), "state.json"), state: restored}
+	actions := restarted.handleEvent("message.edited", eventPayload{
+		EventID: "1", MessageRef: "edited", MessageKey: "stable", Text: "без триггера",
+	})
+	if len(actions) != 1 || actions[0].Reactions == nil || len(actions[0].Reactions) != 0 {
+		t.Fatalf("restart must accept the new edit and remove reactions: %#v", actions)
+	}
+}
+
+func TestCreatedNonMatchDoesNotPopulateActiveState(t *testing.T) {
+	m := testModule(t)
+	actions := m.handleEvent("message.created", eventPayload{
+		EventID: "10", MessageRef: "created", MessageKey: "no-match", Text: "обычное сообщение",
+	})
+	if len(actions) != 0 || len(m.state.Active) != 0 {
+		t.Fatalf("nonmatching created event should be ignored: actions=%#v active=%#v", actions, m.state.Active)
+	}
+}
+
+func TestMalformedCustomIDIsRejected(t *testing.T) {
+	if _, err := parseReactions([]token{{Text: "ce:not-a-number"}}, nil); err == nil {
+		t.Fatal("malformed diagnostic custom emoji ID must be rejected")
 	}
 }

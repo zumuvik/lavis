@@ -543,7 +543,22 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+
+    fn test_nonce() -> String {
+        format!(
+            "{}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        )
+    }
 
     const ECHO_MODULE_PY: &str = r#"#!/usr/bin/env python3
 import sys, json
@@ -628,11 +643,7 @@ if child:
     }
 
     fn create_echo_module() -> (ExternalModuleDescriptor, PathBuf) {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("lavis-proc-test-{nonce}"));
+        let dir = std::env::temp_dir().join(format!("lavis-proc-test-{}", test_nonce()));
         fs::create_dir_all(dir.join("bin")).unwrap();
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         fs::set_permissions(dir.join("bin"), fs::Permissions::from_mode(0o700)).unwrap();
@@ -658,11 +669,7 @@ if child:
     }
 
     fn create_child_spawner_module() -> (ExternalModuleDescriptor, PathBuf) {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("lavis-proc-child-{nonce}"));
+        let dir = std::env::temp_dir().join(format!("lavis-proc-child-{}", test_nonce()));
         fs::create_dir_all(dir.join("bin")).unwrap();
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         fs::set_permissions(dir.join("bin"), fs::Permissions::from_mode(0o700)).unwrap();
@@ -688,11 +695,7 @@ if child:
     }
 
     fn create_fixture_module(body: &str, id: &str) -> (ExternalModuleDescriptor, PathBuf) {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("lavis-fixture-{nonce}"));
+        let dir = std::env::temp_dir().join(format!("lavis-fixture-{}", test_nonce()));
         fs::create_dir_all(dir.join("bin")).unwrap();
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         fs::set_permissions(dir.join("bin"), fs::Permissions::from_mode(0o700)).unwrap();

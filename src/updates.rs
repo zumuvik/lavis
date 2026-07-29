@@ -313,17 +313,25 @@ async fn process_update(
         || setup_input.is_some()
         || runtime.setup_protects_message(peer_id, authored_by_self);
 
-    if should_prepare_message_event(event_protected) {
+    // New command/setup messages stay private. If an already-projected message is
+    // edited into protected content, emit a redacted edit so modules can reconcile
+    // prior actions without receiving command or setup text.
+    if should_prepare_message_event(edited, event_protected) {
         let event = if edited {
             crate::external_modules::protocol::MessageEventKind::Edited
         } else {
             crate::external_modules::protocol::MessageEventKind::Created
         };
-        let entities = crate::external_modules::entities::project_custom_emoji_entities(
-            message.fmt_entities(),
-            0,
-            message.text().encode_utf16().count(),
-        );
+        let event_text = if event_protected { "" } else { message.text() };
+        let entities = if event_protected {
+            Vec::new()
+        } else {
+            crate::external_modules::entities::project_custom_emoji_entities(
+                message.fmt_entities(),
+                0,
+                message.text().encode_utf16().count(),
+            )
+        };
         if !event_dispatches.has_capacity() {
             tracing::warn!(
                 event = "external_event_task_skipped",
@@ -331,12 +339,7 @@ async fn process_update(
                 "Skipped external event dispatch because the task queue is full"
             );
         } else if let Some(dispatch) = runtime.prepare_message_event_dispatch(
-            peer_id,
-            message_id,
-            event,
-            message.text(),
-            outgoing,
-            entities,
+            peer_id, message_id, event, event_text, outgoing, entities,
         ) {
             let reaction_message = message.clone();
             let reaction_client = client.clone();
@@ -454,8 +457,8 @@ async fn process_update(
     }
 }
 
-fn should_prepare_message_event(event_protected: bool) -> bool {
-    !event_protected
+fn should_prepare_message_event(edited: bool, event_protected: bool) -> bool {
+    edited || !event_protected
 }
 
 async fn handle_event_dispatch(
@@ -835,8 +838,10 @@ mod tests {
 
     #[test]
     fn protected_command_messages_are_not_projected_to_external_events() {
-        assert!(!should_prepare_message_event(true));
-        assert!(should_prepare_message_event(false));
+        assert!(!should_prepare_message_event(false, true));
+        assert!(should_prepare_message_event(true, true));
+        assert!(should_prepare_message_event(false, false));
+        assert!(should_prepare_message_event(true, false));
     }
 
     #[tokio::test]

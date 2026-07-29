@@ -87,7 +87,7 @@ type trigger struct {
 
 type activeEntry struct {
 	Reactions []reaction `json:"reactions"`
-	Revision  uint64     `json:"revision"`
+	Revision  uint64     `json:"-"`
 	SeenAt    int64      `json:"seen_at"`
 }
 
@@ -306,14 +306,11 @@ func (m *module) remove(arguments string) (string, error) {
 }
 
 func (m *module) toggle(arguments string) (string, error) {
-	fields := strings.Fields(arguments)
-	if len(fields) == 0 || isSwitch(fields[0]) {
-		if len(fields) > 1 {
-			return "", errors.New("использование: toggle [on|off]")
-		}
+	arguments = strings.TrimSpace(arguments)
+	if arguments == "" || isSwitch(arguments) {
 		value := !m.state.Enabled
-		if len(fields) == 1 {
-			value = switchValue(fields[0], value)
+		if arguments != "" {
+			value = switchValue(arguments, value)
 		}
 		m.state.Enabled = value
 		if err := m.save(); err != nil {
@@ -321,16 +318,27 @@ func (m *module) toggle(arguments string) (string, error) {
 		}
 		return fmt.Sprintf("GAF: %s", onOff(value)), nil
 	}
-	index := m.findTrigger(fields[0])
+
+	key := arguments
+	requestedSwitch := ""
+	index := m.findTrigger(key)
+	if index < 0 {
+		fields := strings.Fields(arguments)
+		if len(fields) > 1 && isSwitch(fields[len(fields)-1]) {
+			requestedSwitch = fields[len(fields)-1]
+			key = strings.TrimSpace(strings.TrimSuffix(arguments, requestedSwitch))
+			index = m.findTrigger(key)
+		}
+	}
+	if key == "" {
+		return "", errors.New("использование: toggle <номер|триггер> [on|off]")
+	}
 	if index < 0 {
 		return "", errors.New("триггер не найден")
 	}
 	value := !m.state.Triggers[index].Enabled
-	if len(fields) > 1 {
-		if !isSwitch(fields[1]) || len(fields) > 2 {
-			return "", errors.New("использование: toggle <номер|слово> [on|off]")
-		}
-		value = switchValue(fields[1], value)
+	if requestedSwitch != "" {
+		value = switchValue(requestedSwitch, value)
 	}
 	m.state.Triggers[index].Enabled = value
 	if err := m.save(); err != nil {
@@ -353,10 +361,13 @@ func (m *module) handleEvent(event string, payload eventPayload) []eventAction {
 	now := time.Now().Unix()
 	entry := activeEntry{Reactions: desired, Revision: revision, SeenAt: now}
 	if len(desired) == 0 {
+		if event == "message.created" && !known {
+			return nil
+		}
 		shouldRemove := event == "message.edited" && known && len(previous.Reactions) > 0
 		m.state.Active[payload.MessageKey] = entry
 		m.pruneActive()
-		_ = m.save()
+		m.saveEventState()
 		if !shouldRemove {
 			return nil
 		}
@@ -364,13 +375,19 @@ func (m *module) handleEvent(event string, payload eventPayload) []eventAction {
 	}
 	if known && equalReactions(previous.Reactions, desired) {
 		m.state.Active[payload.MessageKey] = entry
-		_ = m.save()
+		m.saveEventState()
 		return nil
 	}
 	m.state.Active[payload.MessageKey] = entry
 	m.pruneActive()
-	_ = m.save()
+	m.saveEventState()
 	return []eventAction{{Type: "message.react", MessageRef: payload.MessageRef, Reactions: desired}}
+}
+
+func (m *module) saveEventState() {
+	if err := m.save(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+	}
 }
 
 func (m *module) reactionsFor(text string) []reaction {
@@ -474,7 +491,11 @@ func parseReactions(tokens []token, entities []customEmojiEntity) ([]reaction, e
 				return nil, errors.New("некорректный Premium emoji document_id")
 			}
 			value = reaction{Type: "custom_emoji", DocumentID: entity.DocumentID}
-		} else if id, ok := customID(item.Text); ok {
+		} else if hasCustomIDPrefix(item.Text) {
+			id, ok := customID(item.Text)
+			if !ok {
+				return nil, errors.New("некорректный Premium emoji document_id")
+			}
 			value = reaction{Type: "custom_emoji", DocumentID: id}
 		} else {
 			if utf8.RuneCountInString(item.Text) > 32 {
@@ -533,6 +554,11 @@ func overlappingEntity(item token, entities []customEmojiEntity) (customEmojiEnt
 		}
 	}
 	return customEmojiEntity{}, false
+}
+
+func hasCustomIDPrefix(value string) bool {
+	lower := strings.ToLower(value)
+	return strings.HasPrefix(lower, "ce:") || strings.HasPrefix(lower, "custom:")
 }
 
 func customID(value string) (string, bool) {

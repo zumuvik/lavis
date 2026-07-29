@@ -59,6 +59,11 @@ action. `message_key` is stable for the same Telegram message and module across
 `message.created` and `message.edited`; modules may use it as a reconciliation
 key. Neither value exposes the Telegram peer or message ID.
 
+New Lavis command/setup messages are not projected to modules. If a previously
+projected message is edited into protected command/setup content, v4 subscribers
+receive a redacted `message.edited` event with empty `text` and `entities`. This
+allows modules to remove prior actions without receiving the protected text.
+
 ## Atomic reaction set
 
 A v4 event response may contain at most one action. `message.react` replaces the
