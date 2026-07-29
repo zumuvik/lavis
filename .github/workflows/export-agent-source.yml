@@ -28,32 +28,10 @@ jobs:
           echo '62e07f7b3d8eb78a91dbb0c65cbe8342445b6e22d77ad12b64ee9120affcf92e  /tmp/gaf.patch' | sha256sum --check
           git apply --check /tmp/gaf.patch
           git apply /tmp/gaf.patch
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path('src/external_modules/source_inspection.rs')
-          text = path.read_text()
-          old = '''            .map(|x| match x {
-                          super::manifest::ExternalSubscription::MessageCreated => "message.created".into(),
-                      })'''
-          new = '''            .map(|x| match x {
-                          super::manifest::ExternalSubscription::MessageCreated => "message.created".into(),
-                          super::manifest::ExternalSubscription::MessageEdited => "message.edited".into(),
-                      })'''
-          if old not in text:
-              raise SystemExit('source inspection subscription mapping not found')
-          path.write_text(text.replace(old, new, 1))
-
-          path = Path('src/runtime.rs')
-          text = path.read_text()
-          old = '''                PeerId::user(7),
-                          42,'''
-          new = '''                PeerId::user(7).expect("valid test peer"),
-                          42,'''
-          if old not in text:
-              raise SystemExit('runtime test peer call not found')
-          path.write_text(text.replace(old, new, 1))
-          PY
+          echo 'H4sICDs6amoCA2dhZi1maXgucGF0Y2gApVZtb9s2EP5s/wpWw1CplpXYSexGm4d0jTN0y9pizbAPgWEwMuWw0xtIKk2Q+j/t67Y/kZ+0O5KSZUXpBsyALet4L889d0dyOBwSupfmqzJhcm9N472U8ixY5/3BYECuOldOTshwdHzsj8ZkoJ8H5OSkT+Iyi4ibkhfGxiPslkWlYm6UpynNVj6hYl2mLFOSSCV4tvYJvHDFmSSXi6iUKk/naf6Rz1F65xG3VhMiFx6575OedUZm1ocMLvLz/BMTbv0uePqhoFEd2PPAjsekNp0RB/JxwN+w14u5kMongklFQvBaJFydocyt4Xr9wY6e+X0Xx5K1bH7j6trIm9akh+G1Ax3c0Zn0eoKpUmQkDUCvdD2fZDzBhQ3+PJ2odqS9bgmdaUiIs6YUDK95rOb23a0WmujRC0aTn7iKrmuGNNFUMuIkXCrlhLrmR5OpP5qSwdHkpX8w0TWvUigzHuUrFryR50wpwAjV+vy5IX5bple1WCALz5fP+wRi94e6cRq839CkZDbrRhNUAqyaUWlQU9dcr3igAoxbLcv4sCbccXz49getwI3ifRGCT3imEMegB+9pyla6CRpQzlmszsC58eM3eNAgsZ8SRleg//2dglKBecIyi50M9Yt13dD99eJsNKl0SxWPJsE8Q7/u5UKUmc39Mmy6XngeegAyKqgVHYMWHT5phtF9MezFuSAcGgajCpqtmeVUswlOW4m5wpSndm0R8YX/VKkuebhAhI8jVYA1VIj1rDMYrMGoQGtnJcOXDf4oyhN0ZF1gDJOvnfGuUqFNZ6V6Ev/tFAp1qzqhU62W1/vBTr0GT5arQgf0QJW+pAjhLsMtDFvUiuSGny6aNUCfGHhghgztWj4u/7+j1hDAVTVFnVtN17ZeITFx9CR1aOnKaqdmulL6OyLo8Lbva6hVSK9qpqU9Xe62HVXDqlrKKATvGoC+3YHX6i9i+6vDbjhrGuq2sehnhBYFy1auFVS4PDtjzVEx+1IlsgZmmzTnK2SWUvULo5HieSbNDCHPwoo82wE4h51n+xIaSD19wNfLuOMf+NAJB/5U7/U8LXKhiAuwnYKq672YJwz/OChBMwiL6B07RHu6fWDVq+FfgNZrYBMCyd9ysXIVeWEtgwscZ4w6HfsHZDA98Mcjc8j0VHBGFU1i10moYiSCZJFZdgNMkhR6glwxwtdZLtgqJF9/dYPtDCr2eNu2KcY/ZTEtE/XDq7MP5ZU98T4g0/K9YCkvU9NZprjyEcJBL9UNqXnT/YEchIRUdAQ/5hy2iOCCpcUpF3iuO1IBmuCjzDPH83VzoCAk+nE/z+hVgsiVwBZ4y27Vm9OQjHzyCmp6A3opLS5NXRdUiwCjuLvfbHw70NubAGBzALggD38//PHw58Nf5BaLwhpJfekMadk6ZqtZ6juYzjuornX6DtW41Pldc3yvGbq4KyAJx6wuGS6DZWN8QtLE55Nzlq3VtV0CHk7zSAdBWpyjw6PJ6HB/Mj3cH7/cHx0fvpw4moeNPeoQ6rMZ3qbMANv2cUHuWb5ACxlIA1MZ2C3Xayakh3YjvKO0Vy73F0E9dviCOaH2blY7AaFflTGvmvJRPANnY2dVimgPis9ERpNlNZkyL0XEljAxBdPhAyHt8P53fT3N+xM9z/AwE938BByvbV5LCH3nfr4FNiheD2/xYtj+yLKA/EKYIh7DnITh3AKC6ZKR4AVCCMOfmZR0zV7b0Z19R5zUiAI7zk4Ah0Hu4nz8vxjzFW+HYFq0jbDjfdPOOsqTBKhzvW+2CwmMja0+7OirRsFgbBRP2W5VGkKkfnw4PgbSB/bZJL/ShL5fbmtJM4At3GvYmxJgKMlhND0voJ8oVy1UKw43AyzPrPLVSqcQsC8JtrRkLPW2uazM3P6wTfd7xsSbVRiWEiBMuwrS0oA9AXvNdeA44iuC+yUpQMVpU42fw3GHsCodQvuJZ+DadkqHrqMTgJH/B/vZmHa9DgAA' | base64 --decode | gzip --decompress > /tmp/gaf-fix.patch
+          echo 'dd0ed0d60a8682c6893d746c7b194b76bfeef4c9ae3449f3b5b97361a6e72d10  /tmp/gaf-fix.patch' | sha256sum --check
+          git apply --check /tmp/gaf-fix.patch
+          git apply /tmp/gaf-fix.patch
           rm -rf .agent .github/workflows/export-agent-source.yml
           git diff --check
 
