@@ -2447,7 +2447,7 @@ for line in sys.stdin:
             .prepare_message_event_dispatch(
                 PeerId::user(7).expect("valid test peer"),
                 42,
-                MessageEventKind::Created,
+                crate::external_modules::protocol::MessageEventKind::Created,
                 "event",
                 true,
                 vec![],

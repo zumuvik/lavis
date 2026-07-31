@@ -189,7 +189,9 @@ impl CoreMessage {
                 if protocol_version >= 4 {
                     event_payload["message_key"] = serde_json::json!(payload.message_key);
                 }
-                if let Some(peer_id) = payload.peer_id {
+                if let Some(peer_id) = payload.peer_id
+                    && protocol_version >= 4
+                {
                     event_payload["peer_id"] = serde_json::json!(peer_id);
                 }
                 serde_json::to_string(&serde_json::json!({
@@ -534,6 +536,18 @@ mod tests {
         let serialized = event.serialize_for(4).unwrap();
         let value: serde_json::Value = serde_json::from_str(&serialized).unwrap();
         assert_eq!(value["payload"]["peer_id"], -1002871795336_i64);
+    }
+
+    #[test]
+    fn v3_does_not_serialize_peer_id_when_present() {
+        let mut event = sample_event(MessageEventKind::Created);
+        let CoreMessage::Event { payload, .. } = &mut event else {
+            panic!("expected event");
+        };
+        payload.peer_id = Some(-1002871795336);
+        let serialized = event.serialize_for(3).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert!(value["payload"].get("peer_id").is_none());
     }
 
     #[test]

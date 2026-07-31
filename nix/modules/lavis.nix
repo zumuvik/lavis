@@ -43,6 +43,11 @@ let
   lavisStateDir = "${stateHome}/lavis";
   lavisDataDir = "${dataHome}/lavis";
   modulesDir = "${lavisDataDir}/modules";
+  moduleStagingDir = "${lavisDataDir}/module-staging";
+  declarativeStateFile = "${lavisStateDir}/declarative-modules.json";
+  moduleIdType = types.addCheck types.str (
+    id: builtins.match "[a-z][a-z0-9-]{0,31}" id != null
+  );
 
   settingsFile =
     if cfg.settings.prefix == null then
@@ -66,7 +71,7 @@ let
     {
       options = {
         id = mkOption {
-          type = types.str;
+          type = moduleIdType;
           description = "Lavis external module id. Must match the module manifest id.";
           example = "gaf";
         };
@@ -128,19 +133,20 @@ let
   setupScript = pkgs.writeShellScript "lavis-setup" ''
     set -euo pipefail
 
-    install -d -m 700 -o ${lib.escapeShellArg cfg.user} -g ${lib.escapeShellArg effectiveGroup} \
+    install -d -m 700 \
       ${lib.escapeShellArg lavisConfigDir} \
       ${lib.escapeShellArg lavisStateDir} \
       ${lib.escapeShellArg lavisDataDir} \
-      ${lib.escapeShellArg modulesDir}
+      ${lib.escapeShellArg modulesDir} \
+      ${lib.escapeShellArg moduleStagingDir}
 
     ${lib.optionalString (settingsFile != null) ''
-      install -m 600 -o ${lib.escapeShellArg cfg.user} -g ${lib.escapeShellArg effectiveGroup} \
+      install -m 600 \
         ${lib.escapeShellArg settingsFile} ${lib.escapeShellArg "${lavisStateDir}/settings.json"}
     ''}
 
     ${lib.optionalString (fastfetchProfileFile != null) ''
-      install -m 600 -o ${lib.escapeShellArg cfg.user} -g ${lib.escapeShellArg effectiveGroup} \
+      install -m 600 \
         ${lib.escapeShellArg fastfetchProfileFile} ${lib.escapeShellArg "${lavisConfigDir}/fastfetch.json"}
     ''}
 
@@ -148,32 +154,56 @@ let
       local id="$1"
       local src="$2"
       local dest=${lib.escapeShellArg modulesDir}/"$id"
+      local staging
+      local old
 
       if [ ! -f "$src/module.json" ]; then
         echo "lavis extension $id: $src/module.json does not exist" >&2
         exit 1
       fi
+      if ! ${pkgs.python3}/bin/python3 - "$id" "$src/module.json" <<'PY'
+import json
+import sys
 
-      install -d -m 700 -o ${lib.escapeShellArg cfg.user} -g ${lib.escapeShellArg effectiveGroup} "$dest"
-      cp -R --dereference --no-preserve=ownership "$src/." "$dest/"
-      chown -R ${lib.escapeShellArg cfg.user}:${lib.escapeShellArg effectiveGroup} "$dest"
-      chmod -R u+rwX,go-rwx "$dest"
-      printf '%s\n' 'managed-by=services.lavis' > "$dest/.lavis-nixos-module"
-      chown ${lib.escapeShellArg cfg.user}:${lib.escapeShellArg effectiveGroup} "$dest/.lavis-nixos-module"
-      chmod 600 "$dest/.lavis-nixos-module"
+expected_id, manifest_path = sys.argv[1:3]
+with open(manifest_path, "r", encoding="utf-8") as handle:
+    manifest = json.load(handle)
+actual_id = manifest.get("id")
+if actual_id != expected_id:
+    raise SystemExit(
+        f"lavis extension {expected_id}: module.json id {actual_id!r} does not match declarative id"
+    )
+PY
+      then
+        exit 1
+      fi
+
+      staging=$(mktemp -d -p ${lib.escapeShellArg moduleStagingDir} ".nixos-$id.XXXXXXXXXX")
+      trap 'rm -rf "$staging"' RETURN
+
+      cp -R --no-dereference --no-preserve=ownership "$src/." "$staging/"
+      chmod -R u+rwX,go-rwx "$staging"
+      printf '%s\n' 'managed-by=services.lavis' > "$staging/.lavis-nixos-module"
+      chmod 600 "$staging/.lavis-nixos-module"
+
+      if [ -e "$dest" ] || [ -L "$dest" ]; then
+        old="$staging.old"
+        mv -T "$dest" "$old"
+        mv -T "$staging" "$dest"
+        rm -rf "$old"
+      else
+        mv -T "$staging" "$dest"
+      fi
+      trap - RETURN
     }
 
     ${installExtensionCommands}
 
-    ${lib.optionalString (extensions != [ ]) ''
-      ${pkgs.python3}/bin/python3 ${./merge-enabled-extensions.py} \
-        ${lib.escapeShellArg "${lavisStateDir}/external-modules.json"} \
-        ${lib.escapeShellArg declarativeIdsJson} \
-        ${lib.escapeShellArg enabledIdsJson}
-      chown ${lib.escapeShellArg cfg.user}:${lib.escapeShellArg effectiveGroup} \
-        ${lib.escapeShellArg "${lavisStateDir}/external-modules.json"}
-      chmod 600 ${lib.escapeShellArg "${lavisStateDir}/external-modules.json"}
-    ''}
+    ${pkgs.python3}/bin/python3 ${./merge-enabled-extensions.py} \
+      ${lib.escapeShellArg "${lavisStateDir}/external-modules.json"} \
+      ${lib.escapeShellArg declarativeStateFile} \
+      ${lib.escapeShellArg declarativeIdsJson} \
+      ${lib.escapeShellArg enabledIdsJson}
   '';
 in
 {
@@ -309,7 +339,6 @@ in
         WorkingDirectory = effectiveHome;
         Restart = "on-failure";
         RestartSec = "5s";
-        PermissionsStartOnly = true;
         EnvironmentFile = optional (cfg.credentialsEnvironmentFile != null) cfg.credentialsEnvironmentFile;
       };
     };

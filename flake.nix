@@ -125,12 +125,51 @@
             ];
           };
         in
-        pkgs.runCommand "lavis-nixos-module-eval" { unit = evaluated.config.systemd.units."lavis.service".unit; } ''
+        pkgs.runCommand "lavis-nixos-module-eval" {
+          unit = evaluated.config.systemd.units."lavis.service".unit;
+          preStartScript = evaluated.config.systemd.services.lavis.preStart;
+        } ''
           grep -q 'User=lavis-test' "$unit/lavis.service"
           grep -q 'EnvironmentFile=/run/secrets/lavis.env' "$unit/lavis.service"
           grep -q 'XDG_STATE_HOME=/var/lib/lavis-test/.local/state' "$unit/lavis.service"
+          grep -q 'mktemp -d -p /var/lib/lavis-test/.local/share/lavis/module-staging' "$preStartScript"
+          ! grep -q 'chown -R' "$preStartScript"
+          ! grep -q 'PermissionsStartOnly=true' "$unit/lavis.service"
           touch "$out"
         '';
+      mergeEnabledCheck = pkgs.runCommand "lavis-merge-enabled-extensions-check" { } ''
+        work="$TMPDIR/lavis-state"
+        mkdir -p "$work"
+        printf '%s\n' '{"version":1,"enabled":["manual","old-decl","enabled-decl"]}' > "$work/external-modules.json"
+        printf '%s\n' '["old-decl","enabled-decl"]' > "$work/declarative-modules.json"
+        printf '%s\n' '["enabled-decl"]' > "$work/current-declarative.json"
+        printf '%s\n' '[]' > "$work/current-enabled.json"
+
+        ${pkgs.python3}/bin/python3 ${./nix/modules/merge-enabled-extensions.py} \
+          "$work/external-modules.json" \
+          "$work/declarative-modules.json" \
+          "$work/current-declarative.json" \
+          "$work/current-enabled.json"
+
+        ${pkgs.python3}/bin/python3 - "$work" <<'PY'
+import json
+import os
+import sys
+
+work = sys.argv[1]
+with open(os.path.join(work, "external-modules.json"), "r", encoding="utf-8") as handle:
+    state = json.load(handle)
+if state != {"version": 1, "enabled": ["manual"]}:
+    raise SystemExit(state)
+with open(os.path.join(work, "declarative-modules.json"), "r", encoding="utf-8") as handle:
+    declarative = json.load(handle)
+if declarative != ["enabled-decl"]:
+    raise SystemExit(declarative)
+if os.path.exists(os.path.join(work, ".external-modules.json.nixos.tmp")):
+    raise SystemExit("predictable temporary file exists")
+PY
+        touch "$out"
+      '';
     in
     {
       lib.${system} = extensionLib;
@@ -157,6 +196,7 @@
       };
       checks.${system} = {
         default = package;
+        merge-enabled-extensions = mergeEnabledCheck;
         nixos-module = moduleEvalCheck;
       };
     };

@@ -9,8 +9,8 @@ The module is intentionally conservative:
 - it stores mutable data under that user's XDG directories;
 - it never writes Telegram credentials or sessions into the Nix store;
 - it installs external modules as real writable directories, not symlinks;
-- it keeps user-created extension state files when refreshing declarative
-  extension payloads.
+- it stages and atomically replaces declarative extension payloads as the Lavis
+  service user.
 
 ## Basic setup
 
@@ -158,9 +158,10 @@ Declarative extension payloads are copied into:
 $XDG_DATA_HOME/lavis/modules/<id>/
 ```
 
-The copied directory is writable by the service user. This matters for modules
-such as GAF that keep local state beside their entrypoint. On rebuild, Lavis'
-NixOS module refreshes packaged files and preserves unknown runtime files.
+The copied directory is writable by the service user. On rebuild, Lavis' NixOS
+module stages the declared payload as that user and atomically replaces the
+previous declarative payload. Modules should keep mutable data under
+`$XDG_STATE_HOME/lavis/`, not next to their packaged entrypoint.
 
 Enabled declarative extensions are merged into:
 

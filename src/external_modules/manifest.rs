@@ -473,7 +473,8 @@ pub fn validate_manifest_at(
         return Err(ExternalError::InvalidCapability);
     }
     if seen_capabilities.contains(&ExternalCapability::MessagePeerId)
-        && !seen_capabilities.contains(&ExternalCapability::MessageRead)
+        && (manifest.schema_version < 4
+            || !seen_capabilities.contains(&ExternalCapability::MessageRead))
     {
         return Err(ExternalError::InvalidCapability);
     }
@@ -710,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn peer_id_capability_requires_message_read() {
+    fn peer_id_capability_requires_schema_v4_and_message_read() {
         let base = temp_dir();
         let dir = create_module_dir(&base, "echo");
         let mut json = serde_json::from_slice::<serde_json::Value>(&valid_manifest_json()).unwrap();
@@ -725,6 +726,14 @@ mod tests {
         );
 
         json["capabilities"] = serde_json::json!(["message.peer_id"]);
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(matches!(
+            validate_manifest_at(&path, Some("echo")),
+            Err(ExternalError::InvalidCapability)
+        ));
+
+        json["schema_version"] = serde_json::json!(3);
+        json["capabilities"] = serde_json::json!(["message.read", "message.peer_id"]);
         fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
         assert!(matches!(
             validate_manifest_at(&path, Some("echo")),
