@@ -129,6 +129,7 @@
         } ''
           grep -q 'User=lavis-test' "$unit/lavis.service"
           grep -q 'Group=users' "$unit/lavis.service"
+          ! grep -q 'Group=lavis-test' "$unit/lavis.service"
           grep -q 'EnvironmentFile=/run/secrets/lavis.env' "$unit/lavis.service"
           grep -q 'XDG_STATE_HOME=/build/lavis-test/.local/state' "$unit/lavis.service"
           grep -q 'mktemp -d -p /build/lavis-test/.local/share/lavis/module-staging' "$preStartScript"
@@ -141,6 +142,12 @@
           "$preStartScript"
           test -f /build/lavis-test/.local/state/lavis/modules/fixture/state.json
           grep -q '"word":"nix"' /build/lavis-test/.local/state/lavis/modules/fixture/state.json
+          test ! -f /build/lavis-test/.local/share/lavis/modules/fixture/state.json
+          printf '%s\n' '{"enabled":true,"next_id":3,"triggers":[{"id":2,"word":"runtime","reactions":[{"type":"emoji","emoji":"✅"}],"enabled":true}],"active":{}}' \
+            > /build/lavis-test/.local/state/lavis/modules/fixture/state.json
+          "$preStartScript"
+          test -f /build/lavis-test/.local/state/lavis/modules/fixture/state.json
+          grep -q '"word":"runtime"' /build/lavis-test/.local/state/lavis/modules/fixture/state.json
           test ! -f /build/lavis-test/.local/share/lavis/modules/fixture/state.json
 
           touch "$out"
