@@ -27,6 +27,7 @@ use crate::{
         events::{
             EventScope, module_can_receive_event, opaque_message_ref, validate_reaction_action,
         },
+        manifest::ExternalCapability,
         protocol::{EventAction, MessageEvent, MessageEventKind},
         source_inspection::{
             InspectionConfig, InspectionLimits, ModuleInspector, OsRandom, SystemClock,
@@ -434,6 +435,11 @@ impl RuntimeState {
                 event_id,
                 message_ref: message_ref.clone(),
                 message_key: stable_message_key(peer_id, message_id, &descriptor.id),
+                peer_id: descriptor
+                    .capabilities
+                    .contains(&ExternalCapability::MessagePeerId)
+                    .then(|| peer_id.bot_api_dialog_id())
+                    .flatten(),
                 text: text.to_owned(),
                 outgoing,
                 entities: entities.clone(),
@@ -1852,7 +1858,6 @@ mod tests {
         aliases::{Alias, AliasStore},
         bot_api::{BotApi, BotApiFuture, BotIdentity},
         commands::{Action, AliasRequest},
-        external_modules::protocol::MessageEventKind,
         fastfetch::{FastfetchInputError, FastfetchProfileError, FastfetchResult},
         setup_store::{CompanionToken, PersistedSetupState, SetupStore},
     };

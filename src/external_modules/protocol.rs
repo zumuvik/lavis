@@ -37,6 +37,9 @@ pub struct MessageEvent {
     /// Stable, module-scoped identifier for the same Telegram message across
     /// create/edit events. It does not grant access to the underlying peer.
     pub message_key: String,
+    /// Optional Telegram-style peer id, exposed only to modules that declare
+    /// `message.peer_id`.
+    pub peer_id: Option<i64>,
     pub text: String,
     pub outgoing: bool,
     pub entities: Vec<CustomEmojiEntity>,
@@ -185,6 +188,9 @@ impl CoreMessage {
                 });
                 if protocol_version >= 4 {
                     event_payload["message_key"] = serde_json::json!(payload.message_key);
+                }
+                if let Some(peer_id) = payload.peer_id {
+                    event_payload["peer_id"] = serde_json::json!(peer_id);
                 }
                 serde_json::to_string(&serde_json::json!({
                     "protocol_version": protocol_version,
@@ -393,6 +399,7 @@ mod tests {
                 event_id: "evt".to_owned(),
                 message_ref: "opaque".to_owned(),
                 message_key: "stable".to_owned(),
+                peer_id: None,
                 text: "Привет 🦀".to_owned(),
                 outgoing: false,
                 entities: vec![CustomEmojiEntity {
@@ -509,11 +516,24 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&serialized).unwrap();
         assert_eq!(value["event"], "message.edited");
         assert_eq!(value["payload"]["message_key"], "stable");
+        assert!(value["payload"].get("peer_id").is_none());
         assert!(
             sample_event(MessageEventKind::Edited)
                 .serialize_for(3)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn v4_serializes_peer_id_when_present() {
+        let mut event = sample_event(MessageEventKind::Created);
+        let CoreMessage::Event { payload, .. } = &mut event else {
+            panic!("expected event");
+        };
+        payload.peer_id = Some(-1002871795336);
+        let serialized = event.serialize_for(4).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(value["payload"]["peer_id"], -1002871795336_i64);
     }
 
     #[test]

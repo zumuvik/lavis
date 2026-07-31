@@ -136,6 +136,30 @@ cargo run
 
 `lavis credentials reset` запрашивает в интерактивном TTY подтверждение `[y/N]` и удаляет только `credentials.json`. Сеанс, настройки и псевдонимы сохраняются; после этого можно исправить учётные данные перед запуском `lavis auth`.
 
+## NixOS
+
+```nix
+{
+  imports = [ inputs.lavis.nixosModules.default ];
+
+  services.lavis = {
+    enable = true;
+    user = "melvi";
+    credentialsEnvironmentFile = "/run/secrets/lavis.env";
+
+    extensions = [
+      {
+        id = "gaf";
+        package = inputs.lavis.packages.x86_64-linux.lavis-extension-gaf;
+      }
+    ];
+  };
+}
+```
+
+Full service, credentials and declarative extension setup:
+[NixOS module](docs/nixos-module.md).
+
 ## Первая авторизация
 
 1. Запустите `nix run github:zumuvik/lavis` или `lavis auth`.

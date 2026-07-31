@@ -34,6 +34,8 @@ A v4 module uses `schema_version: 4` and may subscribe to both message events:
 `message.created` and `message.edited` require `message.read`. The
 `message.react` action requires `message.react`. Schema v3 still accepts only
 `message.created`; schema v2 accepts neither subscriptions nor actions.
+Modules that must filter by the Telegram Bot API dialog id may additionally
+declare `message.peer_id`; Lavis then adds `peer_id` to message event payloads.
 
 ## Event payload
 
@@ -47,6 +49,7 @@ A v4 module uses `schema_version: 4` and may subscribe to both message events:
     "event_id": "18",
     "message_ref": "request-scoped-opaque-reference",
     "message_key": "stable-module-scoped-opaque-key",
+    "peer_id": -1002871795336,
     "text": "edited text",
     "outgoing": false,
     "entities": []
@@ -57,7 +60,8 @@ A v4 module uses `schema_version: 4` and may subscribe to both message events:
 `message_ref` is valid only for the current request and must be copied into an
 action. `message_key` is stable for the same Telegram message and module across
 `message.created` and `message.edited`; modules may use it as a reconciliation
-key. Neither value exposes the Telegram peer or message ID.
+key. `peer_id` is present only when the module declares `message.peer_id`.
+Neither `message_ref` nor `message_key` exposes the Telegram peer or message ID.
 
 New Lavis command/setup messages are not projected to modules. If a previously
 projected message is edited into protected command/setup content, v4 subscribers

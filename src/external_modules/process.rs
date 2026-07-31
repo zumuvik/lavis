@@ -731,6 +731,7 @@ if child:
             event_id: "event-1".to_owned(),
             message_ref: "message-1".to_owned(),
             message_key: "stable-message-1".to_owned(),
+            peer_id: None,
             text: "hello".to_owned(),
             outgoing: true,
             entities: vec![],

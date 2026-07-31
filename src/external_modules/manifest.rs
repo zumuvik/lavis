@@ -50,6 +50,7 @@ pub enum ExternalCapability {
     PersistentStateRead,
     PersistentStateWrite,
     MessageRead,
+    MessagePeerId,
     MessageReact,
 }
 
@@ -61,6 +62,7 @@ impl ExternalCapability {
             Self::PersistentStateRead => "persistent_state_read",
             Self::PersistentStateWrite => "persistent_state_write",
             Self::MessageRead => "message.read",
+            Self::MessagePeerId => "message.peer_id",
             Self::MessageReact => "message.react",
         }
     }
@@ -72,6 +74,7 @@ impl ExternalCapability {
             Self::PersistentStateRead => "чтение постоянного состояния",
             Self::PersistentStateWrite => "изменение постоянного состояния",
             Self::MessageRead => "чтение сообщений",
+            Self::MessagePeerId => "идентификатор чата сообщения",
             Self::MessageReact => "реакции на сообщения",
         }
     }
@@ -83,6 +86,7 @@ impl ExternalCapability {
             "persistent_state_read" => Some(Self::PersistentStateRead),
             "persistent_state_write" => Some(Self::PersistentStateWrite),
             "message.read" => Some(Self::MessageRead),
+            "message.peer_id" => Some(Self::MessagePeerId),
             "message.react" => Some(Self::MessageReact),
             _ => None,
         }
@@ -468,6 +472,11 @@ pub fn validate_manifest_at(
     if !subscriptions.is_empty() && !seen_capabilities.contains(&ExternalCapability::MessageRead) {
         return Err(ExternalError::InvalidCapability);
     }
+    if seen_capabilities.contains(&ExternalCapability::MessagePeerId)
+        && !seen_capabilities.contains(&ExternalCapability::MessageRead)
+    {
+        return Err(ExternalError::InvalidCapability);
+    }
     if actions.contains(&ExternalAction::MessageReact)
         && !seen_capabilities.contains(&ExternalCapability::MessageReact)
     {
@@ -697,6 +706,30 @@ mod tests {
                 .subscriptions
                 .contains(&ExternalSubscription::MessageEdited)
         );
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn peer_id_capability_requires_message_read() {
+        let base = temp_dir();
+        let dir = create_module_dir(&base, "echo");
+        let mut json = serde_json::from_slice::<serde_json::Value>(&valid_manifest_json()).unwrap();
+        json["schema_version"] = serde_json::json!(4);
+        json["capabilities"] = serde_json::json!(["message.read", "message.peer_id"]);
+        let path = write_manifest(&dir, &serde_json::to_vec(&json).unwrap());
+        let descriptor = validate_manifest_at(&path, Some("echo")).unwrap();
+        assert!(
+            descriptor
+                .capabilities
+                .contains(&ExternalCapability::MessagePeerId)
+        );
+
+        json["capabilities"] = serde_json::json!(["message.peer_id"]);
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(matches!(
+            validate_manifest_at(&path, Some("echo")),
+            Err(ExternalError::InvalidCapability)
+        ));
         fs::remove_dir_all(&base).unwrap();
     }
 
