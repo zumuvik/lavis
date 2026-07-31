@@ -45,6 +45,7 @@ configuration, set `home` explicitly:
 services.lavis = {
   enable = true;
   user = "melvi";
+  group = "users";
   home = "/home/melvi";
 };
 ```
