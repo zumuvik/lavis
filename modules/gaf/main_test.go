@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -91,6 +92,34 @@ func TestDefaultGAFSubcommandShiftsPremiumEntityOffsets(t *testing.T) {
 	}
 	if len(m.state.Triggers) != 1 || m.state.Triggers[0].Reactions[0].Type != "custom_emoji" {
 		t.Fatalf("trigger: %#v", m.state.Triggers)
+	}
+}
+
+func TestLoadModuleUsesDedicatedModuleStateDirectory(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("LAVIS_MODULE_STATE_DIR", stateDir)
+	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "xdg-state"))
+
+	initial := []byte(`{"enabled":true,"next_id":2,"triggers":[{"id":1,"word":"никс","reactions":[{"type":"emoji","emoji":"👍"}],"enabled":true}],"active":{}}`)
+	if err := os.WriteFile(filepath.Join(stateDir, "state.json"), initial, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModule()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.path != filepath.Join(stateDir, "state.json") {
+		t.Fatalf("unexpected state path: %s", m.path)
+	}
+	if len(m.state.Triggers) != 1 || m.state.Triggers[0].Word != "никс" {
+		t.Fatalf("unexpected restored state: %#v", m.state)
+	}
+	if _, err := m.set("лавис | ❤️", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "state.json")); err != nil {
+		t.Fatal(err)
 	}
 }
 

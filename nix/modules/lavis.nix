@@ -22,12 +22,15 @@ let
   system = pkgs.stdenv.hostPlatform.system;
   extensionLib = import ../lib/extensions.nix { inherit pkgs; };
 
-  effectiveGroup = if cfg.group == null then cfg.user else cfg.group;
-  declaredUserHome =
+  declaredUser =
     if cfg.user != null && builtins.hasAttr cfg.user config.users.users then
-      config.users.users.${cfg.user}.home
+      config.users.users.${cfg.user}
     else
       null;
+  declaredUserGroup = if declaredUser != null then declaredUser.group else null;
+  effectiveGroup = if cfg.group != null then cfg.group else declaredUserGroup;
+  declaredUserHome =
+    if declaredUser != null then declaredUser.home else null;
   effectiveHome =
     if cfg.home != null then
       cfg.home
@@ -43,6 +46,7 @@ let
   lavisStateDir = "${stateHome}/lavis";
   lavisDataDir = "${dataHome}/lavis";
   modulesDir = "${lavisDataDir}/modules";
+  moduleStateRoot = "${lavisStateDir}/modules";
   moduleStagingDir = "${lavisDataDir}/module-staging";
   declarativeStateFile = "${lavisStateDir}/declarative-modules.json";
   moduleIdType = types.addCheck types.str (
@@ -154,6 +158,7 @@ let
       local id="$1"
       local src="$2"
       local dest=${lib.escapeShellArg modulesDir}/"$id"
+      local state_dir=${lib.escapeShellArg moduleStateRoot}/"$id"
       local staging
       local old
 
@@ -178,6 +183,8 @@ PY
         exit 1
       fi
 
+      install -d -m 700 "$state_dir"
+
       staging=$(mktemp -d -p ${lib.escapeShellArg moduleStagingDir} ".nixos-$id.XXXXXXXXXX")
       trap 'rm -rf "$staging"' RETURN
 
@@ -189,6 +196,9 @@ PY
       if [ -e "$dest" ] || [ -L "$dest" ]; then
         old="$staging.old"
         mv -T "$dest" "$old"
+        if [ -f "$old/state.json" ] && [ ! -L "$old/state.json" ] && [ ! -e "$state_dir/state.json" ]; then
+          install -m 600 "$old/state.json" "$state_dir/state.json"
+        fi
         mv -T "$staging" "$dest"
         rm -rf "$old"
       else
@@ -227,7 +237,7 @@ in
     group = mkOption {
       type = types.nullOr types.str;
       default = null;
-      description = "Existing Unix group for Lavis files. Defaults to services.lavis.user.";
+      description = "Existing Unix group for Lavis files. Defaults to the declared primary group of services.lavis.user.";
       example = "users";
     };
 
@@ -304,6 +314,10 @@ in
         {
           assertion = cfg.home != null || declaredUserHome != null;
           message = "services.lavis.home must be set when services.lavis.user has no declared home.";
+        }
+        {
+          assertion = effectiveGroup != null;
+          message = "services.lavis.group must be set when services.lavis.user has no declared primary group.";
         }
       ]
       ++ map (ext: {

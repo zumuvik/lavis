@@ -136,13 +136,15 @@ func main() {
 }
 
 func loadModule() (*module, error) {
-	executable, err := os.Executable()
+	path, legacyPath, err := statePath()
 	if err != nil {
-		return nil, fmt.Errorf("resolve executable: %w", err)
+		return nil, err
 	}
-	path := filepath.Join(filepath.Dir(executable), "state.json")
 	current := state{Enabled: true, NextID: 1, Active: make(map[string]activeEntry)}
 	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) && legacyPath != "" {
+		data, err = os.ReadFile(legacyPath)
+	}
 	if err == nil {
 		if err := json.Unmarshal(data, &current); err != nil {
 			return nil, fmt.Errorf("decode state: %w", err)
@@ -157,6 +159,30 @@ func loadModule() (*module, error) {
 		current.Active = make(map[string]activeEntry)
 	}
 	return &module{path: path, state: current}, nil
+}
+
+func statePath() (string, string, error) {
+	if moduleStateDir := os.Getenv("LAVIS_MODULE_STATE_DIR"); moduleStateDir != "" {
+		legacyPath, err := legacyExecutableStatePath()
+		return filepath.Join(moduleStateDir, "state.json"), legacyPath, err
+	}
+	if stateHome := os.Getenv("XDG_STATE_HOME"); stateHome != "" {
+		legacyPath, err := legacyExecutableStatePath()
+		return filepath.Join(stateHome, "lavis", "modules", "gaf", "state.json"), legacyPath, err
+	}
+	legacyPath, err := legacyExecutableStatePath()
+	if err != nil {
+		return "", "", err
+	}
+	return legacyPath, "", nil
+}
+
+func legacyExecutableStatePath() (string, error) {
+	executable, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("resolve executable: %w", err)
+	}
+	return filepath.Join(filepath.Dir(executable), "state.json"), nil
 }
 
 func (m *module) handle(req request) response {
@@ -450,6 +476,9 @@ func (m *module) save() error {
 	data, err := json.MarshalIndent(m.state, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode state: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(m.path), 0o700); err != nil {
+		return fmt.Errorf("create state directory: %w", err)
 	}
 	temporary := m.path + ".tmp"
 	if err := os.WriteFile(temporary, append(data, '\n'), 0o600); err != nil {

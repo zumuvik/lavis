@@ -161,7 +161,9 @@ $XDG_DATA_HOME/lavis/modules/<id>/
 The copied directory is writable by the service user. On rebuild, Lavis' NixOS
 module stages the declared payload as that user and atomically replaces the
 previous declarative payload. Modules should keep mutable data under
-`$XDG_STATE_HOME/lavis/`, not next to their packaged entrypoint.
+the `LAVIS_MODULE_STATE_DIR` environment variable passed to the module process.
+For the NixOS service this resolves to
+`$XDG_STATE_HOME/lavis/modules/<id>/`, not next to the packaged entrypoint.
 
 Enabled declarative extensions are merged into:
 

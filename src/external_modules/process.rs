@@ -6,7 +6,12 @@ use super::{
     },
 };
 use crate::error::ExternalError;
-use std::{process::Stdio, time::Duration};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
@@ -65,6 +70,14 @@ impl ModuleProcess {
         if !entrypoint.starts_with(&descriptor.module_dir) {
             return Err(ExternalError::PathEscape);
         }
+        let state_dir = module_state_dir(&descriptor.id, &|name| std::env::var_os(name))
+            .ok_or(ExternalError::StateRead)?;
+        tokio::fs::create_dir_all(&state_dir)
+            .await
+            .map_err(|_| ExternalError::StateWrite)?;
+        secure_directory(&state_dir)
+            .await
+            .map_err(|_| ExternalError::StateWrite)?;
 
         let mut command = Command::new(&entrypoint);
         command
@@ -79,6 +92,7 @@ impl ModuleProcess {
             .env("NO_COLOR", "1")
             .env("CLICOLOR", "0")
             .env("CLICOLOR_FORCE", "0")
+            .env("LAVIS_MODULE_STATE_DIR", &state_dir)
             .env("TERM", "dumb")
             .kill_on_drop(true);
 
@@ -532,6 +546,36 @@ fn truncate_result(text: &str) -> String {
     }
 }
 
+fn module_state_dir<F>(module_id: &str, environment: &F) -> Option<PathBuf>
+where
+    F: Fn(&str) -> Option<OsString>,
+{
+    let base = environment("XDG_STATE_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            environment("HOME")
+                .filter(|value| !value.is_empty())
+                .map(|home| Path::new(&home).join(".local/state"))
+        })?;
+    if !base.is_absolute() {
+        return None;
+    }
+    Some(base.join("lavis/modules").join(module_id))
+}
+
+#[cfg(unix)]
+async fn secure_directory(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).await
+}
+
+#[cfg(not(unix))]
+async fn secure_directory(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 pub async fn reap_child(mut child: Child) {
     let _ = child.wait().await;
 }
@@ -540,6 +584,7 @@ pub async fn reap_child(mut child: Child) {
 mod tests {
     use super::*;
     use std::env;
+    use std::ffi::OsString;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
@@ -736,6 +781,31 @@ if child:
             outgoing: true,
             entities: vec![],
         }
+    }
+
+    #[test]
+    fn module_state_dir_uses_xdg_state_home_before_home() {
+        let env = |name: &str| match name {
+            "XDG_STATE_HOME" => Some(OsString::from("/tmp/state")),
+            "HOME" => Some(OsString::from("/tmp/home")),
+            _ => None,
+        };
+        assert_eq!(
+            module_state_dir("gaf", &env),
+            Some(PathBuf::from("/tmp/state/lavis/modules/gaf"))
+        );
+    }
+
+    #[test]
+    fn module_state_dir_falls_back_to_home_state() {
+        let env = |name: &str| match name {
+            "HOME" => Some(OsString::from("/tmp/home")),
+            _ => None,
+        };
+        assert_eq!(
+            module_state_dir("gaf", &env),
+            Some(PathBuf::from("/tmp/home/.local/state/lavis/modules/gaf"))
+        );
     }
 
     #[tokio::test]

@@ -99,10 +99,8 @@
                 {
                   users.users.lavis-test = {
                     isNormalUser = true;
-                    group = "lavis-test";
-                    home = "/var/lib/lavis-test";
+                    home = "/build/lavis-test";
                   };
-                  users.groups.lavis-test = { };
                   services.lavis = {
                     enable = true;
                     user = "lavis-test";
@@ -130,11 +128,21 @@
           preStartScript = evaluated.config.systemd.services.lavis.preStart;
         } ''
           grep -q 'User=lavis-test' "$unit/lavis.service"
+          grep -q 'Group=users' "$unit/lavis.service"
           grep -q 'EnvironmentFile=/run/secrets/lavis.env' "$unit/lavis.service"
-          grep -q 'XDG_STATE_HOME=/var/lib/lavis-test/.local/state' "$unit/lavis.service"
-          grep -q 'mktemp -d -p /var/lib/lavis-test/.local/share/lavis/module-staging' "$preStartScript"
+          grep -q 'XDG_STATE_HOME=/build/lavis-test/.local/state' "$unit/lavis.service"
+          grep -q 'mktemp -d -p /build/lavis-test/.local/share/lavis/module-staging' "$preStartScript"
           ! grep -q 'chown -R' "$preStartScript"
           ! grep -q 'PermissionsStartOnly=true' "$unit/lavis.service"
+
+          "$preStartScript"
+          printf '%s\n' '{"enabled":true,"next_id":2,"triggers":[{"id":1,"word":"nix","reactions":[{"type":"emoji","emoji":"👍"}],"enabled":true}],"active":{}}' \
+            > /build/lavis-test/.local/share/lavis/modules/fixture/state.json
+          "$preStartScript"
+          test -f /build/lavis-test/.local/state/lavis/modules/fixture/state.json
+          grep -q '"word":"nix"' /build/lavis-test/.local/state/lavis/modules/fixture/state.json
+          test ! -f /build/lavis-test/.local/share/lavis/modules/fixture/state.json
+
           touch "$out"
         '';
       mergeEnabledCheck = pkgs.runCommand "lavis-merge-enabled-extensions-check" { } ''

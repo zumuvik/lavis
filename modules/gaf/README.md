@@ -47,4 +47,5 @@ The installed module remains disabled. Enable it locally and restart Lavis:
 lavis modules enable gaf
 ```
 
-GAF persists `state.json` beside its executable with mode `0600`.
+GAF persists `state.json` in `LAVIS_MODULE_STATE_DIR` when Lavis provides it,
+or `$XDG_STATE_HOME/lavis/modules/gaf/` when run directly.
