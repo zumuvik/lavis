@@ -12,6 +12,7 @@ pub mod protocol;
 pub mod source_inspection;
 pub mod state;
 pub mod v6_executor;
+pub(crate) mod v6_process;
 pub mod v6_registry;
 
 pub const MAX_ENABLED_MODULES: usize = 32;
