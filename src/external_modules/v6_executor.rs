@@ -126,7 +126,7 @@ impl GrammersV6Executor {
                 response.users.len(),
                 response.saved_count,
             ),
-            grammers_client::tl::enums::contacts::Contacts::NotModified(_) => {
+            grammers_client::tl::enums::contacts::Contacts::NotModified => {
                 contacts_summary(0, 0, 0)
             }
         }
