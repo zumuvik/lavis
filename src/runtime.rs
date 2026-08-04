@@ -1401,7 +1401,7 @@ fn render_install_plan(
         }
     };
     format!(
-        "📋 План установки\n\nИсточник: {source}\nМодуль: {} v{}\nПротокол: {}\nТочка входа: {}\nКоманда по умолчанию: {}\nSHA-256: {}\nОтпечаток: {}\nАрхив: {} Байт, файлов: {}, сжато: {} Байт, распаковано: {} Байт\nВозможности: {}\nПодписки: {}\nДействия: {}\nПредупреждения: {}\n\nApprovalId: {approval_id}\nПодтвердите: {prefix}lm confirm {approval_id}\nОтменить: {prefix}lm cancel {approval_id}\nСрок действия: 10 минут.",
+        "📋 План установки\n\nИсточник: {source}\nМодуль: {} v{}\nПротокол: {}\nТочка входа: {}\nКоманда по умолчанию: {}\nSHA-256: {}\nОтпечаток: {}\nАрхив: {} Байт, файлов: {}, сжато: {} Байт, распаковано: {} Байт\nВозможности: {}\nПодписки: {}\nМетоды Telegram V6: {}\nДействия: {}\nПредупреждения: {}\n\nApprovalId: {approval_id}\nПодтвердите: {prefix}lm confirm {approval_id}\nОтменить: {prefix}lm cancel {approval_id}\nСрок действия: 10 минут.",
         plan.module_id,
         plan.module_version,
         plan.protocol_version,
@@ -1415,6 +1415,7 @@ fn render_install_plan(
         plan.archive.expanded_bytes,
         bounded_list(&plan.capabilities),
         bounded_list(&plan.subscriptions),
+        bounded_list(&plan.telegram_methods),
         bounded_list(&plan.actions),
         bounded_list(
             &plan
@@ -2099,7 +2100,7 @@ mod tests {
         MODULE_MUTATION_DENIED, ProcStats, REBOOT_DENIED, SensitiveCommandDenial,
         SensitiveCommandPolicy, authorize_sensitive_message, bounded_list,
         external_event_error_category, fastfetch_response, format_duration, format_latency,
-        format_stats, lm_usage, parse_memory_kib, parse_system_uptime,
+        format_stats, lm_usage, parse_memory_kib, parse_system_uptime, render_install_plan,
     };
     use crate::response::Response;
     use crate::{
@@ -2107,6 +2108,11 @@ mod tests {
         bot_api::{BotApi, BotApiFuture, BotIdentity},
         commands::{Action, AliasRequest},
         fastfetch::{FastfetchInputError, FastfetchProfileError, FastfetchResult},
+        external_modules::source_inspection::{
+            ArchiveDigest, ArchiveStatistics, InspectionTimes, InspectionWarning, ModuleInstallPlan,
+            SourceIdentity, SourceKind,
+        },
+        external_modules::approval::{APPROVAL_ID_BYTES, ApprovalId},
         setup_store::{CompanionToken, PersistedSetupState, SetupStore},
     };
     use grammers_session::types::PeerId;
@@ -2115,6 +2121,38 @@ mod tests {
         path::PathBuf,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn install_plan_renders_bounded_v6_method_grants() {
+        let plan = ModuleInstallPlan {
+            source_kind: SourceKind::Archive,
+            source_identity: SourceIdentity::Archive,
+            module_id: "raw".to_owned(),
+            module_version: "1".to_owned(),
+            protocol_version: 6,
+            entrypoint: "run".to_owned(),
+            default_command: None,
+            archive_digest: ArchiveDigest::from_hex(&"0".repeat(64)).unwrap(),
+            archive: ArchiveStatistics {
+                archive_bytes: 1,
+                file_count: 1,
+                compressed_bytes: 1,
+                expanded_bytes: 1,
+            },
+            warnings: vec![InspectionWarning::TelegramRawNotSandboxed],
+            times: InspectionTimes {
+                inspected_unix_seconds: 0,
+                expires_unix_seconds: 0,
+            },
+            capabilities: vec!["telegram.raw".to_owned()],
+            subscriptions: vec![],
+            telegram_methods: vec!["account.updateStatus".to_owned()],
+            actions: vec![],
+            fingerprint: "fingerprint".to_owned(),
+        };
+        let approval_id = ApprovalId::from_bytes([0; APPROVAL_ID_BYTES]);
+        assert!(render_install_plan(&plan, approval_id, ".").contains("account.updateStatus"));
+    }
 
     #[test]
     fn sensitive_command_policies_distinguish_saved_messages_from_reboot_dialogs() {
@@ -2672,6 +2710,7 @@ for line in sys.stdin:
                     )
                     .into_iter()
                     .collect(),
+                telegram_methods: vec![],
                 actions: vec![],
                 commands: vec![],
             }

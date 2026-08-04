@@ -1,3 +1,4 @@
+use super::v6_registry;
 use crate::error::ExternalError;
 use serde::Deserialize;
 use std::{
@@ -17,6 +18,7 @@ const MAX_NAME_CHARS: usize = 64;
 const MAX_VERSION_CHARS: usize = 32;
 const MAX_AUTHOR_CHARS: usize = 128;
 const MAX_USAGE_CHARS: usize = 256;
+const MAX_V6_TELEGRAM_METHODS: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalModuleDescriptor {
@@ -30,6 +32,7 @@ pub struct ExternalModuleDescriptor {
     pub capabilities: Vec<ExternalCapability>,
     pub default_command: Option<String>,
     pub subscriptions: Vec<ExternalSubscription>,
+    pub telegram_methods: Vec<v6_registry::V6Method>,
     pub actions: Vec<ExternalAction>,
     pub commands: Vec<ExternalCommandDescriptor>,
 }
@@ -53,6 +56,7 @@ pub enum ExternalCapability {
     MessagePeerId,
     MessageReact,
     TelegramAccountStatus,
+    TelegramRaw,
 }
 
 impl ExternalCapability {
@@ -66,6 +70,7 @@ impl ExternalCapability {
             Self::MessagePeerId => "message.peer_id",
             Self::MessageReact => "message.react",
             Self::TelegramAccountStatus => "telegram.account.status",
+            Self::TelegramRaw => "telegram.raw",
         }
     }
 
@@ -79,6 +84,8 @@ impl ExternalCapability {
             Self::MessagePeerId => "идентификатор чата сообщения",
             Self::MessageReact => "реакции на сообщения",
             Self::TelegramAccountStatus => "изменение статуса аккаунта Telegram",
+            // This grants reviewed raw RPC methods, not a sandbox or generic API.
+            Self::TelegramRaw => "высокорисковые проверенные вызовы Telegram без песочницы",
         }
     }
 
@@ -92,6 +99,7 @@ impl ExternalCapability {
             "message.peer_id" => Some(Self::MessagePeerId),
             "message.react" => Some(Self::MessageReact),
             "telegram.account.status" => Some(Self::TelegramAccountStatus),
+            "telegram.raw" => Some(Self::TelegramRaw),
             _ => None,
         }
     }
@@ -146,6 +154,8 @@ struct ManifestFile {
     default_command: Option<String>,
     #[serde(default)]
     subscriptions: Vec<String>,
+    #[serde(default)]
+    telegram_methods: Option<Vec<String>>,
     #[serde(default)]
     actions: Vec<String>,
 }
@@ -331,7 +341,11 @@ pub fn validate_manifest_at(
     let manifest: ManifestFile =
         serde_json::from_slice(&bytes).map_err(|_| ExternalError::MalformedManifest)?;
 
-    if !matches!(manifest.schema_version, 2..=5) {
+    if manifest.schema_version <= 5 && manifest.telegram_methods.is_some() {
+        return Err(ExternalError::MalformedManifest);
+    }
+
+    if !matches!(manifest.schema_version, 2..=6) {
         return Err(ExternalError::UnsupportedSchemaVersion);
     }
 
@@ -378,6 +392,29 @@ pub fn validate_manifest_at(
         }
         seen_capabilities.push(cap);
     }
+    let telegram_method_names = manifest.telegram_methods.unwrap_or_default();
+    let has_raw = seen_capabilities.contains(&ExternalCapability::TelegramRaw);
+    if has_raw == telegram_method_names.is_empty()
+        || telegram_method_names.len() > MAX_V6_TELEGRAM_METHODS
+        || (has_raw && manifest.schema_version != 6)
+    {
+        return Err(ExternalError::InvalidCapability);
+    }
+    for method in &telegram_method_names {
+        if v6_registry::lookup(method).is_none()
+            || telegram_method_names
+                .iter()
+                .filter(|candidate| *candidate == method)
+                .count()
+                != 1
+        {
+            return Err(ExternalError::InvalidArgument);
+        }
+    }
+    let telegram_methods = telegram_method_names
+        .iter()
+        .map(|name| v6_registry::lookup(name).ok_or(ExternalError::InvalidArgument))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let mut subscriptions = Vec::new();
     let mut actions = Vec::new();
@@ -504,6 +541,7 @@ pub fn validate_manifest_at(
         capabilities: seen_capabilities,
         default_command: manifest.default_command,
         subscriptions,
+        telegram_methods,
         actions,
         commands,
     })
@@ -654,7 +692,7 @@ mod tests {
         let path = dir.join("module.json");
         assert!(matches!(
             validate_manifest_at(&path, Some("echo")),
-            Err(ExternalError::MalformedManifest)
+            Err(ExternalError::InvalidArgument)
         ));
         fs::remove_dir_all(&base).unwrap();
     }
@@ -738,7 +776,7 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
         assert!(matches!(
             validate_manifest_at(&path, Some("echo")),
-            Err(ExternalError::MalformedManifest)
+            Err(ExternalError::InvalidArgument)
         ));
 
         json.as_object_mut().unwrap().remove("timer_subscriptions");
@@ -761,9 +799,66 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
         assert!(matches!(
             validate_manifest_at(&path, Some("echo")),
-            Err(ExternalError::MalformedManifest)
+            Err(ExternalError::InvalidArgument)
         ));
         for schema_version in 2..=4 {
+            json["schema_version"] = serde_json::json!(schema_version);
+            fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+            assert!(matches!(
+                validate_manifest_at(&path, Some("echo")),
+                Err(ExternalError::MalformedManifest)
+            ));
+        }
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn v6_raw_methods_are_explicit_reviewed_and_legacy_rejects_the_field() {
+        let base = temp_dir();
+        let dir = create_module_dir(&base, "echo");
+        let mut json = serde_json::from_slice::<serde_json::Value>(&valid_manifest_json()).unwrap();
+        json["schema_version"] = serde_json::json!(6);
+        json["capabilities"] = serde_json::json!(["telegram.raw"]);
+        json["telegram_methods"] = serde_json::json!(["account.updateStatus"]);
+        let path = write_manifest(&dir, &serde_json::to_vec(&json).unwrap());
+        let descriptor = validate_manifest_at(&path, Some("echo")).unwrap();
+        assert_eq!(descriptor.protocol_version, 6);
+        assert_eq!(descriptor.telegram_methods[0].spec().name, "account.updateStatus");
+
+        json.as_object_mut().unwrap().remove("telegram_methods");
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(matches!(
+            validate_manifest_at(&path, Some("echo")),
+            Err(ExternalError::InvalidCapability)
+        ));
+
+        json["capabilities"] = serde_json::json!([]);
+        json["telegram_methods"] = serde_json::json!(["account.updateStatus"]);
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(matches!(
+            validate_manifest_at(&path, Some("echo")),
+            Err(ExternalError::InvalidCapability)
+        ));
+
+        json["capabilities"] = serde_json::json!(["telegram.raw"]);
+        json["telegram_methods"] = serde_json::json!(["unknown.method"]);
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(matches!(
+            validate_manifest_at(&path, Some("echo")),
+            Err(ExternalError::InvalidArgument)
+        ));
+
+        json["telegram_methods"] =
+            serde_json::json!(["account.updateStatus", "account.updateStatus"]);
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(matches!(
+            validate_manifest_at(&path, Some("echo")),
+            Err(ExternalError::InvalidArgument)
+        ));
+
+        json["capabilities"] = serde_json::json!([]);
+        json["telegram_methods"] = serde_json::json!(["account.updateStatus"]);
+        for schema_version in 2..=5 {
             json["schema_version"] = serde_json::json!(schema_version);
             fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
             assert!(matches!(

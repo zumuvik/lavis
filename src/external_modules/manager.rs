@@ -470,6 +470,7 @@ mod tests {
             capabilities: vec![],
             default_command: None,
             subscriptions: vec![],
+            telegram_methods: vec![],
             actions: vec![],
             commands: vec![ExternalCommandDescriptor {
                 name: "run".to_owned(),

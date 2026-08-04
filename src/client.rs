@@ -1,7 +1,7 @@
 use std::{path::PathBuf, sync::Arc};
 
-use grammers_client::Client;
-use grammers_mtsender::SenderPool;
+use grammers_client::{Client, client::{ClientConfiguration, NoRetries}};
+use grammers_mtsender::{SenderPool, SenderPoolFatHandle};
 use grammers_session::storages::SqliteSession;
 use tokio::{sync::mpsc::UnboundedReceiver, task::JoinHandle};
 
@@ -9,6 +9,7 @@ use crate::{config::Config, error::ClientError};
 
 pub struct TelegramClient {
     client: Client,
+    module_rpc_handle: SenderPoolFatHandle,
     runner: JoinHandle<()>,
     updates: Option<UnboundedReceiver<grammers_session::updates::UpdatesLike>>,
 }
@@ -25,11 +26,13 @@ impl TelegramClient {
 
         let api_id = i32::try_from(config.api_id).map_err(|_| ClientError::InvalidApiId)?;
         let pool = SenderPool::new(session, api_id);
+        let module_rpc_handle = pool.handle.clone();
         let client = Client::new(pool.handle);
         let runner = tokio::spawn(pool.runner.run());
 
         Ok(Self {
             client,
+            module_rpc_handle,
             runner,
             updates: Some(pool.updates),
         })
@@ -37,6 +40,16 @@ impl TelegramClient {
 
     pub(crate) fn client(&self) -> &Client {
         &self.client
+    }
+
+    pub(crate) fn module_rpc_client(&self) -> Client {
+        Client::with_configuration(
+            self.module_rpc_handle.clone(),
+            ClientConfiguration {
+                retry_policy: Box::new(NoRetries),
+                auto_cache_peers: false,
+            },
+        )
     }
 
     pub(crate) fn take_updates(
@@ -48,10 +61,12 @@ impl TelegramClient {
     pub async fn shutdown(self) -> Result<(), ClientError> {
         let Self {
             client,
+            module_rpc_handle,
             runner,
             updates,
         } = self;
         drop(updates);
+        drop(module_rpc_handle);
         client.disconnect();
         drop(client);
         runner.await.map_err(|_| ClientError::RunnerTask)

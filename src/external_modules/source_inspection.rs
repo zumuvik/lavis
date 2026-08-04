@@ -242,6 +242,8 @@ pub struct ArchiveStatistics {
 #[serde(rename_all = "snake_case")]
 pub enum InspectionWarning {
     StoredOnlyArchive,
+    /// `telegram.raw` grants reviewed RPC methods but does not sandbox a module.
+    TelegramRawNotSandboxed,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct InspectionTimes {
@@ -265,6 +267,7 @@ pub struct ModuleInstallPlan {
     pub times: InspectionTimes,
     pub capabilities: Vec<String>,
     pub subscriptions: Vec<String>,
+    pub telegram_methods: Vec<String>,
     pub actions: Vec<String>,
     pub fingerprint: String,
 }
@@ -316,6 +319,22 @@ impl ModuleInstallPlan {
                 super::manifest::ExternalAction::MessageReact => "message.react".into(),
             })
             .collect();
+        let telegram_methods = d
+            .telegram_methods
+            .iter()
+            .map(|method| method.spec().name.to_owned())
+            .collect();
+        let warnings = if d
+            .capabilities
+            .contains(&super::manifest::ExternalCapability::TelegramRaw)
+        {
+            vec![
+                InspectionWarning::StoredOnlyArchive,
+                InspectionWarning::TelegramRawNotSandboxed,
+            ]
+        } else {
+            vec![InspectionWarning::StoredOnlyArchive]
+        };
         let mut result = Self {
             source_kind: identity.kind(),
             source_identity: identity,
@@ -326,13 +345,14 @@ impl ModuleInstallPlan {
             default_command: d.default_command.clone(),
             archive_digest: digest,
             archive,
-            warnings: vec![InspectionWarning::StoredOnlyArchive],
+            warnings,
             times: InspectionTimes {
                 inspected_unix_seconds: unix_seconds(now),
                 expires_unix_seconds: unix_seconds(expires),
             },
             capabilities,
             subscriptions,
+            telegram_methods,
             actions,
             fingerprint: String::new(),
         };
@@ -368,6 +388,9 @@ impl ModuleInstallPlan {
         encoded.extend_from_slice(&self.archive.expanded_bytes.to_be_bytes());
         canonical_list(&mut encoded, &self.capabilities);
         canonical_list(&mut encoded, &self.subscriptions);
+        if self.protocol_version == 6 {
+            canonical_list(&mut encoded, &self.telegram_methods);
+        }
         canonical_list(&mut encoded, &self.actions);
         encoded.extend_from_slice(&(self.warnings.len() as u32).to_be_bytes());
         for warning in &self.warnings {
@@ -375,6 +398,7 @@ impl ModuleInstallPlan {
                 &mut encoded,
                 match warning {
                     InspectionWarning::StoredOnlyArchive => "stored_only_archive",
+                    InspectionWarning::TelegramRawNotSandboxed => "telegram_raw_not_sandboxed",
                 },
             );
         }
@@ -1088,6 +1112,19 @@ mod tests {
         zip(&[manifest, run])
     }
 
+    fn v6_archive(method: &str) -> Vec<u8> {
+        let manifest = file(
+            "module.json",
+            format!(
+                "{{\"schema_version\":6,\"id\":\"raw\",\"name\":\"Raw\",\"version\":\"1\",\"author\":\"A\",\"entrypoint\":\"run\",\"capabilities\":[\"telegram.raw\"],\"telegram_methods\":[\"{method}\"],\"commands\":[{{\"name\":\"go\",\"summary_ru\":\"x\",\"description_ru\":\"x\",\"usage\":\"<value>\"}}]}}"
+            )
+            .as_bytes(),
+        );
+        let mut run = file("run", b"#!/bin/sh");
+        run.mode = 0o100755;
+        zip(&[manifest, run])
+    }
+
     struct TestRandom(u8);
 
     impl RandomSource for TestRandom {
@@ -1266,6 +1303,86 @@ mod tests {
         );
         pending.cleanup().unwrap();
         let _ = fs::remove_dir(root);
+    }
+
+    #[test]
+    fn v6_plan_fingerprints_explicit_raw_method_grants() {
+        let root = root("v6-plan");
+        let config = InspectionConfig {
+            staging_root: root.clone(),
+            limits: limits(),
+        };
+        let mut random = TestRandom(1);
+        let first = inspect_pending(
+            &config,
+            AcquiredLmod::archive(v6_archive("account.updateStatus")),
+            SystemTime::UNIX_EPOCH,
+            SystemTime::UNIX_EPOCH,
+            &mut random,
+        )
+        .unwrap();
+        let second = inspect_pending(
+            &config,
+            AcquiredLmod::archive(v6_archive("contacts.getContacts")),
+            SystemTime::UNIX_EPOCH,
+            SystemTime::UNIX_EPOCH,
+            &mut random,
+        )
+        .unwrap();
+        assert_eq!(
+            first.plan.telegram_methods,
+            vec!["account.updateStatus".to_owned()]
+        );
+        assert!(first
+            .plan
+            .warnings
+            .contains(&InspectionWarning::TelegramRawNotSandboxed));
+        let changed_grant = ModuleInstallPlan {
+            telegram_methods: vec!["contacts.getContacts".to_owned()],
+            ..first.plan.clone()
+        };
+        assert_ne!(
+            first.plan.fingerprint,
+            changed_grant.canonical_fingerprint()
+        );
+        assert_ne!(first.plan.fingerprint, second.plan.fingerprint);
+        first.cleanup().unwrap();
+        second.cleanup().unwrap();
+        let _ = fs::remove_dir(root);
+    }
+
+    #[test]
+    fn legacy_fingerprint_has_its_pre_v6_golden_value() {
+        let plan = ModuleInstallPlan {
+            source_kind: SourceKind::Archive,
+            source_identity: SourceIdentity::Archive,
+            module_id: "legacy".to_owned(),
+            module_version: "1".to_owned(),
+            protocol_version: 5,
+            entrypoint: "run".to_owned(),
+            default_command: None,
+            archive_digest: ArchiveDigest([0; 32]),
+            archive: ArchiveStatistics {
+                archive_bytes: 1,
+                file_count: 2,
+                compressed_bytes: 3,
+                expanded_bytes: 4,
+            },
+            warnings: vec![InspectionWarning::StoredOnlyArchive],
+            times: InspectionTimes {
+                inspected_unix_seconds: 0,
+                expires_unix_seconds: 0,
+            },
+            capabilities: vec![],
+            subscriptions: vec![],
+            telegram_methods: vec!["account.updateStatus".to_owned()],
+            actions: vec![],
+            fingerprint: String::new(),
+        };
+        assert_eq!(
+            plan.canonical_fingerprint(),
+            "d920f19f1446cd1cc08b61e173105b5a4ecb79ce528581b4c7f3910c9358f19e"
+        );
     }
 
     #[test]

@@ -1,4 +1,6 @@
 use crate::error::ExternalError;
+use serde::Deserialize;
+use serde_json::value::RawValue;
 
 pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
@@ -7,6 +9,9 @@ pub const MAX_ERROR_MESSAGE_CHARS: usize = 256;
 pub const MAX_LOG_MESSAGE_CHARS: usize = 1024;
 pub const MAX_EVENT_ACTIONS: usize = 1;
 pub const MAX_REACTIONS_PER_ACTION: usize = 3;
+pub const V6_MAX_JSON_DEPTH: usize = 8;
+pub const V6_MAX_JSON_STRING_BYTES: usize = 8 * 1024;
+pub const V6_MAX_JSON_COLLECTION_ITEMS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CustomEmojiEntity {
@@ -96,6 +101,458 @@ pub struct TelegramCallError {
     pub name: Option<String>,
     pub message: String,
     pub retry_after_seconds: Option<u32>,
+}
+
+#[derive(Debug)]
+pub enum V6ModuleFrame {
+    TelegramInvoke {
+        call_id: String,
+        method: String,
+        params: Box<RawValue>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V6CallError {
+    pub kind: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum V6CoreFrame {
+    TelegramResult {
+        call_id: String,
+        result: Result<serde_json::Value, V6CallError>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum V6OutboundCoreFrame {
+    Initialize {
+        request_id: String,
+        module_id: String,
+    },
+    Execute {
+        request_id: String,
+        command: String,
+        arguments: String,
+        argument_entities: Vec<CustomEmojiEntity>,
+    },
+    Event {
+        request_id: String,
+        event: MessageEventKind,
+        payload: MessageEvent,
+    },
+    Health {
+        request_id: String,
+    },
+    Shutdown {
+        request_id: String,
+    },
+    TelegramResult {
+        call_id: String,
+        result: Result<serde_json::Value, V6CallError>,
+    },
+}
+
+impl V6OutboundCoreFrame {
+    pub fn serialize(&self) -> Result<String, ExternalError> {
+        match self {
+            Self::Initialize {
+                request_id,
+                module_id,
+            } => serialize_v6_lifecycle(request_id, serde_json::json!({
+                "protocol_version": 6,
+                "type": "initialize",
+                "request_id": request_id,
+                "module_id": module_id,
+            })),
+            Self::Execute {
+                request_id,
+                command,
+                arguments,
+                argument_entities,
+            } => serialize_v6_lifecycle(request_id, serde_json::json!({
+                "protocol_version": 6,
+                "type": "execute",
+                "request_id": request_id,
+                "command": command,
+                "arguments": arguments,
+                "context": {
+                    "argument_entities": argument_entities.iter().map(|entity| serde_json::json!({
+                        "type": "custom_emoji",
+                        "offset_utf16": entity.offset_utf16,
+                        "length_utf16": entity.length_utf16,
+                        "document_id": entity.document_id,
+                    })).collect::<Vec<_>>(),
+                },
+            })),
+            Self::Event {
+                request_id,
+                event,
+                payload,
+            } => {
+                let mut event_payload = serde_json::json!({
+                    "event_id": payload.event_id,
+                    "message_ref": payload.message_ref,
+                    "message_key": payload.message_key,
+                    "text": payload.text,
+                    "outgoing": payload.outgoing,
+                    "entities": payload.entities.iter().map(|entity| serde_json::json!({
+                        "type": "custom_emoji",
+                        "offset_utf16": entity.offset_utf16,
+                        "length_utf16": entity.length_utf16,
+                        "document_id": entity.document_id,
+                    })).collect::<Vec<_>>(),
+                });
+                if let Some(peer_id) = payload.peer_id {
+                    event_payload["peer_id"] = serde_json::json!(peer_id);
+                }
+                serialize_v6_lifecycle(request_id, serde_json::json!({
+                    "protocol_version": 6,
+                    "type": "event",
+                    "request_id": request_id,
+                    "event": event.as_str(),
+                    "payload": event_payload,
+                }))
+            }
+            Self::Health { request_id } => serialize_v6_lifecycle(request_id, serde_json::json!({
+                "protocol_version": 6,
+                "type": "health",
+                "request_id": request_id,
+            })),
+            Self::Shutdown { request_id } => serialize_v6_lifecycle(request_id, serde_json::json!({
+                "protocol_version": 6,
+                "type": "shutdown",
+                "request_id": request_id,
+            })),
+            Self::TelegramResult { call_id, result } => {
+                serialize_v6_core_result(call_id, result.clone())
+            }
+        }
+    }
+}
+
+fn serialize_v6_lifecycle(
+    request_id: &str,
+    value: serde_json::Value,
+) -> Result<String, ExternalError> {
+    if !is_v6_request_id(request_id) {
+        return Err(ExternalError::ProtocolEncode);
+    }
+    guard_v6_json(&value, 0).map_err(|_| ExternalError::ProtocolEncode)?;
+    let line = serde_json::to_string(&value).map_err(|_| ExternalError::ProtocolEncode)?;
+    if line.len() > MAX_LINE_BYTES {
+        return Err(ExternalError::ProtocolEncode);
+    }
+    Ok(line)
+}
+
+#[derive(Debug)]
+pub enum V6InboundFrame {
+    Initialized { request_id: String, module_id: String },
+    Result { request_id: String, text: String },
+    Error { request_id: String, code: String, message: String },
+    Health { request_id: String },
+    Log { request_id: String, level: String, message: String },
+    EventResult { request_id: String, actions: Vec<serde_json::Value> },
+    TelegramInvoke(V6ModuleFrame),
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+enum V6WireFrame {
+    #[serde(rename = "initialized")]
+    Initialized {
+        protocol_version: u32,
+        request_id: String,
+        module_id: String,
+    },
+    #[serde(rename = "result")]
+    Result {
+        protocol_version: u32,
+        request_id: String,
+        text: String,
+    },
+    #[serde(rename = "error")]
+    Error {
+        protocol_version: u32,
+        request_id: String,
+        code: String,
+        message: String,
+    },
+    #[serde(rename = "health")]
+    Health {
+        protocol_version: u32,
+        request_id: String,
+    },
+    #[serde(rename = "log")]
+    Log {
+        protocol_version: u32,
+        request_id: String,
+        level: String,
+        message: String,
+    },
+    #[serde(rename = "event_result")]
+    EventResult {
+        protocol_version: u32,
+        request_id: String,
+        actions: Vec<serde_json::Value>,
+    },
+    #[serde(rename = "telegram.invoke")]
+    TelegramInvoke {
+        protocol_version: u32,
+        call_id: String,
+        method: String,
+        params: Box<RawValue>,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct V6WireSuccess {
+    protocol_version: u32,
+    #[serde(rename = "type")]
+    message_type: String,
+    call_id: String,
+    ok: bool,
+    result: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct V6WireFailure {
+    protocol_version: u32,
+    #[serde(rename = "type")]
+    message_type: String,
+    call_id: String,
+    ok: bool,
+    error: V6WireError,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct V6WireError {
+    kind: String,
+    message: String,
+}
+
+pub fn parse_v6_inbound_frame(line: &str) -> Result<V6InboundFrame, ExternalError> {
+    let wire: V6WireFrame = parse_v6_wire(line)?;
+    match wire {
+        V6WireFrame::Initialized {
+            protocol_version: 6,
+            request_id,
+            module_id,
+        } if is_v6_request_id(&request_id) => Ok(V6InboundFrame::Initialized {
+            request_id,
+            module_id,
+        }),
+        V6WireFrame::Result {
+            protocol_version: 6,
+            request_id,
+            text,
+        } if is_v6_request_id(&request_id) => Ok(V6InboundFrame::Result { request_id, text }),
+        V6WireFrame::Error {
+            protocol_version: 6,
+            request_id,
+            code,
+            message,
+        } if is_v6_request_id(&request_id) => Ok(V6InboundFrame::Error {
+            request_id,
+            code,
+            message,
+        }),
+        V6WireFrame::Health {
+            protocol_version: 6,
+            request_id,
+        } if is_v6_request_id(&request_id) => Ok(V6InboundFrame::Health { request_id }),
+        V6WireFrame::Log {
+            protocol_version: 6,
+            request_id,
+            level,
+            message,
+        } if is_v6_request_id(&request_id) => Ok(V6InboundFrame::Log {
+            request_id,
+            level,
+            message,
+        }),
+        V6WireFrame::EventResult {
+            protocol_version: 6,
+            request_id,
+            actions,
+        } if is_v6_request_id(&request_id) => Ok(V6InboundFrame::EventResult {
+            request_id,
+            actions,
+        }),
+        V6WireFrame::TelegramInvoke {
+            protocol_version: 6,
+            call_id,
+            method,
+            params,
+        } if is_v6_call_id(&call_id)
+            && !method.is_empty()
+            && validate_v6_raw_params(&params).is_ok() =>
+        {
+            Ok(V6InboundFrame::TelegramInvoke(V6ModuleFrame::TelegramInvoke {
+                call_id,
+                method,
+                params,
+            }))
+        }
+        _ => Err(ExternalError::ProtocolDecode),
+    }
+}
+
+pub fn parse_v6_module_frame(line: &str) -> Result<V6ModuleFrame, ExternalError> {
+    match parse_v6_inbound_frame(line)? {
+        V6InboundFrame::TelegramInvoke(frame) => Ok(frame),
+        _ => Err(ExternalError::ProtocolDecode),
+    }
+}
+
+pub fn parse_v6_core_frame(line: &str) -> Result<V6CoreFrame, ExternalError> {
+    let _ = parse_v6_value(line)?;
+    let success = serde_json::from_str::<V6WireSuccess>(line);
+    if let Ok(success) = success {
+        if success.protocol_version == 6
+            && success.message_type == "telegram.result"
+            && success.ok
+            && is_v6_call_id(&success.call_id)
+        {
+            return Ok(V6CoreFrame::TelegramResult {
+                call_id: success.call_id,
+                result: Ok(success.result),
+            });
+        }
+        return Err(ExternalError::ProtocolDecode);
+    }
+    let failure: V6WireFailure =
+        serde_json::from_str(line).map_err(|_| ExternalError::ProtocolDecode)?;
+    if failure.protocol_version != 6
+        || failure.message_type != "telegram.result"
+        || failure.ok
+        || !is_v6_call_id(&failure.call_id)
+        || failure.error.kind.is_empty()
+    {
+        return Err(ExternalError::ProtocolDecode);
+    }
+    Ok(V6CoreFrame::TelegramResult {
+        call_id: failure.call_id,
+        result: Err(V6CallError {
+            kind: failure.error.kind,
+            message: failure.error.message,
+        }),
+    })
+}
+
+pub fn serialize_v6_core_result(
+    call_id: &str,
+    result: Result<serde_json::Value, V6CallError>,
+) -> Result<String, ExternalError> {
+    if !is_v6_call_id(call_id) {
+        return Err(ExternalError::ProtocolEncode);
+    }
+    let value = match result {
+        Ok(result) => serde_json::json!({
+            "protocol_version": 6,
+            "type": "telegram.result",
+            "call_id": call_id,
+            "ok": true,
+            "result": result,
+        }),
+        Err(error) if !error.kind.is_empty() => serde_json::json!({
+            "protocol_version": 6,
+            "type": "telegram.result",
+            "call_id": call_id,
+            "ok": false,
+            "error": {"kind": error.kind, "message": error.message},
+        }),
+        Err(_) => return Err(ExternalError::ProtocolEncode),
+    };
+    guard_v6_json(&value, 0).map_err(|_| ExternalError::ProtocolEncode)?;
+    let line = serde_json::to_string(&value).map_err(|_| ExternalError::ProtocolEncode)?;
+    if line.len() > MAX_LINE_BYTES {
+        return Err(ExternalError::ProtocolEncode);
+    }
+    Ok(line)
+}
+
+fn parse_v6_value(line: &str) -> Result<serde_json::Value, ExternalError> {
+    if line.len() > MAX_LINE_BYTES {
+        return Err(ExternalError::LineTooLarge);
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(line).map_err(|_| ExternalError::ProtocolDecode)?;
+    guard_v6_json(&value, 0)?;
+    Ok(value)
+}
+
+fn parse_v6_wire(line: &str) -> Result<V6WireFrame, ExternalError> {
+    let _ = parse_v6_value(line)?;
+    serde_json::from_str(line).map_err(|_| ExternalError::ProtocolDecode)
+}
+
+fn guard_v6_json(value: &serde_json::Value, depth: usize) -> Result<(), ExternalError> {
+    if depth > V6_MAX_JSON_DEPTH {
+        return Err(ExternalError::ProtocolDecode);
+    }
+    match value {
+        serde_json::Value::String(string) if string.len() > V6_MAX_JSON_STRING_BYTES => {
+            Err(ExternalError::ProtocolDecode)
+        }
+        serde_json::Value::Array(values) => {
+            if values.len() > V6_MAX_JSON_COLLECTION_ITEMS {
+                return Err(ExternalError::ProtocolDecode);
+            }
+            for value in values {
+                guard_v6_json(value, depth + 1)?;
+            }
+            Ok(())
+        }
+        serde_json::Value::Object(values) => {
+            if values.len() > V6_MAX_JSON_COLLECTION_ITEMS {
+                return Err(ExternalError::ProtocolDecode);
+            }
+            for (key, value) in values {
+                if key.len() > V6_MAX_JSON_STRING_BYTES {
+                    return Err(ExternalError::ProtocolDecode);
+                }
+                guard_v6_json(value, depth + 1)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+pub(crate) fn validate_v6_output(value: &serde_json::Value) -> Result<(), ExternalError> {
+    guard_v6_json(value, 0).map_err(|_| ExternalError::ProtocolEncode)?;
+    let encoded = serde_json::to_vec(value).map_err(|_| ExternalError::ProtocolEncode)?;
+    if encoded.len() > MAX_RESULT_BYTES {
+        return Err(ExternalError::ProtocolEncode);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_v6_raw_params(params: &RawValue) -> Result<(), ExternalError> {
+    let value: serde_json::Value =
+        serde_json::from_str(params.get()).map_err(|_| ExternalError::ProtocolDecode)?;
+    guard_v6_json(&value, 0)
+}
+
+fn is_v6_call_id(call_id: &str) -> bool {
+    !call_id.is_empty()
+        && call_id.len() <= 64
+        && call_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+fn is_v6_request_id(request_id: &str) -> bool {
+    !request_id.is_empty()
+        && request_id.len() <= 64
+        && request_id.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -489,6 +946,194 @@ pub fn request_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v6_frames_are_parentless_and_strict() {
+        let invoke = r#"{"protocol_version":6,"type":"telegram.invoke","call_id":"call_1","method":"account.updateStatus","params":{"offline":true}}"#;
+        let V6ModuleFrame::TelegramInvoke {
+            call_id,
+            method,
+            params,
+        } = parse_v6_module_frame(invoke).unwrap();
+        assert_eq!(call_id, "call_1");
+        assert_eq!(method, "account.updateStatus");
+        assert_eq!(params.get(), r#"{"offline":true}"#);
+        assert!(parse_v6_module_frame(
+            r#"{"protocol_version":6,"type":"telegram.invoke","call_id":"call_1","request_id":"1","method":"account.updateStatus","params":{}}"#
+        )
+        .is_err());
+        assert!(parse_v6_module_frame(
+            r#"{"protocol_version":6,"type":"telegram.invoke","call_id":"!","method":"account.updateStatus","params":{}}"#
+        )
+        .is_err());
+
+        let result = serialize_v6_core_result(
+            "call_1",
+            Ok(serde_json::json!({"offline": true})),
+        )
+        .unwrap();
+        assert!(matches!(
+            parse_v6_core_frame(&result),
+            Ok(V6CoreFrame::TelegramResult { result: Ok(_), .. })
+        ));
+    }
+
+    #[test]
+    fn v6_json_limits_do_not_change_v5_parsing() {
+        let deep = (0..=V6_MAX_JSON_DEPTH)
+            .fold("true".to_owned(), |value, _| format!("{{\"x\":{value}}}"));
+        let line = format!(
+            "{{\"protocol_version\":6,\"type\":\"telegram.invoke\",\"call_id\":\"call\",\"method\":\"account.updateStatus\",\"params\":{deep}}}"
+        );
+        assert!(parse_v6_module_frame(&line).is_err());
+        assert!(parse_v6_module_frame(&format!(
+            "{{\"protocol_version\":6,\"type\":\"telegram.invoke\",\"call_id\":\"call\",\"method\":\"account.updateStatus\",\"params\":\"{}\"}}",
+            "x".repeat(V6_MAX_JSON_STRING_BYTES + 1)
+        ))
+        .is_err());
+        assert!(matches!(
+            parse_module_line_for(
+                r#"{"protocol_version":5,"type":"telegram.invoke","request_id":"10","call_id":"call","method":"account.updateStatus","params":{"offline":true}}"#,
+                5
+            ),
+            Ok(Some(ModuleMessage::TelegramInvoke { .. }))
+        ));
+    }
+
+    #[test]
+    fn v6_wire_rejects_duplicate_keys_and_parses_all_inbound_kinds() {
+        assert!(parse_v6_module_frame(
+            r#"{"protocol_version":6,"protocol_version":6,"type":"telegram.invoke","call_id":"call","method":"account.updateStatus","params":{}}"#
+        )
+        .is_err());
+        assert!(parse_v6_core_frame(
+            r#"{"protocol_version":6,"type":"telegram.result","call_id":"call","ok":true,"ok":true,"result":true}"#
+        )
+        .is_err());
+        assert!(matches!(
+            parse_v6_inbound_frame(r#"{"protocol_version":6,"type":"initialized","request_id":"1","module_id":"mod"}"#),
+            Ok(V6InboundFrame::Initialized { .. })
+        ));
+        assert!(matches!(
+            parse_v6_inbound_frame(r#"{"protocol_version":6,"type":"event_result","request_id":"2","actions":[]}"#),
+            Ok(V6InboundFrame::EventResult { .. })
+        ));
+        assert!(parse_v6_inbound_frame(
+            r#"{"protocol_version":6,"type":"health"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn v6_outbound_bounds_are_encode_errors() {
+        let call_id = "a".repeat(64);
+        assert!(serialize_v6_core_result(
+            &call_id,
+            Ok(serde_json::Value::String("x".repeat(V6_MAX_JSON_STRING_BYTES)))
+        )
+        .is_ok());
+        assert!(matches!(
+            serialize_v6_core_result(
+                "call",
+                Ok(serde_json::Value::String("x".repeat(V6_MAX_JSON_STRING_BYTES + 1)))
+            ),
+            Err(ExternalError::ProtocolEncode)
+        ));
+        assert!(matches!(
+            serialize_v6_core_result(
+                "call",
+                Err(V6CallError {
+                    kind: "validation".to_owned(),
+                    message: "x".repeat(V6_MAX_JSON_STRING_BYTES + 1),
+                })
+            ),
+            Err(ExternalError::ProtocolEncode)
+        ));
+        assert!(matches!(
+            serialize_v6_core_result(
+                "call",
+                Ok(serde_json::Value::Array(vec![
+                    serde_json::Value::String("x".repeat(V6_MAX_JSON_STRING_BYTES));
+                    V6_MAX_JSON_COLLECTION_ITEMS
+                ]))
+            ),
+            Err(ExternalError::ProtocolEncode)
+        ));
+        assert!(matches!(
+            parse_v6_module_frame(&"x".repeat(MAX_LINE_BYTES + 1)),
+            Err(ExternalError::LineTooLarge)
+        ));
+    }
+
+    #[test]
+    fn v6_core_serializes_lifecycle_frames_with_required_numeric_ids() {
+        let initialize = V6OutboundCoreFrame::Initialize {
+            request_id: "1".to_owned(),
+            module_id: "module".to_owned(),
+        };
+        let execute = V6OutboundCoreFrame::Execute {
+            request_id: "2".to_owned(),
+            command: "run".to_owned(),
+            arguments: "args".to_owned(),
+            argument_entities: vec![],
+        };
+        let event = V6OutboundCoreFrame::Event {
+            request_id: "3".to_owned(),
+            event: MessageEventKind::Created,
+            payload: MessageEvent {
+                event_id: "event".to_owned(),
+                message_ref: "message".to_owned(),
+                message_key: "key".to_owned(),
+                peer_id: Some(1),
+                text: "text".to_owned(),
+                outgoing: true,
+                entities: vec![],
+            },
+        };
+        let health = V6OutboundCoreFrame::Health {
+            request_id: "4".to_owned(),
+        };
+        let shutdown = V6OutboundCoreFrame::Shutdown {
+            request_id: "5".to_owned(),
+        };
+        for frame in [initialize, execute, event, health, shutdown] {
+            let value: serde_json::Value = serde_json::from_str(&frame.serialize().unwrap()).unwrap();
+            assert_eq!(value["protocol_version"], 6);
+            assert!(value.get("request_id").is_some());
+        }
+        assert!(
+            V6OutboundCoreFrame::Health {
+                request_id: "invalid".to_owned()
+            }
+            .serialize()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn v6_core_result_has_only_call_correlation() {
+        let line = V6OutboundCoreFrame::TelegramResult {
+            call_id: "call".to_owned(),
+            result: Err(V6CallError {
+                kind: "validation".to_owned(),
+                message: "bad params".to_owned(),
+            }),
+        }
+        .serialize()
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["type"], "telegram.result");
+        assert!(value.get("request_id").is_none());
+        assert_eq!(value["error"]["kind"], "validation");
+        assert!(
+            V6OutboundCoreFrame::TelegramResult {
+                call_id: "".to_owned(),
+                result: Ok(serde_json::Value::Null),
+            }
+            .serialize()
+            .is_err()
+        );
+    }
 
     fn sample_event(kind: MessageEventKind) -> CoreMessage {
         CoreMessage::Event {
