@@ -2107,12 +2107,12 @@ mod tests {
         aliases::{Alias, AliasStore},
         bot_api::{BotApi, BotApiFuture, BotIdentity},
         commands::{Action, AliasRequest},
-        fastfetch::{FastfetchInputError, FastfetchProfileError, FastfetchResult},
-        external_modules::source_inspection::{
-            ArchiveDigest, ArchiveStatistics, InspectionTimes, InspectionWarning, ModuleInstallPlan,
-            SourceIdentity, SourceKind,
-        },
         external_modules::approval::{APPROVAL_ID_BYTES, ApprovalId},
+        external_modules::source_inspection::{
+            ArchiveDigest, ArchiveStatistics, InspectionTimes, InspectionWarning,
+            ModuleInstallPlan, SourceIdentity, SourceKind,
+        },
+        fastfetch::{FastfetchInputError, FastfetchProfileError, FastfetchResult},
         setup_store::{CompanionToken, PersistedSetupState, SetupStore},
     };
     use grammers_session::types::PeerId;

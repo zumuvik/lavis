@@ -1333,10 +1333,12 @@ mod tests {
             first.plan.telegram_methods,
             vec!["account.updateStatus".to_owned()]
         );
-        assert!(first
-            .plan
-            .warnings
-            .contains(&InspectionWarning::TelegramRawNotSandboxed));
+        assert!(
+            first
+                .plan
+                .warnings
+                .contains(&InspectionWarning::TelegramRawNotSandboxed)
+        );
         let changed_grant = ModuleInstallPlan {
             telegram_methods: vec!["contacts.getContacts".to_owned()],
             ..first.plan.clone()

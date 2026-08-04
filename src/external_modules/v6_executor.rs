@@ -96,46 +96,43 @@ impl V6TelegramExecutor for GrammersV6Executor {
 }
 
 impl GrammersV6Executor {
-    async fn update_status(
-        &self,
-        params: Box<RawValue>,
-    ) -> Result<V6RpcOutput, V6ExecutorError> {
+    async fn update_status(&self, params: Box<RawValue>) -> Result<V6RpcOutput, V6ExecutorError> {
         let params = decode::<UpdateStatusParams>(&params)?;
         let request = grammers_client::tl::functions::account::UpdateStatus {
             offline: params.offline,
         };
-        let result = self.client.invoke(&request).await.map_err(map_invocation_error)?;
+        let result = self
+            .client
+            .invoke(&request)
+            .await
+            .map_err(map_invocation_error)?;
         V6RpcOutput::new(serde_json::Value::Bool(result))
     }
 
-    async fn get_contacts(
-        &self,
-        params: Box<RawValue>,
-    ) -> Result<V6RpcOutput, V6ExecutorError> {
+    async fn get_contacts(&self, params: Box<RawValue>) -> Result<V6RpcOutput, V6ExecutorError> {
         let params = decode::<GetContactsParams>(&params)?;
         let request = grammers_client::tl::functions::contacts::GetContacts {
             hash: parse_decimal_i64(&params.hash)?,
         };
-        let response = self.client.invoke(&request).await.map_err(map_invocation_error)?;
+        let response = self
+            .client
+            .invoke(&request)
+            .await
+            .map_err(map_invocation_error)?;
         // The adapter deliberately exposes no raw users, chats, or access hashes.
         match response {
-            grammers_client::tl::enums::contacts::Contacts::Contacts(response) => {
-                contacts_summary(
-                    response.contacts.len(),
-                    response.users.len(),
-                    response.saved_count,
-                )
-            }
+            grammers_client::tl::enums::contacts::Contacts::Contacts(response) => contacts_summary(
+                response.contacts.len(),
+                response.users.len(),
+                response.saved_count,
+            ),
             grammers_client::tl::enums::contacts::Contacts::NotModified(_) => {
                 contacts_summary(0, 0, 0)
             }
         }
     }
 
-    async fn get_history(
-        &self,
-        params: Box<RawValue>,
-    ) -> Result<V6RpcOutput, V6ExecutorError> {
+    async fn get_history(&self, params: Box<RawValue>) -> Result<V6RpcOutput, V6ExecutorError> {
         let params = decode::<GetHistoryParams>(&params)?;
         require_self_peer(&params.peer)?;
         validate_limit(params.limit)?;
@@ -149,26 +146,26 @@ impl GrammersV6Executor {
             min_id: params.min_id,
             hash: parse_decimal_i64(&params.hash)?,
         };
-        let response = self.client.invoke(&request).await.map_err(map_invocation_error)?;
+        let response = self
+            .client
+            .invoke(&request)
+            .await
+            .map_err(map_invocation_error)?;
         match response {
-            grammers_client::tl::enums::messages::Messages::Messages(response) => {
-                history_summary(
-                    response.messages.len(),
-                    response.topics.len(),
-                    response.chats.len(),
-                    response.users.len(),
-                    params.limit,
-                )
-            }
-            grammers_client::tl::enums::messages::Messages::Slice(response) => {
-                history_summary(
-                    response.messages.len(),
-                    response.topics.len(),
-                    response.chats.len(),
-                    response.users.len(),
-                    params.limit,
-                )
-            }
+            grammers_client::tl::enums::messages::Messages::Messages(response) => history_summary(
+                response.messages.len(),
+                response.topics.len(),
+                response.chats.len(),
+                response.users.len(),
+                params.limit,
+            ),
+            grammers_client::tl::enums::messages::Messages::Slice(response) => history_summary(
+                response.messages.len(),
+                response.topics.len(),
+                response.chats.len(),
+                response.users.len(),
+                params.limit,
+            ),
             grammers_client::tl::enums::messages::Messages::ChannelMessages(response) => {
                 history_summary(
                     response.messages.len(),
@@ -184,10 +181,7 @@ impl GrammersV6Executor {
         }
     }
 
-    async fn get_dialogs(
-        &self,
-        params: Box<RawValue>,
-    ) -> Result<V6RpcOutput, V6ExecutorError> {
+    async fn get_dialogs(&self, params: Box<RawValue>) -> Result<V6RpcOutput, V6ExecutorError> {
         let params = decode::<DialogsInitialParams>(&params)?;
         validate_limit(params.limit)?;
         let request = grammers_client::tl::functions::messages::GetDialogs {
@@ -199,7 +193,11 @@ impl GrammersV6Executor {
             limit: params.limit,
             hash: parse_decimal_i64(&params.hash)?,
         };
-        let response = self.client.invoke(&request).await.map_err(map_invocation_error)?;
+        let response = self
+            .client
+            .invoke(&request)
+            .await
+            .map_err(map_invocation_error)?;
         match response {
             grammers_client::tl::enums::messages::Dialogs::Dialogs(response) => dialogs_summary(
                 response.dialogs.len(),
@@ -314,7 +312,9 @@ fn parse_decimal_i64(value: &str) -> Result<i64, V6ExecutorError> {
             .enumerate()
             .all(|(index, byte)| byte.is_ascii_digit() || (index == 0 && byte == b'-'))
     {
-        return Err(V6ExecutorError::InvalidParams("hash must be decimal string"));
+        return Err(V6ExecutorError::InvalidParams(
+            "hash must be decimal string",
+        ));
     }
     value
         .parse()
@@ -422,10 +422,12 @@ mod tests {
         assert!(default_limit() <= MAX_PAGE_LIMIT);
         assert!(parse_decimal_i64("1").is_ok());
         assert!(parse_decimal_i64("1.0").is_err());
-        assert!(decode::<GetHistoryParams>(&raw(
-            r#"{"peer":{"kind":"self","kind":"other"},"hash":"1"}"#
-        ))
-        .is_err());
+        assert!(
+            decode::<GetHistoryParams>(&raw(
+                r#"{"peer":{"kind":"self","kind":"other"},"hash":"1"}"#
+            ))
+            .is_err()
+        );
         assert!(matches!(
             decode::<DialogsInitialParams>(&raw(r#"{"limit":101,"hash":"1"}"#)),
             Ok(params) if validate_limit(params.limit).is_err()
@@ -439,10 +441,12 @@ mod tests {
     #[test]
     fn output_and_rpc_mapping_are_bounded() {
         assert!(V6RpcOutput::new(serde_json::json!({"ok": true})).is_ok());
-        assert!(V6RpcOutput::new(serde_json::Value::String(
-            "x".repeat(protocol::V6_MAX_JSON_STRING_BYTES + 1)
-        ))
-        .is_err());
+        assert!(
+            V6RpcOutput::new(serde_json::Value::String(
+                "x".repeat(protocol::V6_MAX_JSON_STRING_BYTES + 1)
+            ))
+            .is_err()
+        );
         assert_eq!(
             map_rpc_error(420, "FLOOD_WAIT".to_owned(), Some(4)),
             V6ExecutorError::Rpc {

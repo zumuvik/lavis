@@ -1,6 +1,9 @@
 use std::{path::PathBuf, sync::Arc};
 
-use grammers_client::{Client, client::{ClientConfiguration, NoRetries}};
+use grammers_client::{
+    Client,
+    client::{ClientConfiguration, NoRetries},
+};
 use grammers_mtsender::{SenderPool, SenderPoolFatHandle};
 use grammers_session::storages::SqliteSession;
 use tokio::{sync::mpsc::UnboundedReceiver, task::JoinHandle};

@@ -161,32 +161,38 @@ impl V6OutboundCoreFrame {
             Self::Initialize {
                 request_id,
                 module_id,
-            } => serialize_v6_lifecycle(request_id, serde_json::json!({
-                "protocol_version": 6,
-                "type": "initialize",
-                "request_id": request_id,
-                "module_id": module_id,
-            })),
+            } => serialize_v6_lifecycle(
+                request_id,
+                serde_json::json!({
+                    "protocol_version": 6,
+                    "type": "initialize",
+                    "request_id": request_id,
+                    "module_id": module_id,
+                }),
+            ),
             Self::Execute {
                 request_id,
                 command,
                 arguments,
                 argument_entities,
-            } => serialize_v6_lifecycle(request_id, serde_json::json!({
-                "protocol_version": 6,
-                "type": "execute",
-                "request_id": request_id,
-                "command": command,
-                "arguments": arguments,
-                "context": {
-                    "argument_entities": argument_entities.iter().map(|entity| serde_json::json!({
-                        "type": "custom_emoji",
-                        "offset_utf16": entity.offset_utf16,
-                        "length_utf16": entity.length_utf16,
-                        "document_id": entity.document_id,
-                    })).collect::<Vec<_>>(),
-                },
-            })),
+            } => serialize_v6_lifecycle(
+                request_id,
+                serde_json::json!({
+                    "protocol_version": 6,
+                    "type": "execute",
+                    "request_id": request_id,
+                    "command": command,
+                    "arguments": arguments,
+                    "context": {
+                        "argument_entities": argument_entities.iter().map(|entity| serde_json::json!({
+                            "type": "custom_emoji",
+                            "offset_utf16": entity.offset_utf16,
+                            "length_utf16": entity.length_utf16,
+                            "document_id": entity.document_id,
+                        })).collect::<Vec<_>>(),
+                    },
+                }),
+            ),
             Self::Event {
                 request_id,
                 event,
@@ -208,24 +214,33 @@ impl V6OutboundCoreFrame {
                 if let Some(peer_id) = payload.peer_id {
                     event_payload["peer_id"] = serde_json::json!(peer_id);
                 }
-                serialize_v6_lifecycle(request_id, serde_json::json!({
-                    "protocol_version": 6,
-                    "type": "event",
-                    "request_id": request_id,
-                    "event": event.as_str(),
-                    "payload": event_payload,
-                }))
+                serialize_v6_lifecycle(
+                    request_id,
+                    serde_json::json!({
+                        "protocol_version": 6,
+                        "type": "event",
+                        "request_id": request_id,
+                        "event": event.as_str(),
+                        "payload": event_payload,
+                    }),
+                )
             }
-            Self::Health { request_id } => serialize_v6_lifecycle(request_id, serde_json::json!({
-                "protocol_version": 6,
-                "type": "health",
-                "request_id": request_id,
-            })),
-            Self::Shutdown { request_id } => serialize_v6_lifecycle(request_id, serde_json::json!({
-                "protocol_version": 6,
-                "type": "shutdown",
-                "request_id": request_id,
-            })),
+            Self::Health { request_id } => serialize_v6_lifecycle(
+                request_id,
+                serde_json::json!({
+                    "protocol_version": 6,
+                    "type": "health",
+                    "request_id": request_id,
+                }),
+            ),
+            Self::Shutdown { request_id } => serialize_v6_lifecycle(
+                request_id,
+                serde_json::json!({
+                    "protocol_version": 6,
+                    "type": "shutdown",
+                    "request_id": request_id,
+                }),
+            ),
             Self::TelegramResult { call_id, result } => {
                 serialize_v6_core_result(call_id, result.clone())
             }
@@ -250,12 +265,31 @@ fn serialize_v6_lifecycle(
 
 #[derive(Debug)]
 pub enum V6InboundFrame {
-    Initialized { request_id: String, module_id: String },
-    Result { request_id: String, text: String },
-    Error { request_id: String, code: String, message: String },
-    Health { request_id: String },
-    Log { request_id: String, level: String, message: String },
-    EventResult { request_id: String, actions: Vec<serde_json::Value> },
+    Initialized {
+        request_id: String,
+        module_id: String,
+    },
+    Result {
+        request_id: String,
+        text: String,
+    },
+    Error {
+        request_id: String,
+        code: String,
+        message: String,
+    },
+    Health {
+        request_id: String,
+    },
+    Log {
+        request_id: String,
+        level: String,
+        message: String,
+    },
+    EventResult {
+        request_id: String,
+        actions: Vec<serde_json::Value>,
+    },
     TelegramInvoke(V6ModuleFrame),
 }
 
@@ -394,11 +428,13 @@ pub fn parse_v6_inbound_frame(line: &str) -> Result<V6InboundFrame, ExternalErro
             && !method.is_empty()
             && validate_v6_raw_params(&params).is_ok() =>
         {
-            Ok(V6InboundFrame::TelegramInvoke(V6ModuleFrame::TelegramInvoke {
-                call_id,
-                method,
-                params,
-            }))
+            Ok(V6InboundFrame::TelegramInvoke(
+                V6ModuleFrame::TelegramInvoke {
+                    call_id,
+                    method,
+                    params,
+                },
+            ))
         }
         _ => Err(ExternalError::ProtocolDecode),
     }
@@ -967,11 +1003,8 @@ mod tests {
         )
         .is_err());
 
-        let result = serialize_v6_core_result(
-            "call_1",
-            Ok(serde_json::json!({"offline": true})),
-        )
-        .unwrap();
+        let result =
+            serialize_v6_core_result("call_1", Ok(serde_json::json!({"offline": true}))).unwrap();
         assert!(matches!(
             parse_v6_core_frame(&result),
             Ok(V6CoreFrame::TelegramResult { result: Ok(_), .. })
@@ -1011,31 +1044,38 @@ mod tests {
         )
         .is_err());
         assert!(matches!(
-            parse_v6_inbound_frame(r#"{"protocol_version":6,"type":"initialized","request_id":"1","module_id":"mod"}"#),
+            parse_v6_inbound_frame(
+                r#"{"protocol_version":6,"type":"initialized","request_id":"1","module_id":"mod"}"#
+            ),
             Ok(V6InboundFrame::Initialized { .. })
         ));
         assert!(matches!(
-            parse_v6_inbound_frame(r#"{"protocol_version":6,"type":"event_result","request_id":"2","actions":[]}"#),
+            parse_v6_inbound_frame(
+                r#"{"protocol_version":6,"type":"event_result","request_id":"2","actions":[]}"#
+            ),
             Ok(V6InboundFrame::EventResult { .. })
         ));
-        assert!(parse_v6_inbound_frame(
-            r#"{"protocol_version":6,"type":"health"}"#
-        )
-        .is_err());
+        assert!(parse_v6_inbound_frame(r#"{"protocol_version":6,"type":"health"}"#).is_err());
     }
 
     #[test]
     fn v6_outbound_bounds_are_encode_errors() {
         let call_id = "a".repeat(64);
-        assert!(serialize_v6_core_result(
-            &call_id,
-            Ok(serde_json::Value::String("x".repeat(V6_MAX_JSON_STRING_BYTES)))
-        )
-        .is_ok());
+        assert!(
+            serialize_v6_core_result(
+                &call_id,
+                Ok(serde_json::Value::String(
+                    "x".repeat(V6_MAX_JSON_STRING_BYTES)
+                ))
+            )
+            .is_ok()
+        );
         assert!(matches!(
             serialize_v6_core_result(
                 "call",
-                Ok(serde_json::Value::String("x".repeat(V6_MAX_JSON_STRING_BYTES + 1)))
+                Ok(serde_json::Value::String(
+                    "x".repeat(V6_MAX_JSON_STRING_BYTES + 1)
+                ))
             ),
             Err(ExternalError::ProtocolEncode)
         ));
@@ -1053,7 +1093,9 @@ mod tests {
             serialize_v6_core_result(
                 "call",
                 Ok(serde_json::Value::Array(vec![
-                    serde_json::Value::String("x".repeat(V6_MAX_JSON_STRING_BYTES));
+                    serde_json::Value::String(
+                        "x".repeat(V6_MAX_JSON_STRING_BYTES)
+                    );
                     V6_MAX_JSON_COLLECTION_ITEMS
                 ]))
             ),
@@ -1097,7 +1139,8 @@ mod tests {
             request_id: "5".to_owned(),
         };
         for frame in [initialize, execute, event, health, shutdown] {
-            let value: serde_json::Value = serde_json::from_str(&frame.serialize().unwrap()).unwrap();
+            let value: serde_json::Value =
+                serde_json::from_str(&frame.serialize().unwrap()).unwrap();
             assert_eq!(value["protocol_version"], 6);
             assert!(value.get("request_id").is_some());
         }

@@ -823,7 +823,10 @@ mod tests {
         let path = write_manifest(&dir, &serde_json::to_vec(&json).unwrap());
         let descriptor = validate_manifest_at(&path, Some("echo")).unwrap();
         assert_eq!(descriptor.protocol_version, 6);
-        assert_eq!(descriptor.telegram_methods[0].spec().name, "account.updateStatus");
+        assert_eq!(
+            descriptor.telegram_methods[0].spec().name,
+            "account.updateStatus"
+        );
 
         json.as_object_mut().unwrap().remove("telegram_methods");
         fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
