@@ -114,6 +114,104 @@ Given a fixture that returns an invalid lifecycle response, Lavis must:
 5. expose the same category through `lm info` or `lm logs`;
 6. keep other modules and the Telegram update loop operational.
 
+## Priority 0B: Telegram authorization diagnostics and session recovery
+
+Authorization failures must preserve an actionable, sanitized cause instead of
+collapsing every `Client::is_authorized()` failure into
+`failed to check Telegram authorization status`.
+
+The observed `AUTH_KEY_DUPLICATED` failure is the reference incident for this
+work: the dependency log contained the exact Telegram RPC error, while Lavis
+returned only the generic `AuthError::AuthorizationCheck` wrapper.
+
+### Error classification
+
+- Preserve the safe Telegram RPC code and symbolic error name when available.
+- Distinguish RPC rejection, transport failure, timeout, session-storage
+  failure, malformed local session state, and interactive-authentication
+  failure.
+- Keep a stable internal category such as `auth_key_duplicated` while retaining
+  the original sanitized Telegram name for diagnostics.
+- Do not require global dependency debug logging to discover the root cause.
+- Keep the full error chain available to `anyhow` and structured `tracing`
+  without exposing secrets.
+
+For `AUTH_KEY_DUPLICATED`, startup output must explain that the stored auth key
+has been invalidated and that retrying the same session is not sufficient.
+
+### Single-session protection
+
+- Add an exclusive local lock associated with the session path before opening
+  the Telegram client.
+- Report the PID or service context holding the lock where this can be done
+  safely.
+- Detect and explain the common conflict between an interactive `lavis` process
+  and `lavis.service` using the same session.
+- Document that a copied session must not be used concurrently on another host
+  or through independently routed connections.
+- Release the lock on every clean, failed, cancelled, and panic-unwind exit path
+  supported by the runtime.
+
+A local lock cannot prevent another host from reusing a copied session, but it
+must prevent the most common same-machine duplication.
+
+### Recovery UX
+
+Add commands equivalent to:
+
+```text
+lavis auth doctor
+lavis auth reset --backup
+```
+
+`auth doctor` should report, without reading out secret contents:
+
+- resolved session path;
+- whether a local process lock is held;
+- session file type, ownership, permissions, and basic readability;
+- last sanitized authorization failure category;
+- whether reauthorization is required;
+- whether the application appears to be running as both a service and an
+  interactive process.
+
+`auth reset --backup` must:
+
+1. refuse to run while another process owns the session lock;
+2. stop before modifying an active session;
+3. atomically move the session database and sidecar files into a timestamped
+   backup directory;
+4. preserve restrictive permissions;
+5. print the backup path;
+6. require a fresh Telegram login on the next start.
+
+Lavis must never print or persist the phone number, login code, 2FA password,
+API hash, auth key, session bytes, or unrestricted Telegram response payloads
+as part of diagnostics.
+
+### Authorization regression coverage
+
+Add injectable or fixture-backed tests for:
+
+- `AUTH_KEY_DUPLICATED` returned by `is_authorized()`;
+- generic RPC rejection with a sanitized symbolic name;
+- transport disconnect and timeout;
+- corrupt or unreadable session storage;
+- a second local process attempting to acquire the session lock;
+- backup/reset with SQLite-style `-wal` and `-shm` sidecar files;
+- successful reauthorization after reset;
+- confirmation that secrets never appear in error text, logs, or diagnostics.
+
+### Acceptance gate
+
+Given an `AUTH_KEY_DUPLICATED` fixture, Lavis must:
+
+1. retain the `auth_key_duplicated` category;
+2. emit a structured error with the sanitized RPC name;
+3. explain that the current session cannot be reused;
+4. provide the exact supported recovery command;
+5. exit without repeatedly retrying the invalidated key;
+6. expose no credential or session secret in normal or debug output.
+
 ## Priority 1: finish the API v6 foundation in PR #28
 
 ### CI and source quality
@@ -294,7 +392,10 @@ Every runtime or protocol PR must satisfy all applicable gates:
 - existing protocol fixtures remain green;
 - new wire behavior is documented before merge;
 - user-facing state matches actual filesystem and process state;
-- a failure produces an actionable diagnostic rather than only `Unavailable`.
+- module failures produce actionable diagnostics rather than only
+  `Unavailable`;
+- Telegram authorization failures preserve an actionable sanitized category
+  rather than only `AuthorizationCheck`.
 
 ## Explicit non-goals
 
@@ -303,5 +404,7 @@ Every runtime or protocol PR must satisfy all applicable gates:
 - Loading unreviewed native code in the Lavis process.
 - Building arbitrary source code received through Telegram.
 - Silently modifying user Nix configuration.
+- Printing or persisting Telegram credentials, auth keys, or session contents
+  for debugging.
 - Deprecating working legacy modules before v6 tooling and migration paths are
   complete.
