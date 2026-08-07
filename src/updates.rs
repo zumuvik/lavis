@@ -28,6 +28,8 @@ const MAX_EVENT_DISPATCH_TASKS: usize = 32;
 const PROVISION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const REBOOT_RECEIPT_EDIT_TIMEOUT: Duration = Duration::from_secs(1);
 const REBOOT_RECEIPT_COMPLETION_TIMEOUT: Duration = Duration::from_secs(4);
+const UPDATE_STREAM_RETRY_BASE: Duration = Duration::from_millis(250);
+const UPDATE_STREAM_RETRY_MAX: Duration = Duration::from_secs(5);
 
 struct EventDispatches {
     tasks: JoinSet<()>,
@@ -126,11 +128,14 @@ pub async fn run(
     tokio::pin!(shutdown);
     let mut event_dispatches = EventDispatches::new();
     let mut provision_tasks = ProvisionTasks::new();
+    let mut consecutive_update_errors = 0_u32;
+    let mut update_retry_deadline = None;
 
     loop {
         let setup_timeout = runtime
             .setup_timeout_deadline()
             .map(|deadline| tokio::time::sleep_until(deadline.into()));
+        let retry_deadline = update_retry_deadline;
         tokio::select! {
             signal = &mut shutdown => {
                 signal.context("failed to listen for Ctrl-C shutdown signal")?;
@@ -159,17 +164,51 @@ pub async fn run(
                     send_setup_notification(client, runtime, response).await;
                 }
             }
-            next = event_dispatches.next_update_or_event(stream.next()) => {
+            next = event_dispatches.next_update_or_event(async {
+                if let Some(deadline) = retry_deadline {
+                    tokio::time::sleep_until(deadline).await;
+                }
+                stream.next().await
+            }) => {
                 match next {
                     UpdateOrEvent::Event(Some(Ok(()))) => {}
                     UpdateOrEvent::Event(Some(Err(error))) => tracing::warn!(event = "external_event_task_failed", error = %error, "External event task failed"),
                     UpdateOrEvent::Event(None) => {}
                     UpdateOrEvent::Update(update) => {
-                        if update.is_err() {
-                            event_dispatches.abort_and_drain().await;
-                            provision_tasks.abort_and_drain().await;
-                        }
-                        let update = update.context("Telegram update stream ended or failed")?;
+                        let update = match update {
+                            Ok(update) => {
+                                if consecutive_update_errors > 0 {
+                                    tracing::info!(
+                                        event = "telegram_update_stream_recovered",
+                                        consecutive_errors = consecutive_update_errors,
+                                        "Telegram update stream recovered"
+                                    );
+                                }
+                                consecutive_update_errors = 0;
+                                update_retry_deadline = None;
+                                update
+                            }
+                            Err(error) if is_temporary_telegram_error(&error) => {
+                                consecutive_update_errors = consecutive_update_errors.saturating_add(1);
+                                let retry_delay = update_stream_retry_delay(consecutive_update_errors);
+                                update_retry_deadline = Some(tokio::time::Instant::now() + retry_delay);
+                                tracing::warn!(
+                                    event = "telegram_update_stream_retry",
+                                    error_category = invocation_error_category(&error),
+                                    error = %error,
+                                    consecutive_errors = consecutive_update_errors,
+                                    retry_in_ms = retry_delay.as_millis() as u64,
+                                    "Telegram update stream temporarily failed; retrying"
+                                );
+                                continue;
+                            }
+                            Err(error) => {
+                                event_dispatches.abort_and_drain().await;
+                                provision_tasks.abort_and_drain().await;
+                                return Err(anyhow::Error::new(error)
+                                    .context("Telegram update stream ended or failed"));
+                            }
+                        };
                         // A BotFather RPC is part of processing this update. Keep it
                         // structured (rather than detached), but continue to honor
                         // shutdown and the owned setup deadline while it is pending.
@@ -229,6 +268,26 @@ pub async fn run(
                 }
             }
         }
+    }
+}
+
+fn update_stream_retry_delay(consecutive_errors: u32) -> Duration {
+    let exponent = consecutive_errors.saturating_sub(1).min(5);
+    UPDATE_STREAM_RETRY_BASE
+        .saturating_mul(1_u32 << exponent)
+        .min(UPDATE_STREAM_RETRY_MAX)
+}
+
+fn is_temporary_telegram_error(error: &grammers_client::InvocationError) -> bool {
+    match error {
+        grammers_client::InvocationError::Io(_)
+        | grammers_client::InvocationError::Transport(_)
+        | grammers_client::InvocationError::Dropped => true,
+        grammers_client::InvocationError::Rpc(error) => {
+            error.code == 420 && error.value.unwrap_or(u32::MAX) <= 5
+                || matches!(error.code, 500 | 502 | 503)
+        }
+        _ => false,
     }
 }
 
@@ -681,22 +740,9 @@ async fn telegram_reboot_receipt_edit(
     {
         Ok(Ok(())) => ReceiptEditOutcome::Applied,
         Ok(Err(error)) if error.is("MESSAGE_NOT_MODIFIED") => ReceiptEditOutcome::AlreadyApplied,
-        Ok(Err(error)) if is_temporary_receipt_edit_error(&error) => ReceiptEditOutcome::Temporary,
+        Ok(Err(error)) if is_temporary_telegram_error(&error) => ReceiptEditOutcome::Temporary,
         Ok(Err(_)) => ReceiptEditOutcome::Terminal,
         Err(_) => ReceiptEditOutcome::Temporary,
-    }
-}
-
-fn is_temporary_receipt_edit_error(error: &grammers_client::InvocationError) -> bool {
-    match error {
-        grammers_client::InvocationError::Io(_)
-        | grammers_client::InvocationError::Transport(_)
-        | grammers_client::InvocationError::Dropped => true,
-        grammers_client::InvocationError::Rpc(error) => {
-            error.code == 420 && error.value.unwrap_or(u32::MAX) <= 5
-                || matches!(error.code, 500 | 502 | 503)
-        }
-        _ => false,
     }
 }
 
@@ -908,9 +954,10 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::{
-        EventDispatches, MAX_EVENT_DISPATCH_TASKS, ProvisionTasks, UpdateOrEvent, is_self_authored,
+        EventDispatches, MAX_EVENT_DISPATCH_TASKS, ProvisionTasks, UPDATE_STREAM_RETRY_BASE,
+        UPDATE_STREAM_RETRY_MAX, UpdateOrEvent, is_self_authored, is_temporary_telegram_error,
         provision_completion_text, register_reboot_completion_suppression, route,
-        should_prepare_message_event,
+        should_prepare_message_event, update_stream_retry_delay,
     };
     use crate::commands::{Action, ExternalInvocation, PrefixRequest};
     use crate::{
@@ -924,6 +971,30 @@ mod tests {
         settings::SettingsStore,
     };
     use std::{collections::HashMap, path::PathBuf, time::Instant};
+
+    #[test]
+    fn update_stream_retry_delay_backs_off_and_caps() {
+        assert_eq!(update_stream_retry_delay(1), UPDATE_STREAM_RETRY_BASE);
+        assert_eq!(update_stream_retry_delay(2), Duration::from_millis(500));
+        assert_eq!(update_stream_retry_delay(3), Duration::from_secs(1));
+        assert_eq!(update_stream_retry_delay(4), Duration::from_secs(2));
+        assert_eq!(update_stream_retry_delay(5), Duration::from_secs(4));
+        assert_eq!(update_stream_retry_delay(6), UPDATE_STREAM_RETRY_MAX);
+        assert_eq!(update_stream_retry_delay(u32::MAX), UPDATE_STREAM_RETRY_MAX);
+    }
+
+    #[test]
+    fn update_stream_retries_transient_transport_errors() {
+        assert!(is_temporary_telegram_error(
+            &grammers_client::InvocationError::Dropped
+        ));
+        assert!(is_temporary_telegram_error(
+            &grammers_client::InvocationError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "connection closed",
+            ))
+        ));
+    }
 
     #[tokio::test]
     async fn event_dispatches_limit_pending_tasks_and_skip_overload() {
