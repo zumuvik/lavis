@@ -1,0 +1,24 @@
+Во имя Декларативности, Воспроизводимости и Святого Чистого Хэша.
+Да пребудет с нами inputs.nixpkgs.url,
+Да не замажорится софт без апдейта flake.lock,
+И да минует нас error: builder for '/nix/store/...drv' failed with exit code 1.
+Аминь.
+
+Аминь.
+
+Да будет nix flake check зелен,
+Да сойдёт closure в Cachix,
+Да не иссякнет binary cache,
+И да не воззовет Nix:
+
+hash mismatch in fixed-output derivation
+
+Да сохранит нас --show-trace,
+Да наставит nix why-depends,
+И да очистит грехи поколений:
+
+nix-collect-garbage -d
+
+Во имя nixpkgs, home-manager и system.stateVersion.
+
+Аминь, и nh os switch.
