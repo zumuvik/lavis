@@ -30,6 +30,7 @@ const REBOOT_RECEIPT_EDIT_TIMEOUT: Duration = Duration::from_secs(1);
 const REBOOT_RECEIPT_COMPLETION_TIMEOUT: Duration = Duration::from_secs(4);
 const UPDATE_STREAM_RETRY_BASE: Duration = Duration::from_millis(250);
 const UPDATE_STREAM_RETRY_MAX: Duration = Duration::from_secs(5);
+const UPDATE_STREAM_RESTART_AFTER: u32 = 3;
 
 struct EventDispatches {
     tasks: JoinSet<()>,
@@ -190,6 +191,18 @@ pub async fn run(
                             }
                             Err(error) if is_temporary_telegram_error(&error) => {
                                 consecutive_update_errors = consecutive_update_errors.saturating_add(1);
+                                if consecutive_update_errors >= UPDATE_STREAM_RESTART_AFTER {
+                                    tracing::warn!(
+                                        event = "telegram_update_stream_restart",
+                                        error_category = invocation_error_category(&error),
+                                        error = %error,
+                                        consecutive_errors = consecutive_update_errors,
+                                        "Telegram update stream remains unavailable; restarting Lavis"
+                                    );
+                                    event_dispatches.abort_and_drain().await;
+                                    provision_tasks.abort_and_drain().await;
+                                    return Ok(ShutdownReason::Restart);
+                                }
                                 let retry_delay = update_stream_retry_delay(consecutive_update_errors);
                                 update_retry_deadline = Some(tokio::time::Instant::now() + retry_delay);
                                 tracing::warn!(
@@ -954,10 +967,11 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::{
-        EventDispatches, MAX_EVENT_DISPATCH_TASKS, ProvisionTasks, UPDATE_STREAM_RETRY_BASE,
-        UPDATE_STREAM_RETRY_MAX, UpdateOrEvent, is_self_authored, is_temporary_telegram_error,
-        provision_completion_text, register_reboot_completion_suppression, route,
-        should_prepare_message_event, update_stream_retry_delay,
+        EventDispatches, MAX_EVENT_DISPATCH_TASKS, ProvisionTasks, UPDATE_STREAM_RESTART_AFTER,
+        UPDATE_STREAM_RETRY_BASE, UPDATE_STREAM_RETRY_MAX, UpdateOrEvent, is_self_authored,
+        is_temporary_telegram_error, provision_completion_text,
+        register_reboot_completion_suppression, route, should_prepare_message_event,
+        update_stream_retry_delay,
     };
     use crate::commands::{Action, ExternalInvocation, PrefixRequest};
     use crate::{
@@ -970,10 +984,15 @@ mod tests {
         runtime::RuntimeState,
         settings::SettingsStore,
     };
-    use std::{collections::HashMap, path::PathBuf, time::Instant};
+    use std::{
+        collections::HashMap,
+        path::PathBuf,
+        time::{Duration, Instant},
+    };
 
     #[test]
     fn update_stream_retry_delay_backs_off_and_caps() {
+        assert_eq!(UPDATE_STREAM_RESTART_AFTER, 3);
         assert_eq!(update_stream_retry_delay(1), UPDATE_STREAM_RETRY_BASE);
         assert_eq!(update_stream_retry_delay(2), Duration::from_millis(500));
         assert_eq!(update_stream_retry_delay(3), Duration::from_secs(1));
