@@ -18,7 +18,7 @@ const MAX_NAME_CHARS: usize = 64;
 const MAX_VERSION_CHARS: usize = 32;
 const MAX_AUTHOR_CHARS: usize = 128;
 const MAX_USAGE_CHARS: usize = 256;
-const MAX_V6_TELEGRAM_METHODS: usize = 4;
+const MAX_V6_TELEGRAM_METHODS: usize = v6_registry::METHOD_SPECS.len();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalModuleDescriptor {
@@ -394,7 +394,10 @@ pub fn validate_manifest_at(
     }
     let telegram_method_names = manifest.telegram_methods.unwrap_or_default();
     let has_raw = seen_capabilities.contains(&ExternalCapability::TelegramRaw);
-    if has_raw == telegram_method_names.is_empty()
+    let requests_raw = telegram_method_names
+        .iter()
+        .any(|method| method == "raw.invoke");
+    if has_raw != requests_raw
         || telegram_method_names.len() > MAX_V6_TELEGRAM_METHODS
         || (has_raw && manifest.schema_version != 6)
     {
@@ -813,22 +816,48 @@ mod tests {
     }
 
     #[test]
-    fn v6_raw_methods_are_explicit_reviewed_and_legacy_rejects_the_field() {
+    fn v6_method_grants_preserve_least_privilege_and_legacy_rejects_the_field() {
         let base = temp_dir();
         let dir = create_module_dir(&base, "echo");
         let mut json = serde_json::from_slice::<serde_json::Value>(&valid_manifest_json()).unwrap();
         json["schema_version"] = serde_json::json!(6);
-        json["capabilities"] = serde_json::json!(["telegram.raw"]);
+
+        json["capabilities"] = serde_json::json!(["telegram.account.status"]);
         json["telegram_methods"] = serde_json::json!(["account.updateStatus"]);
         let path = write_manifest(&dir, &serde_json::to_vec(&json).unwrap());
         let descriptor = validate_manifest_at(&path, Some("echo")).unwrap();
-        assert_eq!(descriptor.protocol_version, 6);
         assert_eq!(
             descriptor.telegram_methods[0].spec().name,
             "account.updateStatus"
         );
+        assert!(
+            !descriptor
+                .capabilities
+                .contains(&ExternalCapability::TelegramRaw)
+        );
 
-        json.as_object_mut().unwrap().remove("telegram_methods");
+        json["capabilities"] = serde_json::json!([]);
+        json["telegram_methods"] = serde_json::json!(["contacts.getContacts"]);
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(validate_manifest_at(&path, Some("echo")).is_ok());
+
+        json["telegram_methods"] = serde_json::json!(["raw.invoke"]);
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(matches!(
+            validate_manifest_at(&path, Some("echo")),
+            Err(ExternalError::InvalidCapability)
+        ));
+
+        json["capabilities"] = serde_json::json!(["telegram.raw"]);
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        let descriptor = validate_manifest_at(&path, Some("echo")).unwrap();
+        assert!(
+            descriptor
+                .capabilities
+                .contains(&ExternalCapability::TelegramRaw)
+        );
+
+        json["telegram_methods"] = serde_json::json!(["account.updateStatus"]);
         fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
         assert!(matches!(
             validate_manifest_at(&path, Some("echo")),
@@ -836,14 +865,6 @@ mod tests {
         ));
 
         json["capabilities"] = serde_json::json!([]);
-        json["telegram_methods"] = serde_json::json!(["account.updateStatus"]);
-        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
-        assert!(matches!(
-            validate_manifest_at(&path, Some("echo")),
-            Err(ExternalError::InvalidCapability)
-        ));
-
-        json["capabilities"] = serde_json::json!(["telegram.raw"]);
         json["telegram_methods"] = serde_json::json!(["unknown.method"]);
         fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
         assert!(matches!(
@@ -859,7 +880,6 @@ mod tests {
             Err(ExternalError::InvalidArgument)
         ));
 
-        json["capabilities"] = serde_json::json!([]);
         json["telegram_methods"] = serde_json::json!(["account.updateStatus"]);
         for schema_version in 2..=5 {
             json["schema_version"] = serde_json::json!(schema_version);

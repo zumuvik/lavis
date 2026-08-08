@@ -152,9 +152,7 @@ impl GrammersV6Executor {
                 response.users.len(),
                 response.saved_count,
             ),
-            grammers_client::tl::enums::contacts::Contacts::NotModified => {
-                contacts_summary(0, 0, 0)
-            }
+            grammers_client::tl::enums::contacts::Contacts::NotModified => not_modified_result(),
         }
     }
 
@@ -201,9 +199,7 @@ impl GrammersV6Executor {
                     params.limit,
                 )
             }
-            grammers_client::tl::enums::messages::Messages::NotModified(_) => {
-                history_summary(0, 0, 0, 0, params.limit)
-            }
+            grammers_client::tl::enums::messages::Messages::NotModified(_) => not_modified_result(),
         }
     }
 
@@ -239,9 +235,7 @@ impl GrammersV6Executor {
                 response.users.len(),
                 params.limit,
             ),
-            grammers_client::tl::enums::messages::Dialogs::NotModified(_) => {
-                dialogs_summary(0, 0, 0, 0, params.limit)
-            }
+            grammers_client::tl::enums::messages::Dialogs::NotModified(_) => not_modified_result(),
         }
     }
 
@@ -505,6 +499,10 @@ fn base64_value(byte: u8) -> Result<u8, V6ExecutorError> {
     }
 }
 
+fn not_modified_result() -> Result<V6RpcOutput, V6ExecutorError> {
+    V6RpcOutput::new(serde_json::json!({ "kind": "not_modified" }))
+}
+
 #[derive(Serialize)]
 struct ContactsSummary {
     kind: &'static str,
@@ -670,6 +668,10 @@ mod tests {
                 name: "FLOOD_WAIT".to_owned(),
                 retry_after_seconds: Some(4),
             }
+        );
+        assert_eq!(
+            not_modified_result().unwrap().into_value(),
+            serde_json::json!({"kind": "not_modified"})
         );
         assert_eq!(
             contacts_summary(2, 3, 4).unwrap().into_value(),

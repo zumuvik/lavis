@@ -71,7 +71,7 @@ pub struct ModuleProcess {
 }
 
 #[derive(Debug, Clone, Default)]
-struct StderrCapture {
+pub(crate) struct StderrCapture {
     bytes: Vec<u8>,
     truncated: bool,
 }
@@ -101,7 +101,9 @@ impl StderrCapture {
 
 /// Lock the shared capture, recovering from a poisoned mutex instead of
 /// panicking. The guard is never held across an `.await`.
-fn lock_capture(shared: &Mutex<StderrCapture>) -> std::sync::MutexGuard<'_, StderrCapture> {
+pub(crate) fn lock_capture(
+    shared: &Mutex<StderrCapture>,
+) -> std::sync::MutexGuard<'_, StderrCapture> {
     match shared.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -707,7 +709,7 @@ impl ModuleProcess {
     }
 }
 
-async fn drain_stderr<R>(mut stderr: R, capture: Arc<Mutex<StderrCapture>>)
+pub(crate) async fn drain_stderr<R>(mut stderr: R, capture: Arc<Mutex<StderrCapture>>)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -728,7 +730,7 @@ where
 /// Give the stderr reader a bounded chance to consume bytes already buffered
 /// in the kernel pipe before aborting it. Descendants can retain stderr after
 /// the managed child exits; cleanup must never block on their inherited FD.
-async fn finish_stderr_drain(mut handle: tokio::task::JoinHandle<()>) {
+pub(crate) async fn finish_stderr_drain(mut handle: tokio::task::JoinHandle<()>) {
     if timeout(STDERR_DRAIN_GRACE, &mut handle).await.is_err() {
         handle.abort();
         let _ = handle.await;
@@ -736,7 +738,7 @@ async fn finish_stderr_drain(mut handle: tokio::task::JoinHandle<()>) {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CrashDiagnostics {
+pub(crate) struct CrashDiagnostics {
     module_id: String,
     protocol_version: u32,
     request_id: String,
@@ -748,7 +750,7 @@ struct CrashDiagnostics {
 /// Collect the fields for the crash event without touching `tracing`, so the
 /// assembly is directly testable. Only data the module itself wrote to stderr
 /// is included; protocol frames, environment and credentials are never logged.
-fn build_crash_diagnostics(
+pub(crate) fn build_crash_diagnostics(
     descriptor: &ExternalModuleDescriptor,
     request_id: Option<&str>,
     error: &ExternalError,
@@ -764,7 +766,7 @@ fn build_crash_diagnostics(
     }
 }
 
-fn emit_crash_event(diagnostics: &CrashDiagnostics) {
+pub(crate) fn emit_crash_event(diagnostics: &CrashDiagnostics) {
     tracing::error!(
         event = "external_module_crashed",
         module_id = %diagnostics.module_id,
@@ -777,7 +779,7 @@ fn emit_crash_event(diagnostics: &CrashDiagnostics) {
     );
 }
 
-fn log_module_message(module_id: &str, request_id: &str, level: &str, message: &str) {
+pub(crate) fn log_module_message(module_id: &str, request_id: &str, level: &str, message: &str) {
     match level {
         "error" => tracing::error!(
             event = "external_module_log",

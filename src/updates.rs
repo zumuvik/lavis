@@ -30,7 +30,7 @@ const REBOOT_RECEIPT_EDIT_TIMEOUT: Duration = Duration::from_secs(1);
 const REBOOT_RECEIPT_COMPLETION_TIMEOUT: Duration = Duration::from_secs(4);
 const UPDATE_STREAM_RETRY_BASE: Duration = Duration::from_millis(250);
 const UPDATE_STREAM_RETRY_MAX: Duration = Duration::from_secs(5);
-const UPDATE_STREAM_RESTART_AFTER: u32 = 3;
+const UPDATE_STREAM_RESTART_AFTER: u32 = 12;
 
 struct EventDispatches {
     tasks: JoinSet<()>,
@@ -992,7 +992,7 @@ mod tests {
 
     #[test]
     fn update_stream_retry_delay_backs_off_and_caps() {
-        assert_eq!(UPDATE_STREAM_RESTART_AFTER, 3);
+        assert_eq!(UPDATE_STREAM_RESTART_AFTER, 12);
         assert_eq!(update_stream_retry_delay(1), UPDATE_STREAM_RETRY_BASE);
         assert_eq!(update_stream_retry_delay(2), Duration::from_millis(500));
         assert_eq!(update_stream_retry_delay(3), Duration::from_secs(1));

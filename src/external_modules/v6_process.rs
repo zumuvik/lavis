@@ -1,5 +1,6 @@
 use super::{
     manifest::{ExternalCapability, ExternalModuleDescriptor},
+    process::{self, StderrCapture},
     protocol::{
         self, MessageEvent, MessageEventKind, V6CallError, V6InboundFrame, V6ModuleFrame,
         V6OutboundCoreFrame,
@@ -14,7 +15,7 @@ use std::{
     future,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
@@ -34,7 +35,6 @@ const V6_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 const V6_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 const V6_MAX_ACTIVE_RPCS: usize = V6_RPC_QUEUE;
 const V6_MAX_PENDING: usize = 8;
-const V6_MAX_STDERR_CAPTURE: usize = 16 * 1024;
 
 /// Cloneable front end to the single-owner V6 child-process actor.
 #[derive(Clone)]
@@ -111,7 +111,8 @@ impl V6Process {
         let (rpc_tx, rpc_rx) = mpsc::channel(V6_RPC_QUEUE);
         let reader = tokio::spawn(read_stdout(BufReader::new(stdout), reader_tx));
         let writer = tokio::spawn(write_stdin(stdin, writer_rx, rpc_tx.clone()));
-        let stderr_drain = tokio::spawn(drain_stderr(stderr));
+        let stderr_capture = Arc::new(Mutex::new(StderrCapture::default()));
+        let stderr_drain = tokio::spawn(process::drain_stderr(stderr, stderr_capture.clone()));
         tokio::spawn(supervise(
             child,
             process_group,
@@ -126,6 +127,7 @@ impl V6Process {
                 reader,
                 writer,
                 stderr_drain,
+                stderr_capture,
             },
         ));
         Ok(Self {
@@ -307,6 +309,40 @@ enum Expected {
     EventResult,
 }
 
+#[derive(Clone, Copy)]
+enum FatalReason {
+    Unavailable,
+    ProtocolEncode,
+    ProtocolDecode,
+    LineTooLarge,
+    WrongRequestId,
+    WrongModuleId,
+    ExecutionTimeout,
+    ShutdownTimeout,
+}
+
+impl FatalReason {
+    fn error(self) -> ExternalError {
+        match self {
+            Self::Unavailable => ExternalError::Unavailable,
+            Self::ProtocolEncode => ExternalError::ProtocolEncode,
+            Self::ProtocolDecode => ExternalError::ProtocolDecode,
+            Self::LineTooLarge => ExternalError::LineTooLarge,
+            Self::WrongRequestId => ExternalError::WrongRequestId,
+            Self::WrongModuleId => ExternalError::WrongModuleId,
+            Self::ExecutionTimeout => ExternalError::ExecutionTimeout,
+            Self::ShutdownTimeout => ExternalError::ShutdownTimeout,
+        }
+    }
+
+    fn from_inbound(error: &ExternalError) -> Self {
+        match error {
+            ExternalError::LineTooLarge => Self::LineTooLarge,
+            _ => Self::ProtocolDecode,
+        }
+    }
+}
+
 struct Pending {
     expected: Expected,
     deadline: Instant,
@@ -343,7 +379,8 @@ struct SupervisorIo {
     actor_tx: mpsc::Sender<ActorEvent>,
     reader: JoinHandle<()>,
     writer: JoinHandle<()>,
-    stderr_drain: JoinHandle<Vec<u8>>,
+    stderr_drain: JoinHandle<()>,
+    stderr_capture: Arc<Mutex<StderrCapture>>,
 }
 
 async fn supervise(
@@ -362,6 +399,7 @@ async fn supervise(
         reader,
         writer,
         stderr_drain,
+        stderr_capture,
     } = io;
     let mut pending = HashMap::new();
     let mut active_calls = HashSet::new();
@@ -374,7 +412,8 @@ async fn supervise(
     let mut child_reaped = false;
     let mut reader_open = true;
     let mut control_open = true;
-    let mut force_kill = false;
+    let mut fatal_reason = None;
+    let mut fatal_request_id = None;
     loop {
         tokio::select! {
             child_exit = child.wait(), if stored_child_exit.is_none() => {
@@ -394,6 +433,7 @@ async fn supervise(
                         break;
                     }
                 } else {
+                    fatal_reason = Some(FatalReason::Unavailable);
                     break;
                 }
             }
@@ -404,20 +444,26 @@ async fn supervise(
                     if pending.contains_key(&request_id) { let _ = reply.send(Err(ExternalError::WrongRequestId)); continue; }
                     if pending.len() == V6_MAX_PENDING { let _ = reply.send(Err(ExternalError::Unavailable)); continue; }
                     if queue_writer(&writer_tx, WriterCommand::Frame(frame, Flush::None)).is_err() {
-                        let _ = reply.send(Err(ExternalError::Unavailable));
+                        let _ = reply.send(Err(ExternalError::ProtocolEncode));
+                        fatal_reason = Some(FatalReason::ProtocolEncode);
+                        fatal_request_id = Some(request_id);
                         break;
                     }
                     pending.insert(request_id, Pending { expected, deadline: Instant::now() + V6_LIFECYCLE_TIMEOUT, reply });
                 }
                 Some(Control::Shutdown { request_id, reply }) => {
                     if closing { let _ = reply.send(Err(ExternalError::Unavailable)); }
-                    else if !start_shutdown(&mut closing, &mut pending, &mut workers, &writer_tx, request_id, Some(reply), &mut shutdown_reply) { break; }
+                    else if !start_shutdown(&mut closing, &mut pending, &mut workers, &writer_tx, request_id, Some(reply), &mut shutdown_reply) {
+                        fatal_reason = Some(FatalReason::ProtocolEncode);
+                        break;
+                    }
                 },
                 None => {
                     control_open = false;
                     if !closing
                         && !start_shutdown(&mut closing, &mut pending, &mut workers, &writer_tx, "0".to_owned(), None, &mut shutdown_reply)
                     {
+                        fatal_reason = Some(FatalReason::ProtocolEncode);
                         break;
                     }
                 },
@@ -428,6 +474,7 @@ async fn supervise(
                         if !reserve_call_id(&mut active_calls, &call_id) {
                             // Duplicate call IDs are protocol-fatal even while
                             // closing, so their meaning is never ambiguous.
+                            fatal_reason = Some(FatalReason::ProtocolDecode);
                             break;
                         }
                         if closing {
@@ -459,25 +506,56 @@ async fn supervise(
                         }
                     }
                     frame if terminal_request_id(&frame).is_some() => {
-                        let Some(request_id) = terminal_request_id(&frame) else {
+                        let Some(request_id) = terminal_request_id(&frame).map(str::to_owned) else {
+                            fatal_reason = Some(FatalReason::ProtocolDecode);
                             break;
                         };
-                        if let Some(pending_request) = pending.remove(request_id) {
-                            if !initialized_module_matches(&descriptor, &frame) { let _ = pending_request.reply.send(Err(ExternalError::WrongModuleId)); break; }
-                            else if expected_matches(pending_request.expected, &frame) { let _ = pending_request.reply.send(Ok(frame)); }
-                            else { let _ = pending_request.reply.send(Err(ExternalError::ProtocolDecode)); }
-                        } else { break; }
+                        if let Some(pending_request) = pending.remove(&request_id) {
+                            if !initialized_module_matches(&descriptor, &frame) {
+                                let _ = pending_request.reply.send(Err(ExternalError::WrongModuleId));
+                                fatal_reason = Some(FatalReason::WrongModuleId);
+                                fatal_request_id = Some(request_id);
+                                break;
+                            } else if expected_matches(pending_request.expected, &frame) {
+                                let _ = pending_request.reply.send(Ok(frame));
+                            } else {
+                                let _ = pending_request.reply.send(Err(ExternalError::ProtocolDecode));
+                                fatal_reason = Some(FatalReason::ProtocolDecode);
+                                fatal_request_id = Some(request_id);
+                                break;
+                            }
+                        } else {
+                            fatal_reason = Some(FatalReason::WrongRequestId);
+                            fatal_request_id = Some(request_id);
+                            break;
+                        }
                     }
-                    V6InboundFrame::Log { .. } => {}
-                    _ => break,
+                    V6InboundFrame::Log { request_id, level, message } => {
+                        if !pending.contains_key(&request_id) {
+                            fatal_reason = Some(FatalReason::WrongRequestId);
+                            fatal_request_id = Some(request_id);
+                            break;
+                        }
+                        process::log_module_message(&descriptor.id, &request_id, &level, &message);
+                    }
+                    _ => {
+                        fatal_reason = Some(FatalReason::ProtocolDecode);
+                        break;
+                    },
                 },
-                Some(ActorEvent::Inbound(Err(_))) => break,
+                Some(ActorEvent::Inbound(Err(error))) => {
+                    fatal_reason = Some(FatalReason::from_inbound(&error));
+                    fatal_request_id = single_pending_request_id(&pending);
+                    break;
+                },
                 Some(ActorEvent::ReaderEof) | None => {
                     reader_open = false;
                     if reader_eof_is_fatal(closing) {
                         if let Some(reply) = shutdown_reply.take() {
                             let _ = reply.send(Err(ExternalError::Unavailable));
                         }
+                        fatal_reason = Some(FatalReason::Unavailable);
+                        fatal_request_id = single_pending_request_id(&pending);
                         break;
                     }
                 },
@@ -498,36 +576,66 @@ async fn supervise(
                         break;
                     }
                 }
-                Some(ActorEvent::WriterFailed) | None => { if let Some(reply) = shutdown_reply.take() { let _ = reply.send(Err(ExternalError::Unavailable)); } break; },
+                Some(ActorEvent::WriterFailed) | None => {
+                    if let Some(reply) = shutdown_reply.take() { let _ = reply.send(Err(ExternalError::ProtocolEncode)); }
+                    fatal_reason = Some(FatalReason::ProtocolEncode);
+                    fatal_request_id = single_pending_request_id(&pending);
+                    break;
+                },
                 _ => {}
             },
             _ = async { if let Some(deadline) = shutdown_deadline { tokio::time::sleep_until(deadline).await } else { future::pending::<()>().await } }, if closing => {
                 if let Some(reply) = shutdown_reply.take() { let _ = reply.send(Err(ExternalError::ShutdownTimeout)); }
-                kill_group(process_group);
-                force_kill = true;
+                fatal_reason = Some(FatalReason::ShutdownTimeout);
                 break;
             },
             _ = sleep_until_pending_deadline(&pending), if !pending.is_empty() => {
-                expire_pending(&mut pending);
+                if let Some(request_id) = expired_request_id(&pending) {
+                    fatal_reason = Some(FatalReason::ExecutionTimeout);
+                    fatal_request_id = Some(request_id);
+                    break;
+                }
             },
         }
         while workers.try_join_next().is_some() {}
     }
-    fail_pending(&mut pending);
+    if fatal_request_id.is_none() {
+        fatal_request_id = single_pending_request_id(&pending);
+    }
+    if let Some(reason) = fatal_reason {
+        fail_pending_with(&mut pending, reason);
+    } else {
+        fail_pending(&mut pending);
+    }
     workers.abort_all();
     while workers.join_next().await.is_some() {}
     drop(writer_tx);
     reader.abort();
     writer.abort();
-    stderr_drain.abort();
+
+    // The process group is a separate lifecycle resource from the leader PID.
+    // Always terminate it when the supervisor exits, even when child.wait()
+    // already reaped the leader, so orphaned descendants cannot survive.
+    kill_group(process_group);
+    if !child_reaped && timeout(V6_SHUTDOWN_TIMEOUT, child.wait()).await.is_err() {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+
+    process::finish_stderr_drain(stderr_drain).await;
     let _ = reader.await;
     let _ = writer.await;
-    let _ = stderr_drain.await;
-    if !child_reaped {
-        if force_kill || timeout(V6_SHUTDOWN_TIMEOUT, child.wait()).await.is_err() {
-            kill_group(process_group);
-        }
-        let _ = child.wait().await;
+
+    if let Some(reason) = fatal_reason {
+        let capture = process::lock_capture(&stderr_capture).clone();
+        let error = reason.error();
+        let diagnostics = process::build_crash_diagnostics(
+            &descriptor,
+            fatal_request_id.as_deref(),
+            &error,
+            &capture,
+        );
+        process::emit_crash_event(&diagnostics);
     }
 }
 
@@ -658,15 +766,6 @@ fn validate_invoke(
             message: "duplicate call_id".to_owned(),
         });
     }
-    if !descriptor
-        .capabilities
-        .contains(&ExternalCapability::TelegramRaw)
-    {
-        return Err(V6CallError {
-            kind: "capability".to_owned(),
-            message: "telegram.raw capability is required".to_owned(),
-        });
-    }
     let method = v6_registry::lookup(method).ok_or_else(|| V6CallError {
         kind: "validation".to_owned(),
         message: "gateway method is not recognized".to_owned(),
@@ -676,6 +775,29 @@ fn validate_invoke(
             kind: "capability".to_owned(),
             message: "method is not granted".to_owned(),
         });
+    }
+    match method {
+        v6_registry::V6Method::RawInvoke
+            if !descriptor
+                .capabilities
+                .contains(&ExternalCapability::TelegramRaw) =>
+        {
+            return Err(V6CallError {
+                kind: "capability".to_owned(),
+                message: "telegram.raw capability is required".to_owned(),
+            });
+        }
+        v6_registry::V6Method::AccountUpdateStatus
+            if !descriptor
+                .capabilities
+                .contains(&ExternalCapability::TelegramAccountStatus) =>
+        {
+            return Err(V6CallError {
+                kind: "capability".to_owned(),
+                message: "telegram.account.status capability is required".to_owned(),
+            });
+        }
+        _ => {}
     }
     Ok(method)
 }
@@ -774,16 +896,17 @@ fn reader_eof_is_fatal(closing: bool) -> bool {
     !closing
 }
 
-fn expire_pending(pending: &mut HashMap<String, Pending>) {
+fn expired_request_id(pending: &HashMap<String, Pending>) -> Option<String> {
     let now = Instant::now();
-    let retained = std::mem::take(pending);
-    for (request_id, request) in retained {
-        if request.deadline <= now {
-            let _ = request.reply.send(Err(ExternalError::ExecutionTimeout));
-        } else {
-            pending.insert(request_id, request);
-        }
-    }
+    pending
+        .iter()
+        .find_map(|(request_id, request)| (request.deadline <= now).then(|| request_id.clone()))
+}
+
+fn single_pending_request_id(pending: &HashMap<String, Pending>) -> Option<String> {
+    (pending.len() == 1)
+        .then(|| pending.keys().next().cloned())
+        .flatten()
 }
 
 async fn sleep_until_pending_deadline(pending: &HashMap<String, Pending>) {
@@ -798,6 +921,12 @@ async fn sleep_until_pending_deadline(pending: &HashMap<String, Pending>) {
 fn fail_pending(pending: &mut HashMap<String, Pending>) {
     for (_, request) in pending.drain() {
         let _ = request.reply.send(Err(ExternalError::Unavailable));
+    }
+}
+
+fn fail_pending_with(pending: &mut HashMap<String, Pending>, reason: FatalReason) {
+    for (_, request) in pending.drain() {
+        let _ = request.reply.send(Err(reason.error()));
     }
 }
 
@@ -850,20 +979,6 @@ async fn cleanup_spawned_child(child: &mut Child, pid: Option<u32>) {
     let _ = child.wait().await;
 }
 
-async fn drain_stderr(mut stderr: tokio::process::ChildStderr) -> Vec<u8> {
-    let mut captured = Vec::with_capacity(V6_MAX_STDERR_CAPTURE);
-    let mut chunk = [0u8; 1024];
-    loop {
-        match stderr.read(&mut chunk).await {
-            Ok(0) | Err(_) => return captured,
-            Ok(read) => {
-                let remaining = V6_MAX_STDERR_CAPTURE.saturating_sub(captured.len());
-                captured.extend_from_slice(&chunk[..read.min(remaining)]);
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -892,6 +1007,29 @@ mod tests {
         let descriptor = descriptor();
         assert!(
             matches!(validate_invoke(&descriptor, "account.updateStatus", true), Err(V6CallError { kind, .. }) if kind == "capability")
+        );
+    }
+
+    #[test]
+    fn curated_methods_do_not_require_raw_but_raw_does() {
+        let mut descriptor = descriptor();
+        descriptor.telegram_methods = vec![v6_registry::V6Method::ContactsGetContacts];
+        assert_eq!(
+            validate_invoke(&descriptor, "contacts.getContacts", true).unwrap(),
+            v6_registry::V6Method::ContactsGetContacts
+        );
+
+        descriptor.telegram_methods = vec![v6_registry::V6Method::RawInvoke];
+        assert!(matches!(
+            validate_invoke(&descriptor, "raw.invoke", true),
+            Err(V6CallError { kind, .. }) if kind == "capability"
+        ));
+        descriptor
+            .capabilities
+            .push(ExternalCapability::TelegramRaw);
+        assert_eq!(
+            validate_invoke(&descriptor, "raw.invoke", true).unwrap(),
+            v6_registry::V6Method::RawInvoke
         );
     }
 
@@ -967,7 +1105,8 @@ mod tests {
                 reply,
             },
         );
-        expire_pending(&mut pending);
+        assert_eq!(expired_request_id(&pending), Some("1".to_owned()));
+        fail_pending_with(&mut pending, FatalReason::ExecutionTimeout);
         assert!(pending.is_empty());
         assert!(matches!(
             receiver.try_recv(),
@@ -1042,7 +1181,11 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let descendant: i32 = fs::read_to_string(&pid_path).unwrap().trim().parse().unwrap();
+        let descendant: i32 = fs::read_to_string(&pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
 
         for _ in 0..100 {
             if process.status() == super::super::process::ProcessStatus::Crashed {
@@ -1058,8 +1201,8 @@ mod tests {
         let mut alive = true;
         for _ in 0..200 {
             let result = unsafe { libc::kill(descendant, 0) };
-            alive = result == 0
-                || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+            alive =
+                result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
             if !alive {
                 break;
             }
