@@ -815,6 +815,8 @@ impl RuntimeState {
         match request {
             LmRequest::Overview | LmRequest::List => self.render_lm_list().await,
             LmRequest::Info { id } => self.lm_info(id).await,
+            LmRequest::Logs { id } => self.lm_logs(id).await,
+            LmRequest::Doctor { id } => self.lm_doctor(id.as_deref()).await,
             LmRequest::Invalid => Response::plain(lm_usage(self.prefix())),
             LmRequest::Install => {
                 self.inspect_module_install(client, message_context.message)
@@ -846,8 +848,12 @@ impl RuntimeState {
                 );
             }
         };
+        let fresh_snapshot = match &self.external_manager {
+            Some(handle) => handle.snapshot().await,
+            None => self.external_snapshot.clone(),
+        };
         let mut statuses = list.modules.iter().map(|entry| match &entry.module {
-            Some(module) => format!("• {}\n  ID: {}\n  Версия: {}\n  Состояние: {}\n  Источник: {}\n  Runtime: {}\n  Автор: {}\n  Команд: {}", module.display_name, module.id, module.version, enabled_label(module.enabled), management_label(module.management), runtime_status(self, &module.id), module.author, module.commands.len()),
+            Some(module) => format!("• {}\n  ID: {}\n  Версия: {}\n  Состояние: {}\n  Источник: {}\n  Runtime: {}\n  Автор: {}\n  Команд: {}", module.display_name, module.id, module.version, enabled_label(module.enabled), management_label(module.management), runtime_status_from_snapshot(&fresh_snapshot, &module.id), module.author, module.commands.len()),
             None => format!("• {}\n  Диагностика: {}\n  Состояние: {}\n  Источник: {}", entry.id.as_deref().unwrap_or("некорректный ID"), diagnostic_label(entry.diagnostic.as_ref()), enabled_label(entry.enabled), management_label(entry.management)),
         }).collect::<Vec<_>>();
         for id in state.enabled_ids() {
@@ -879,6 +885,112 @@ impl RuntimeState {
         )
     }
 
+    async fn lm_logs(&self, id: &str) -> Response {
+        let Some(handle) = &self.external_manager else {
+            return Response::plain("⚠️ Runtime внешних модулей недоступен.".to_owned());
+        };
+        match handle.diagnostic_text(id).await {
+            Some(diagnostic) => Response::plain(format!(
+                "📋 Последняя ошибка модуля {id}
+
+{diagnostic}"
+            )),
+            None => Response::plain(format!(
+                "ℹ️ Для модуля {id} нет сохранённой runtime-ошибки."
+            )),
+        }
+    }
+
+    /// Health checklist over the module runtime: per-module state, process
+    /// status, and the last retained crash diagnostic (including failures that
+    /// happened before the process left the running index). With an ID the
+    /// report is narrowed to one module; without one it covers all modules.
+    async fn lm_doctor(&self, id: Option<&str>) -> Response {
+        let Some(config) = &self.module_control else {
+            return Response::plain("⚠️ Управление внешними модулями недоступно.".to_owned());
+        };
+        let state = match ExternalStateStore::load(config.state_path.clone()).await {
+            Ok(state) => state,
+            Err(_) => {
+                return Response::plain("⚠️ Состояние внешних модулей недоступно.".to_owned());
+            }
+        };
+        let list = match control::list_modules(&config.root, &config.declarative_state_path, &state)
+        {
+            Ok(list) => list,
+            Err(_) => {
+                return Response::plain(
+                    "⚠️ Не удалось прочитать список внешних модулей.".to_owned(),
+                );
+            }
+        };
+        let mut lines = Vec::new();
+        for entry in &list.modules {
+            if let Some(module) = &entry.module {
+                if let Some(target) = id
+                    && module.id != target
+                {
+                    continue;
+                }
+                let runtime = fresh_runtime_status(
+                    self.external_manager.as_ref(),
+                    &self.external_snapshot,
+                    &module.id,
+                )
+                .await;
+                let diagnostic = if let Some(handle) = &self.external_manager {
+                    handle
+                        .diagnostic_summary(&module.id)
+                        .await
+                        .map(|summary| format!("\n  Последний сбой: {summary}"))
+                } else {
+                    None
+                };
+                lines.push(format!(
+                    "• {}\n  ID: {}\n  Состояние: {}\n  Runtime: {}\n  Управление: {}{}",
+                    module.display_name,
+                    module.id,
+                    enabled_label(module.enabled),
+                    runtime,
+                    management_label(module.management),
+                    diagnostic.unwrap_or_default(),
+                ));
+            }
+        }
+        for enabled in state.enabled_ids() {
+            let listed = list
+                .modules
+                .iter()
+                .any(|entry| entry.id.as_deref() == Some(enabled));
+            if !listed
+                && let Some(target) = id
+                && enabled != target
+            {
+                continue;
+            }
+            lines.push(format!(
+                "• {enabled}\n  Статус: включён, но каталог отсутствует"
+            ));
+        }
+        let Some(target) = id else {
+            return Response::plain(format!(
+                "🩺 Диагностика внешних модулей\n\n{}",
+                if lines.is_empty() {
+                    "Внешние модули не установлены.".to_owned()
+                } else {
+                    lines.join("\n\n")
+                }
+            ));
+        };
+        if lines.is_empty() {
+            return Response::plain(format!("ℹ️ Модуль {target} не найден."));
+        }
+        Response::plain(format!(
+            "🩺 Диагностика модуля {target}\n\n{}",
+            lines.join("\n\n")
+        ))
+    }
+
     async fn lm_info(&self, id: &str) -> Response {
         let Some(config) = &self.module_control else {
             return Response::plain("⚠️ Управление внешними модулями недоступно.".to_owned());
@@ -889,9 +1001,14 @@ impl RuntimeState {
                 return Response::plain("⚠️ Состояние внешних модулей недоступно.".to_owned());
             }
         };
+        let diagnostic = if let Some(handle) = &self.external_manager {
+            handle.diagnostic_text(id).await
+        } else {
+            None
+        };
         match control::module_info(&config.root, &config.declarative_state_path, &state, id) {
             Ok(module) => Response::plain(format!(
-                "📦 {}\nID: {}\nВерсия: {}\nАвтор: {}\nСостояние: {}\nИсточник: {}\nТочка входа: {}\nSchema/API protocol: v{}\nВозможности: {}\nПредоставляемые команды: {}",
+                "📦 {}\nID: {}\nВерсия: {}\nАвтор: {}\nСостояние: {}\nИсточник: {}\nТочка входа: {}\nSchema/API protocol: v{}\nВозможности: {}\nПредоставляемые команды: {}\nRuntime: {}\nПоследняя ошибка: {}",
                 module.display_name,
                 module.id,
                 module.version,
@@ -901,7 +1018,14 @@ impl RuntimeState {
                 module.entrypoint,
                 module.protocol_version,
                 capabilities_label(&module.capabilities),
-                commands_label(&module.commands)
+                commands_label(&module.commands),
+                fresh_runtime_status(
+                    self.external_manager.as_ref(),
+                    &self.external_snapshot,
+                    &module.id
+                )
+                .await,
+                diagnostic.as_deref().unwrap_or("нет")
             )),
             Err(control::ModuleControlError::InvalidInstalledModule) => {
                 Response::plain("⚠️ Манифест установленного модуля некорректен.".to_owned())
@@ -928,7 +1052,12 @@ impl RuntimeState {
                 .await
         };
         match result {
-            Ok(operation) if operation.changed => Response::plain(format!("✅ Модуль «{}» {}.\n\nДля применения изменений выполните:\n,reboot", operation.module.display_name, if enabled { "включён" } else { "отключён" })),
+            Ok(operation) if operation.changed => Response::plain(format!(
+                "✅ Модуль «{}» {}.\n\nДля применения изменений выполните:\n{}reboot",
+                operation.module.display_name,
+                if enabled { "включён" } else { "отключён" },
+                self.prefix(),
+            )),
             Ok(operation) => Response::plain(format!("ℹ️ Модуль «{}» уже {}.", operation.module.display_name, if enabled { "включён" } else { "отключён" })),
             Err(control::ModuleControlError::DeclarativelyManaged) => Response::plain("⚠️ Модуль управляется декларативно через NixOS. Измените services.lavis.extensions и выполните nh os switch.".to_owned()),
             Err(_) => Response::plain("⚠️ Не удалось изменить состояние модуля.".to_owned()),
@@ -1322,14 +1451,24 @@ fn diagnostic_label(diagnostic: Option<&control::ModuleDiagnostic>) -> &'static 
     }
 }
 
-fn runtime_status<'a>(runtime: &'a RuntimeState, id: &str) -> &'a str {
-    runtime
-        .external_snapshot
+fn runtime_status_from_snapshot<'a>(snapshot: &'a ExternalRuntimeSnapshot, id: &str) -> &'a str {
+    snapshot
         .module_statuses
         .iter()
         .find(|status| status.id == id)
         .map(|status| status.status)
         .unwrap_or("не запущен")
+}
+
+async fn fresh_runtime_status(
+    handle: Option<&ExternalManagerHandle>,
+    cached: &ExternalRuntimeSnapshot,
+    id: &str,
+) -> String {
+    match handle {
+        Some(handle) => runtime_status_from_snapshot(&handle.snapshot().await, id).to_owned(),
+        None => runtime_status_from_snapshot(cached, id).to_owned(),
+    }
 }
 
 fn capabilities_label(capabilities: &[ExternalCapability]) -> String {
@@ -1360,7 +1499,7 @@ fn commands_label(
 
 fn lm_usage(prefix: &str) -> String {
     format!(
-        "⚠️ Использование:\n{prefix}lm\n{prefix}lm list\n{prefix}lm info <id>\n{prefix}lm install\n{prefix}lm confirm <ApprovalId>\n{prefix}lm cancel <ApprovalId>\n{prefix}lm enable <id>\n{prefix}lm disable <id>"
+        "⚠️ Использование:\n{prefix}lm\n{prefix}lm list\n{prefix}lm info <id>\n{prefix}lm logs <id>\n{prefix}lm doctor [<id>]\n{prefix}lm install\n{prefix}lm confirm <ApprovalId>\n{prefix}lm cancel <ApprovalId>\n{prefix}lm enable <id>\n{prefix}lm disable <id>"
     )
 }
 
@@ -1401,7 +1540,7 @@ fn render_install_plan(
         }
     };
     format!(
-        "📋 План установки\n\nИсточник: {source}\nМодуль: {} v{}\nПротокол: {}\nТочка входа: {}\nКоманда по умолчанию: {}\nSHA-256: {}\nОтпечаток: {}\nАрхив: {} Байт, файлов: {}, сжато: {} Байт, распаковано: {} Байт\nВозможности: {}\nПодписки: {}\nДействия: {}\nПредупреждения: {}\n\nApprovalId: {approval_id}\nПодтвердите: {prefix}lm confirm {approval_id}\nОтменить: {prefix}lm cancel {approval_id}\nСрок действия: 10 минут.",
+        "📋 План установки\n\nИсточник: {source}\nМодуль: {} v{}\nПротокол: {}\nТочка входа: {}\nКоманда по умолчанию: {}\nSHA-256: {}\nОтпечаток: {}\nАрхив: {} Байт, файлов: {}, сжато: {} Байт, распаковано: {} Байт\nВозможности: {}\nПодписки: {}\nМетоды Telegram V6: {}\nДействия: {}\nПредупреждения: {}\n\nApprovalId: {approval_id}\nПодтвердите: {prefix}lm confirm {approval_id}\nОтменить: {prefix}lm cancel {approval_id}\nСрок действия: 10 минут.",
         plan.module_id,
         plan.module_version,
         plan.protocol_version,
@@ -1415,6 +1554,7 @@ fn render_install_plan(
         plan.archive.expanded_bytes,
         bounded_list(&plan.capabilities),
         bounded_list(&plan.subscriptions),
+        bounded_list(&plan.telegram_methods),
         bounded_list(&plan.actions),
         bounded_list(
             &plan
@@ -2099,13 +2239,18 @@ mod tests {
         MODULE_MUTATION_DENIED, ProcStats, REBOOT_DENIED, SensitiveCommandDenial,
         SensitiveCommandPolicy, authorize_sensitive_message, bounded_list,
         external_event_error_category, fastfetch_response, format_duration, format_latency,
-        format_stats, lm_usage, parse_memory_kib, parse_system_uptime,
+        format_stats, lm_usage, parse_memory_kib, parse_system_uptime, render_install_plan,
     };
     use crate::response::Response;
     use crate::{
         aliases::{Alias, AliasStore},
         bot_api::{BotApi, BotApiFuture, BotIdentity},
         commands::{Action, AliasRequest},
+        external_modules::approval::{APPROVAL_ID_BYTES, ApprovalId},
+        external_modules::source_inspection::{
+            ArchiveDigest, ArchiveStatistics, InspectionTimes, InspectionWarning,
+            ModuleInstallPlan, SourceIdentity, SourceKind,
+        },
         fastfetch::{FastfetchInputError, FastfetchProfileError, FastfetchResult},
         setup_store::{CompanionToken, PersistedSetupState, SetupStore},
     };
@@ -2115,6 +2260,38 @@ mod tests {
         path::PathBuf,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn install_plan_renders_bounded_v6_method_grants() {
+        let plan = ModuleInstallPlan {
+            source_kind: SourceKind::Archive,
+            source_identity: SourceIdentity::Archive,
+            module_id: "raw".to_owned(),
+            module_version: "1".to_owned(),
+            protocol_version: 6,
+            entrypoint: "run".to_owned(),
+            default_command: None,
+            archive_digest: ArchiveDigest::from_hex(&"0".repeat(64)).unwrap(),
+            archive: ArchiveStatistics {
+                archive_bytes: 1,
+                file_count: 1,
+                compressed_bytes: 1,
+                expanded_bytes: 1,
+            },
+            warnings: vec![InspectionWarning::TelegramRawNotSandboxed],
+            times: InspectionTimes {
+                inspected_unix_seconds: 0,
+                expires_unix_seconds: 0,
+            },
+            capabilities: vec!["telegram.raw".to_owned()],
+            subscriptions: vec![],
+            telegram_methods: vec!["account.updateStatus".to_owned()],
+            actions: vec![],
+            fingerprint: "fingerprint".to_owned(),
+        };
+        let approval_id = ApprovalId::from_bytes([0; APPROVAL_ID_BYTES]);
+        assert!(render_install_plan(&plan, approval_id, ".").contains("account.updateStatus"));
+    }
 
     #[test]
     fn sensitive_command_policies_distinguish_saved_messages_from_reboot_dialogs() {
@@ -2165,12 +2342,16 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     async fn runtime_with_alias() -> (super::RuntimeState, PathBuf) {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let directory =
-            std::env::temp_dir().join(format!("lavis-runtime-show-{}-{nonce}", std::process::id()));
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "lavis-runtime-show-{}-{nonce}-{seq}",
+            std::process::id()
+        ));
         fs::create_dir_all(&directory).unwrap();
         let path = directory.join("aliases.json");
         let mut aliases = AliasStore::load(path).await.unwrap();
@@ -2222,6 +2403,186 @@ mod tests {
         assert!(runtime.setup_timeout_deadline().is_none());
         assert!(runtime.setup_protects_message(botfather, false));
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn lm_doctor_reports_installed_modules_and_unknown_targets() {
+        use std::os::unix::fs::PermissionsExt;
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "lavis-runtime-doctor-{}-{nonce}-{seq}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+
+        // One valid installed module (disabled) with an executable entrypoint.
+        let module_dir = directory.join("sample");
+        fs::create_dir_all(&module_dir).unwrap();
+        fs::write(
+            module_dir.join("module.json"),
+            br#"{"schema_version":6,"id":"sample","name":"Sample","version":"1","author":"A","entrypoint":"run","capabilities":[],"telegram_methods":[],"commands":[{"name":"go","summary_ru":"x","description_ru":"x","usage":"<value>"}]}"#,
+        )
+        .unwrap();
+        let entrypoint = module_dir.join("run");
+        fs::write(&entrypoint, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&entrypoint, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let (mut runtime, state_directory) = runtime_with_alias().await;
+        runtime.configure_module_control(
+            directory.clone(),
+            directory.join("state.json"),
+            directory.join("declarative.json"),
+            PeerId::user(1).unwrap(),
+        );
+
+        let doctor_all = runtime.lm_doctor(None).await;
+        assert!(doctor_all.text.contains("🩺 Диагностика внешних модулей"));
+        assert!(doctor_all.text.contains("sample"));
+        assert!(doctor_all.text.contains("Runtime: не запущен"));
+        assert!(!doctor_all.text.contains("Последний сбой"));
+
+        let doctor_one = runtime.lm_doctor(Some("sample")).await;
+        assert!(doctor_one.text.contains("🩺 Диагностика модуля sample"));
+        assert!(doctor_one.text.contains("sample"));
+
+        let doctor_missing = runtime.lm_doctor(Some("absent")).await;
+        assert!(doctor_missing.text.contains("Модуль absent не найден."));
+
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(state_directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lm_status_commands_use_a_fresh_snapshot_after_asynchronous_v6_crash() {
+        use std::{os::unix::fs::PermissionsExt, sync::Arc};
+
+        struct NoopExecutor;
+        impl crate::external_modules::v6_executor::V6TelegramExecutor for NoopExecutor {
+            fn execute<'a>(
+                &'a self,
+                _context: crate::external_modules::v6_executor::V6ExecutionContext,
+                _method: crate::external_modules::v6_registry::V6Method,
+                _params: Box<serde_json::value::RawValue>,
+            ) -> crate::external_modules::v6_executor::V6ExecutorFuture<'a> {
+                Box::pin(async {
+                    Err(crate::external_modules::v6_executor::V6ExecutorError::Transport)
+                })
+            }
+        }
+
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "lavis-runtime-fresh-status-{}-{nonce}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let module_dir = directory.join("sample");
+        fs::create_dir_all(&module_dir).unwrap();
+        let python = std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+            .map(|directory| directory.join("python3"))
+            .find(|candidate| candidate.is_file())
+            .expect("fixture tests require python3 in PATH");
+        let entrypoint = module_dir.join("run");
+        let script = format!(
+            "#!{}\nimport json, sys, time\nframe = json.loads(sys.stdin.readline())\nprint(json.dumps({{'protocol_version':6,'type':'initialized','request_id':frame['request_id'],'module_id':'sample'}}), flush=True)\nframe = json.loads(sys.stdin.readline())\nprint(json.dumps({{'protocol_version':6,'type':'health','request_id':frame['request_id']}}), flush=True)\ntime.sleep(0.4)\nsys.exit(7)\n",
+            python.display()
+        );
+        fs::write(&entrypoint, script).unwrap();
+        fs::set_permissions(&entrypoint, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(
+            module_dir.join("module.json"),
+            br#"{"schema_version":6,"id":"sample","name":"Sample","version":"1","author":"A","entrypoint":"run","capabilities":[],"telegram_methods":[],"commands":[{"name":"go","summary_ru":"x","description_ru":"x","usage":"<value>"}]}"#,
+        )
+        .unwrap();
+        let descriptor = crate::external_modules::manifest::validate_manifest_at(
+            &module_dir.join("module.json"),
+            Some("sample"),
+        )
+        .unwrap();
+        crate::external_modules::v6_process::set_test_state_base(directory.join("state-base"));
+        let handle = crate::external_modules::manager::ExternalManagerHandle::new(
+            crate::external_modules::manager::ExternalManager::new(),
+        );
+        {
+            let mut manager = handle.lock().await;
+            manager.set_descriptors(vec![descriptor]);
+            manager.set_v6_executor(Arc::new(NoopExecutor));
+        }
+        handle
+            .startup_enabled(&std::collections::BTreeSet::from(["sample".to_owned()]))
+            .await;
+
+        let (mut runtime, state_directory) = runtime_with_alias().await;
+        runtime.configure_module_control(
+            directory.clone(),
+            directory.join("state.json"),
+            directory.join("declarative.json"),
+            PeerId::user(1).unwrap(),
+        );
+        runtime.set_external_manager(handle.clone()).await;
+        assert_eq!(
+            runtime.external_snapshot.module_statuses[0].status, "активен",
+            "the cached routing snapshot intentionally predates the crash"
+        );
+        for _ in 0..200 {
+            if handle
+                .snapshot()
+                .await
+                .module_statuses
+                .iter()
+                .any(|status| status.id == "sample" && status.status == "ошибка")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            handle
+                .snapshot()
+                .await
+                .module_statuses
+                .iter()
+                .any(|status| status.id == "sample" && status.status == "ошибка")
+        );
+
+        assert!(
+            runtime
+                .render_lm_list()
+                .await
+                .text
+                .contains("Runtime: ошибка")
+        );
+        assert!(
+            runtime
+                .lm_info("sample")
+                .await
+                .text
+                .contains("Runtime: ошибка")
+        );
+        assert!(
+            runtime
+                .lm_doctor(Some("sample"))
+                .await
+                .text
+                .contains("Runtime: ошибка")
+        );
+
+        handle.shutdown_all().await;
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(state_directory).unwrap();
     }
 
     #[tokio::test]
@@ -2672,16 +3033,19 @@ for line in sys.stdin:
                     )
                     .into_iter()
                     .collect(),
+                telegram_methods: vec![],
                 actions: vec![],
                 commands: vec![],
             }
         }
 
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let directory = std::env::temp_dir().join(format!("lavis-runtime-events-{nonce}"));
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!("lavis-runtime-events-{nonce}-{seq}"));
         fs::create_dir_all(&directory).unwrap();
         let python = std::env::var_os("PATH")
             .into_iter()
@@ -2955,7 +3319,7 @@ for line in sys.stdin:
     fn lm_usage_lists_each_supported_form() {
         assert_eq!(
             lm_usage("."),
-            "⚠️ Использование:\n.lm\n.lm list\n.lm info <id>\n.lm install\n.lm confirm <ApprovalId>\n.lm cancel <ApprovalId>\n.lm enable <id>\n.lm disable <id>"
+            "⚠️ Использование:\n.lm\n.lm list\n.lm info <id>\n.lm logs <id>\n.lm doctor [<id>]\n.lm install\n.lm confirm <ApprovalId>\n.lm cancel <ApprovalId>\n.lm enable <id>\n.lm disable <id>"
         );
     }
 }

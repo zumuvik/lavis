@@ -357,7 +357,7 @@ fn alias_primary(prefix: &str, command: &CommandDefinition, module_name: &str) -
 
 fn lm_primary(prefix: &str, command: &CommandDefinition, module_name: &str) -> String {
     format!(
-        "{}\n\nИспользование: {prefix}{}\nМодуль: {module_name}\nРиск: {}\n\n{prefix}lm list — список модулей; {prefix}lm info <id> — сведения. В Saved Messages прикрепите .lmod и отправьте {prefix}lm install: код не запускается, показывается inspection-план.\nПроверьте план. Подтвердите полный ApprovalId: {prefix}lm confirm <approval-id>; отмена: {prefix}lm cancel <approval-id>.\n\n{prefix}lm enable <id> и {prefix}lm disable <id> изменяют состояние только для следующего перезапуска.\n\nApprovalId — одноразовый Crockford Base32 идентификатор XXXX-XXXX-XXXX-XXXX, действует ровно 10 минут и не может быть использовано повторно.\n\nПосле установки модуль остаётся disabled и не запускается автоматически. ⚠️ Внешний модуль — исполняемый код без системной песочницы.",
+        "{}\n\nИспользование: {prefix}{}\nМодуль: {module_name}\nРиск: {}\n\n{prefix}lm list — список модулей; {prefix}lm info <id> — сведения; {prefix}lm logs <id> — последняя runtime-ошибка; {prefix}lm doctor [<id>] — диагностика состояния модулей. В Saved Messages прикрепите .lmod и отправьте {prefix}lm install: код не запускается, показывается inspection-план.\nПроверьте план. Подтвердите полный ApprovalId: {prefix}lm confirm <approval-id>; отмена: {prefix}lm cancel <approval-id>.\n\n{prefix}lm enable <id> и {prefix}lm disable <id> изменяют состояние только для следующего перезапуска.\n\nApprovalId — одноразовый Crockford Base32 идентификатор XXXX-XXXX-XXXX-XXXX, действует ровно 10 минут и не может быть использовано повторно.\n\nПосле установки модуль остаётся disabled и не запускается автоматически. ⚠️ Внешний модуль — исполняемый код без системной песочницы.",
         command.description_ru,
         command.usage,
         risk_label(command.risk)
@@ -493,11 +493,13 @@ mod tests {
     }
 
     async fn aliases_with_core_alias() -> (AliasStore, PathBuf) {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let directory = std::env::temp_dir().join(format!("lavis-help-{nonce}"));
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!("lavis-help-{nonce}-{seq}"));
         fs::create_dir_all(&directory).unwrap();
         let mut aliases = AliasStore::load(directory.join("aliases.json"))
             .await

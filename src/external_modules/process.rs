@@ -13,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
@@ -71,7 +71,7 @@ pub struct ModuleProcess {
 }
 
 #[derive(Debug, Clone, Default)]
-struct StderrCapture {
+pub(crate) struct StderrCapture {
     bytes: Vec<u8>,
     truncated: bool,
 }
@@ -101,7 +101,9 @@ impl StderrCapture {
 
 /// Lock the shared capture, recovering from a poisoned mutex instead of
 /// panicking. The guard is never held across an `.await`.
-fn lock_capture(shared: &Mutex<StderrCapture>) -> std::sync::MutexGuard<'_, StderrCapture> {
+pub(crate) fn lock_capture(
+    shared: &Mutex<StderrCapture>,
+) -> std::sync::MutexGuard<'_, StderrCapture> {
     match shared.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -707,7 +709,7 @@ impl ModuleProcess {
     }
 }
 
-async fn drain_stderr<R>(mut stderr: R, capture: Arc<Mutex<StderrCapture>>)
+pub(crate) async fn drain_stderr<R>(mut stderr: R, capture: Arc<Mutex<StderrCapture>>)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -728,7 +730,7 @@ where
 /// Give the stderr reader a bounded chance to consume bytes already buffered
 /// in the kernel pipe before aborting it. Descendants can retain stderr after
 /// the managed child exits; cleanup must never block on their inherited FD.
-async fn finish_stderr_drain(mut handle: tokio::task::JoinHandle<()>) {
+pub(crate) async fn finish_stderr_drain(mut handle: tokio::task::JoinHandle<()>) {
     if timeout(STDERR_DRAIN_GRACE, &mut handle).await.is_err() {
         handle.abort();
         let _ = handle.await;
@@ -736,48 +738,135 @@ async fn finish_stderr_drain(mut handle: tokio::task::JoinHandle<()>) {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CrashDiagnostics {
-    module_id: String,
-    protocol_version: u32,
-    request_id: String,
-    error: String,
-    stderr_truncated: bool,
-    stderr: String,
+pub(crate) struct CrashDiagnostics {
+    pub(crate) module_id: String,
+    pub(crate) protocol_version: u32,
+    pub(crate) lifecycle_stage: String,
+    pub(crate) request_id: String,
+    pub(crate) error_category: String,
+    pub(crate) error: String,
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) signal: Option<i32>,
+    pub(crate) stderr_truncated: bool,
+    pub(crate) stderr: String,
+    pub(crate) timestamp_unix_ms: u64,
+    pub(crate) restart_generation: u64,
 }
 
-/// Collect the fields for the crash event without touching `tracing`, so the
-/// assembly is directly testable. Only data the module itself wrote to stderr
-/// is included; protocol frames, environment and credentials are never logged.
-fn build_crash_diagnostics(
+impl CrashDiagnostics {
+    pub(crate) fn render_user(&self) -> String {
+        let exit = match (self.exit_code, self.signal) {
+            (Some(code), _) => format!("exit={code}"),
+            (_, Some(signal)) => format!("signal={signal}"),
+            _ => "exit=unknown".to_owned(),
+        };
+        let stderr = if self.stderr.is_empty() {
+            "-".to_owned()
+        } else {
+            self.stderr.clone()
+        };
+        format!(
+            "stage={}\ncategory={}\nrequest={}\n{}\ntimestamp_ms={}\ngeneration={}\nstderr_truncated={}\nstderr={}",
+            self.lifecycle_stage,
+            self.error_category,
+            self.request_id,
+            exit,
+            self.timestamp_unix_ms,
+            self.restart_generation,
+            self.stderr_truncated,
+            stderr,
+        )
+    }
+
+    /// One-line health summary for `lm doctor`; never includes stderr or
+    /// request payloads.
+    pub(crate) fn summary(&self) -> String {
+        format!(
+            "stage={} category={} generation={}",
+            self.lifecycle_stage, self.error_category, self.restart_generation
+        )
+    }
+}
+
+/// Backwards-compatible legacy diagnostic builder. V6 uses the richer context-aware
+/// builder below so supervisor stage and process-exit details are retained.
+pub(crate) fn build_crash_diagnostics(
     descriptor: &ExternalModuleDescriptor,
     request_id: Option<&str>,
     error: &ExternalError,
     capture: &StderrCapture,
 ) -> CrashDiagnostics {
+    build_crash_diagnostics_with_context(
+        descriptor,
+        request_id,
+        error,
+        capture,
+        CrashDiagnosticContext {
+            lifecycle_stage: "runtime",
+            error_category: "runtime_failure",
+            exit_code: None,
+            signal: None,
+            restart_generation: 0,
+        },
+    )
+}
+
+pub(crate) struct CrashDiagnosticContext<'a> {
+    pub(crate) lifecycle_stage: &'a str,
+    pub(crate) error_category: &'a str,
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) signal: Option<i32>,
+    pub(crate) restart_generation: u64,
+}
+
+pub(crate) fn build_crash_diagnostics_with_context(
+    descriptor: &ExternalModuleDescriptor,
+    request_id: Option<&str>,
+    error: &ExternalError,
+    capture: &StderrCapture,
+    context: CrashDiagnosticContext<'_>,
+) -> CrashDiagnostics {
+    let timestamp_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
     CrashDiagnostics {
         module_id: descriptor.id.clone(),
         protocol_version: descriptor.protocol_version,
+        lifecycle_stage: context.lifecycle_stage.to_owned(),
         request_id: request_id.unwrap_or("-").to_owned(),
+        error_category: context.error_category.to_owned(),
         error: error.to_string(),
+        exit_code: context.exit_code,
+        signal: context.signal,
         stderr_truncated: capture.truncated,
         stderr: capture.lossy_text().trim().to_owned(),
+        timestamp_unix_ms,
+        restart_generation: context.restart_generation,
     }
 }
 
-fn emit_crash_event(diagnostics: &CrashDiagnostics) {
+pub(crate) fn emit_crash_event(diagnostics: &CrashDiagnostics) {
     tracing::error!(
         event = "external_module_crashed",
         module_id = %diagnostics.module_id,
         protocol_version = diagnostics.protocol_version,
+        lifecycle_stage = %diagnostics.lifecycle_stage,
         request_id = %diagnostics.request_id,
+        error_category = %diagnostics.error_category,
         error = %diagnostics.error,
+        exit_code = ?diagnostics.exit_code,
+        signal = ?diagnostics.signal,
+        timestamp_unix_ms = diagnostics.timestamp_unix_ms,
+        restart_generation = diagnostics.restart_generation,
         stderr_truncated = diagnostics.stderr_truncated,
         stderr = %diagnostics.stderr,
         "External module crashed"
     );
 }
 
-fn log_module_message(module_id: &str, request_id: &str, level: &str, message: &str) {
+pub(crate) fn log_module_message(module_id: &str, request_id: &str, level: &str, message: &str) {
     match level {
         "error" => tracing::error!(
             event = "external_module_log",
@@ -944,6 +1033,7 @@ mod capture_tests {
             capabilities: Vec::new(),
             default_command: None,
             subscriptions: Vec::new(),
+            telegram_methods: Vec::new(),
             actions: Vec::new(),
             commands: vec![],
         }
@@ -1238,6 +1328,7 @@ if child:
             capabilities: Vec::new(),
             default_command: None,
             subscriptions: Vec::new(),
+            telegram_methods: Vec::new(),
             actions: Vec::new(),
             commands: vec![],
         };
@@ -1264,6 +1355,7 @@ if child:
             capabilities: Vec::new(),
             default_command: None,
             subscriptions: Vec::new(),
+            telegram_methods: Vec::new(),
             actions: Vec::new(),
             commands: vec![],
         };
@@ -1290,6 +1382,7 @@ if child:
             capabilities: Vec::new(),
             default_command: None,
             subscriptions: Vec::new(),
+            telegram_methods: Vec::new(),
             actions: Vec::new(),
             commands: vec![],
         };

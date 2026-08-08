@@ -1119,12 +1119,14 @@ mod tests {
     }
 
     fn test_path(label: &str) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let directory = std::env::temp_dir().join(format!(
-            "lavis-fastfetch-{label}-{}-{nonce}",
+            "lavis-fastfetch-{label}-{}-{nonce}-{seq}",
             std::process::id()
         ));
         fs::create_dir_all(&directory).unwrap();

@@ -280,6 +280,10 @@ pub enum ExternalError {
     ModuleError,
     #[error("module is unavailable or crashed")]
     Unavailable,
+    #[error("module IPC queue is full")]
+    Backpressure,
+    #[error("module IPC writer is unavailable")]
+    WriterUnavailable,
     #[error("invalid argument")]
     InvalidArgument,
 }

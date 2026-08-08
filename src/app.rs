@@ -277,6 +277,9 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
             mgr.set_gateway(external_modules::gateway::GrammersGateway::new(
                 guard.inner().client().clone(),
             ));
+            mgr.set_v6_executor(external_modules::v6_executor::GrammersV6Executor::new(
+                guard.inner().module_rpc_client(),
+            ));
         }
         handle.startup_enabled(external_state.enabled_ids()).await;
         let mut runtime = runtime::RuntimeState::new(
@@ -821,8 +824,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn staging_root_is_private_and_rejects_symlinks_and_insecure_directories() {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let directory = std::env::temp_dir().join(format!(
-            "lavis-staging-root-{}",
+            "lavis-staging-root-{}-{seq}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -926,8 +931,10 @@ mod tests {
 
     #[test]
     fn logout_removes_only_session_and_sidecars() {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let directory = std::env::temp_dir().join(format!(
-            "lavis-logout-{}",
+            "lavis-logout-{}-{seq}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
