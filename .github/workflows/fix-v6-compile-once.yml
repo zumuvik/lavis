@@ -48,6 +48,11 @@ jobs:
               '    let mut shutdown_reply: Option<oneshot::Sender<Result<(), ExternalError>>> = None;\n',
           )
           replace(
+              'src/external_modules/v6_process.rs',
+              '                    V6InboundFrame::Log { .. } => {}\n                },\n',
+              '                    V6InboundFrame::Log { .. } => {}\n                    _ => break,\n                },\n',
+          )
+          replace(
               'src/external_modules/manager.rs',
               '''            assert_eq!(\n                process_start_kind(version, false),\n                Ok(ProcessStartKind::Legacy)\n            );''',
               '''            assert!(matches!(\n                process_start_kind(version, false),\n                Ok(ProcessStartKind::Legacy)\n            ));''',
