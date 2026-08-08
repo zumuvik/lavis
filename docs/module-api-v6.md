@@ -106,7 +106,7 @@ The module then sends:
   "call_id": "raw-1",
   "method": "raw.invoke",
   "params": {
-    "body_base64_chunks": ["eFY0EgEAAAA=" ]
+    "body_base64_chunks": ["eFY0EgEAAAA="]
   }
 }
 ```
