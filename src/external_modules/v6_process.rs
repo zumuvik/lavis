@@ -1452,11 +1452,18 @@ mod tests {
     }
 
     /// Executor routing `raw.invoke` through the transport-generic pipeline.
-    struct PipelineExecutor {
+    /// Curated RPCs observed by the packaged-module executor.
+    type CuratedCalls = std::sync::Mutex<Vec<(v6_registry::V6Method, serde_json::Value)>>;
+
+    /// Test executor for the packaged `.lmod` fixture: serves one curated
+    /// helper through the normal executor contract and routes `raw.invoke`
+    /// through the injectable fake transport.
+    struct PackagedExecutor {
         transport: Arc<dyn v6_executor::RawTlTransport>,
+        curated: Arc<CuratedCalls>,
     }
 
-    impl V6TelegramExecutor for PipelineExecutor {
+    impl V6TelegramExecutor for PackagedExecutor {
         fn execute<'a>(
             &'a self,
             _context: V6ExecutionContext,
@@ -1466,6 +1473,27 @@ mod tests {
             let transport = self.transport.clone();
             Box::pin(async move {
                 match method {
+                    v6_registry::V6Method::MessagesGetDialogs => {
+                        let value: serde_json::Value = serde_json::from_str(params.get())
+                            .map_err(|_| V6ExecutorError::InvalidParams("malformed params"))?;
+                        // Mirror the production contract: the module's curated
+                        // call must carry a bounded page limit and a hash.
+                        if value.get("limit").and_then(serde_json::Value::as_i64) != Some(10) {
+                            return Err(V6ExecutorError::InvalidParams("limit"));
+                        }
+                        if value.get("hash").and_then(serde_json::Value::as_str) != Some("0") {
+                            return Err(V6ExecutorError::InvalidParams("hash"));
+                        }
+                        self.curated.lock().unwrap().push((method, value.clone()));
+                        v6_executor::V6RpcOutput::new(serde_json::json!({
+                            "kind": "dialogs_summary",
+                            "dialogs_count": 2,
+                            "messages_count": 1,
+                            "chats_count": 1,
+                            "users_count": 1,
+                            "truncated": false,
+                        }))
+                    }
                     v6_registry::V6Method::RawInvoke => {
                         v6_executor::raw_invoke_pipeline(transport.as_ref(), params).await
                     }
@@ -1698,18 +1726,37 @@ sys.exit(0)
     /// entry — through a fake transport and back into the module.
     #[cfg(unix)]
     #[tokio::test]
-    async fn packaged_lmod_conforms_through_raw_invoke_with_opaque_bytes() {
+    async fn packaged_lmod_conforms_through_full_lifecycle_with_curated_and_raw_rpc() {
+        use grammers_client::tl::Serializable;
         use std::fs;
+
         let root = test_root("v6-packaged");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
 
         let module_id = format!("packagedv6{}", std::process::id());
-        let body = vec![0x70, 0x38, 0x0c, 0x52, 0x01, 0x00, 0x00, 0x00]; // messages.sendMessage
+
+        // Module-owned opaque raw request: a fully serialized, read-only
+        // Telegram function that Lavis has no typed adapter for:
+        //   messages.getPinnedDialogs, folder_id = 1
+        //   TL layer 227, constructor 0xd6b94df2
+        // Layout: LE constructor id (f2 4d b9 d6), then LE int32 folder_id.
+        const RAW_BODY: [u8; 8] = [0xf2, 0x4d, 0xb9, 0xd6, 0x01, 0x00, 0x00, 0x00];
         assert!(
-            v6_registry::lookup("messages.sendMessage").is_none(),
-            "fixture method must not be in the typed registry"
+            v6_registry::lookup("messages.getPinnedDialogs").is_none(),
+            "raw fixture method must not be in the typed registry"
         );
+        // Independently prove validity: serialize the same function with the
+        // generated TL definitions used by the locked grammers dependency and
+        // require the module's hard-coded bytes to match exactly.
+        let reference =
+            grammers_client::tl::functions::messages::GetPinnedDialogs { folder_id: 1 }.to_bytes();
+        assert_eq!(
+            RAW_BODY.as_slice(),
+            reference.as_slice(),
+            "fixture body must equal the generated TL serialization"
+        );
+        let body = RAW_BODY.to_vec();
         let body_base64 = v6_executor::encode_base64(&body);
         let marker = "marker.txt";
         let script = r#"#!/usr/bin/env python3
@@ -1726,38 +1773,96 @@ def write_marker(content):
 def req_id(line):
     return json.loads(line)["request_id"]
 
-line = sys.stdin.readline()
-if not line:
-    sys.exit(60)
-rid = req_id(line)
-print(json.dumps({"protocol_version": 6, "type": "initialized", "request_id": rid, "module_id": "__MODULE_ID__"}), flush=True)
-line = sys.stdin.readline()
-if not line:
-    sys.exit(61)
-rid = req_id(line)
-print(json.dumps({"protocol_version": 6, "type": "health", "request_id": rid}), flush=True)
-print('{"protocol_version":6,"type":"telegram.invoke","call_id":"pkg-1","method":"raw.invoke","params":{"dc_id":2,"body_base64_chunks":["__BODY_BASE64__"]}}', flush=True)
-line = sys.stdin.readline()
 try:
+    # 1. initialize
+    line = sys.stdin.readline()
+    if not line:
+        sys.exit(60)
     frame = json.loads(line)
-    assert frame["type"] == "telegram.result", frame.get("type")
-    result = frame["result"]
+    assert frame["type"] == "initialize", frame
+    rid = req_id(line)
+    print(json.dumps({"protocol_version": 6, "type": "initialized", "request_id": rid, "module_id": "__MODULE_ID__"}), flush=True)
+
+    # 2. execute
+    line = sys.stdin.readline()
+    if not line:
+        sys.exit(61)
+    frame = json.loads(line)
+    assert frame["type"] == "execute", frame
+    assert frame["command"] == "go", frame.get("command")
+    assert frame["arguments"] == "packaged", frame.get("arguments")
+    rid = req_id(line)
+    print(json.dumps({"protocol_version": 6, "type": "result", "request_id": rid, "text": "packaged ok"}), flush=True)
+
+    # 3. event dispatch
+    line = sys.stdin.readline()
+    if not line:
+        sys.exit(63)
+    frame = json.loads(line)
+    assert frame["type"] == "event", frame
+    assert frame["event"] == "message.created", frame.get("event")
+    assert frame["payload"]["text"] == "triggered", frame.get("payload")
+    rid = req_id(line)
+    print(json.dumps({"protocol_version": 6, "type": "event_result", "request_id": rid, "actions": []}), flush=True)
+
+    # 4. curated Telegram RPC
+    print('{"protocol_version":6,"type":"telegram.invoke","call_id":"cur-1","method":"messages.getDialogs","params":{"limit":10,"hash":"0"}}', flush=True)
+    line = sys.stdin.readline()
+    if not line:
+        sys.exit(64)
+    frame = json.loads(line)
+    assert frame["type"] == "telegram.result", frame
+    assert frame["call_id"] == "cur-1", frame.get("call_id")
+    result = frame.get("result")
+    assert result is not None, frame
+    assert result["kind"] == "dialogs_summary", result.get("kind")
+    assert result["dialogs_count"] == 2, result.get("dialogs_count")
+    assert result["truncated"] is False, result.get("truncated")
+
+    # 5. raw.invoke with a fully serialized valid TL function
+    print('{"protocol_version":6,"type":"telegram.invoke","call_id":"raw-1","method":"raw.invoke","params":{"dc_id":2,"body_base64_chunks":["__BODY_BASE64__"]}}', flush=True)
+    line = sys.stdin.readline()
+    if not line:
+        sys.exit(65)
+    frame = json.loads(line)
+    assert frame["type"] == "telegram.result", frame
+    assert frame["call_id"] == "raw-1", frame.get("call_id")
+    result = frame.get("result")
+    assert result is not None, frame
     assert result["kind"] == "raw_tl", result.get("kind")
     assert result["dc_id"] == 2, result.get("dc_id")
     decoded = base64.b64decode("".join(result["body_base64_chunks"]))
-    write_marker(decoded.decode("latin-1"))
+    assert decoded == b"opaque-response-ok", decoded
+    write_marker("all-stages-ok")
+
+    # 6. health
+    line = sys.stdin.readline()
+    if not line:
+        sys.exit(66)
+    frame = json.loads(line)
+    assert frame["type"] == "health", frame
+    rid = req_id(line)
+    print(json.dumps({"protocol_version": 6, "type": "health", "request_id": rid}), flush=True)
+
+    # 7. graceful shutdown
+    line = sys.stdin.readline()
+    if not line:
+        sys.exit(67)
+    frame = json.loads(line)
+    assert frame["type"] == "shutdown", frame
 except Exception as error:
     write_marker("FAILED: " + repr(error))
     sys.exit(62)
-line = sys.stdin.readline()
 sys.exit(0)
 "#
         .replace("__MODULE_ID__", &module_id)
         .replace("__BODY_BASE64__", &body_base64)
         .replace("__MARKER__", marker);
 
+        // The packaged manifest grants one curated helper (which must not
+        // require `telegram.raw`) and `raw.invoke` (which must).
         let manifest_json = format!(
-            r#"{{"schema_version":6,"id":"{module_id}","name":"Packaged","version":"1","author":"A","entrypoint":"run","capabilities":["telegram.raw"],"telegram_methods":["raw.invoke"],"commands":[{{"name":"go","summary_ru":"x","description_ru":"x","usage":"<value>"}}]}}"#
+            r#"{{"schema_version":6,"id":"{module_id}","name":"Packaged","version":"1","author":"A","entrypoint":"run","capabilities":["telegram.raw"],"telegram_methods":["messages.getDialogs","raw.invoke"],"commands":[{{"name":"go","summary_ru":"x","description_ru":"x","usage":"<value>"}}]}}"#
         );
         let archive = zip_entries(&[
             ArchiveEntry {
@@ -1793,7 +1898,10 @@ sys.exit(0)
         assert_eq!(descriptor.protocol_version, 6);
         assert_eq!(
             descriptor.telegram_methods,
-            vec![v6_registry::V6Method::RawInvoke]
+            vec![
+                v6_registry::V6Method::MessagesGetDialogs,
+                v6_registry::V6Method::RawInvoke
+            ]
         );
 
         ensure_test_state_base();
@@ -1803,16 +1911,55 @@ sys.exit(0)
             received: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
         let received = transport.received.clone();
-        let executor = Arc::new(PipelineExecutor {
+        let executor = Arc::new(PackagedExecutor {
             transport: Arc::new(transport),
+            curated: Default::default(),
         });
+        let observed_curated = executor.curated.clone();
         let v6proc = V6Process::start(descriptor, executor, 1).await.unwrap();
+
+        // Stage 1: initialize
         v6proc
             .initialize("1".to_owned(), module_id.clone())
             .await
             .unwrap();
-        v6proc.health("2".to_owned()).await.unwrap();
 
+        // Stage 2: execute
+        let reply = v6proc
+            .execute(
+                "2".to_owned(),
+                "go".to_owned(),
+                "packaged".to_owned(),
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert!(matches!(reply, V6InboundFrame::Result { ref text, .. } if text == "packaged ok"));
+
+        // Stage 3: event dispatch
+        let event_reply = v6proc
+            .event(
+                "3".to_owned(),
+                MessageEventKind::Created,
+                MessageEvent {
+                    event_id: "e1".to_owned(),
+                    message_ref: "r1".to_owned(),
+                    message_key: "k1".to_owned(),
+                    peer_id: None,
+                    text: "triggered".to_owned(),
+                    outgoing: false,
+                    entities: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(event_reply, V6InboundFrame::EventResult { ref actions, .. } if actions.is_empty())
+        );
+
+        // Stages 4-5 run inside the module: it issues the curated RPC, then
+        // raw.invoke, verifies both results against expectations, and writes
+        // its marker only after both round-trips succeeded.
         let marker_path = payload.join(marker);
         let mut verified = false;
         for _ in 0..300 {
@@ -1822,24 +1969,40 @@ sys.exit(0)
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(verified, "module must receive the raw response");
+        assert!(
+            verified,
+            "module must complete the curated and raw RPC stages"
+        );
         let marker_text = fs::read_to_string(&marker_path).unwrap();
         assert!(
             !marker_text.starts_with("FAILED"),
-            "module rejected the response: {marker_text}"
+            "module rejected a stage: {marker_text}"
         );
-        assert_eq!(marker_text, "opaque-response-ok");
+        assert_eq!(marker_text, "all-stages-ok");
 
-        // Both directions verified with opaque bytes: the exact module body
-        // reached the transport, and the exact transport response reached the
-        // module.
+        // The curated call passed through the normal executor contract with
+        // the exact granted schema.
+        {
+            let curated = observed_curated.lock().unwrap();
+            assert_eq!(curated.len(), 1);
+            assert_eq!(curated[0].0, v6_registry::V6Method::MessagesGetDialogs);
+            assert_eq!(curated[0].1, serde_json::json!({"limit": 10, "hash": "0"}));
+        }
+
+        // Raw bytes: the exact module-produced serialized function reached the
+        // transport unchanged, and the exact fake response reached the module
+        // unchanged (asserted by the module before its marker write).
         {
             let received = received.lock().unwrap();
             assert_eq!(received.len(), 1);
             assert_eq!(received[0].0, 2);
-            assert_eq!(received[0].1, body);
+            assert_eq!(received[0].1, RAW_BODY);
         }
 
+        // Stage 6: health
+        v6proc.health("6".to_owned()).await.unwrap();
+
+        // Stage 7: graceful shutdown
         assert!(v6proc.graceful_shutdown().await.is_ok());
         assert_eq!(v6proc.status(), process::ProcessStatus::Terminated);
         let _ = fs::remove_dir_all(&root);
