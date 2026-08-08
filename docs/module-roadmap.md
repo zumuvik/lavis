@@ -21,20 +21,28 @@ Draft PR #28 introduces the API v6 foundation:
 - a persistent module process supervisor;
 - strict v6 lifecycle and `telegram.invoke` frames;
 - bounded queues, pending requests, RPC workers, and shutdown handling;
-- an explicit `telegram.raw` capability with reviewed per-module method grants;
-- a generated typed method registry;
-- a dedicated Telegram client with retries and peer caching disabled;
-- a global RPC concurrency limit;
-- the first reviewed methods: `account.updateStatus`, `contacts.getContacts`,
-  `messages.getHistory`, and `messages.getDialogs`.
+- an explicit `telegram.raw` capability;
+- curated typed Telegram helpers for common operations;
+- a stable `raw.invoke` escape hatch that forwards module-serialized TL request
+  bytes through Lavis' already-authorized Telegram sender and returns raw TL
+  response bytes;
+- a generated registry for typed helpers and the single stable raw gateway,
+  rather than a registry that must grow for every Telegram method;
+- a dedicated Telegram client/transport with retries and peer caching disabled;
+- a global RPC concurrency limit.
 
-PR #28 is still a draft. Its current CI run stops at `cargo fmt --check`, so
-compilation, Clippy, tests, `nix flake check`, and package builds have not yet
-run for the current head.
+The completeness rule for API v6 is:
+
+> A module must be able to use a Telegram RPC that Lavis has never heard of
+> without changing or rebuilding Lavis.
+
+Typed helpers are convenience and policy surfaces. They are not the ceiling of
+what a v6 module can do. A module that explicitly receives `telegram.raw` and
+the `raw.invoke` grant owns TL serialization/deserialization for raw calls.
 
 ## Priority 0: module observability and failure recovery
 
-This work must land before expanding the v6 method surface.
+This work must land before expanding the curated helper surface.
 
 ### Structured failure records
 
@@ -50,7 +58,8 @@ Every module termination must retain a bounded diagnostic record containing:
 - timestamp and restart generation.
 
 Diagnostics must never include Telegram credentials, session data, raw access
-hashes, environment secrets, or unrestricted request payloads.
+hashes, environment secrets, raw TL request/response bodies, or unrestricted
+request payloads.
 
 ### Runtime logging
 
@@ -251,30 +260,47 @@ Create `docs/module-api-v6.md` covering:
 - queue, concurrency, and timeout semantics;
 - shutdown behavior;
 - error categories and retry expectations;
-- capability and per-method grant rules;
+- capability and typed-helper grant rules;
+- the `raw.invoke` request/response encoding and body-size limit;
+- responsibility for TL layer compatibility in raw modules;
 - compatibility guarantees for v2-v5.
 
 ### Security gate
 
-API v6 must remain a reviewed allowlist, not a generic MTProto dispatcher.
-Before merge, verify:
+API v6 deliberately has two Telegram access levels.
 
-- no method can be invoked without `telegram.raw`;
-- every method must also appear in the module's `telegram_methods` grant;
-- grants are included in the installation fingerprint and confirmation plan;
-- parameters use strict typed decoding with unknown fields rejected;
-- outputs are bounded and intentionally shaped;
-- access hashes, sessions, credentials, and unrestricted peer objects are not
-  exposed;
-- RPC errors returned to modules are sanitized;
-- global and per-module resource limits prevent one module from starving the
-  runtime.
+Curated helpers:
+
+- require `telegram.raw` and an explicit entry in `telegram_methods` under the
+  current v6 manifest model;
+- use strict typed decoding with unknown fields rejected;
+- expose bounded, intentionally shaped outputs.
+
+Raw escape hatch:
+
+- is available only through the single stable `raw.invoke` grant;
+- requires the explicit high-risk `telegram.raw` capability;
+- accepts an opaque, bounded, 4-byte-aligned serialized TL request body;
+- sends it only through Lavis' existing authorized `SenderPoolHandle`;
+- returns opaque bounded TL response bytes;
+- may target an explicitly selected known datacenter;
+- never exposes auth keys, session storage, the sender handle, or credentials;
+- never logs or persists raw TL bodies;
+- shares the same global concurrency, timeout, shutdown, and process-lifecycle
+  controls as typed helpers.
+
+The install plan and fingerprint must make both `telegram.raw` and `raw.invoke`
+visible. Granting `raw.invoke` means trusting the module to act with the
+Telegram authority of the signed-in account; it is not a sandbox boundary.
 
 ### Acceptance gate
 
 PR #28 can leave draft status only when all CI stages pass and a packaged v6
-fixture completes initialize, execute, event dispatch, at least one approved
-Telegram RPC, health, and graceful shutdown under an integration test.
+fixture completes initialize, execute, event dispatch, one curated Telegram RPC,
+one `raw.invoke` call, health, and graceful shutdown under integration tests.
+
+A conformance fixture must also prove the completeness rule by successfully
+invoking a valid TL request that has no purpose-built Lavis adapter.
 
 ## Priority 2: API v6 alpha and module conformance kit
 
@@ -284,35 +310,34 @@ After PR #28 is stable:
 - provide a protocol conformance runner for third-party modules;
 - add reference SDK helpers for Go and Rust;
 - provide deterministic fixtures for success, RPC error, timeout, cancellation,
-  malformed frames, duplicate call IDs, and shutdown races;
+  malformed frames, duplicate call IDs, raw TL calls, and shutdown races;
 - add a maintained example v6 module packaged as `.lmod`;
 - document migration from v5 host calls to v6 persistent RPC;
 - add per-module concurrency and fairness limits in addition to the global
   semaphore;
 - expose retry metadata only where it is safe and actionable.
 
-No additional Telegram method should be added until the conformance kit can
-exercise its parameter validation, output shape, failure mapping, and resource
-limits.
+The conformance kit must test both curated helpers and `raw.invoke`; module
+authors must not need a Lavis source checkout to determine whether their module
+speaks v6 correctly.
 
-## Priority 3: reviewed Telegram method expansion
+## Priority 3: curated Telegram helper expansion
 
-Expand `tools/v6-methods.json` in small reviewable batches.
+`raw.invoke` is the completeness mechanism. Expanding `tools/v6-methods.json`
+is optional developer-experience work, not a prerequisite for new modules.
 
-Each new method requires:
+Add a purpose-built helper only when it provides meaningful value such as:
 
-1. a documented use case;
-2. a strict input type;
-3. explicit peer restrictions;
-4. a bounded output type;
-5. capability and privacy review;
-6. unit and integration tests;
-7. installation-plan visibility;
-8. a compatibility note.
+1. simpler parameters than raw TL;
+2. stable high-level peer handling;
+3. redacted/minimal result objects;
+4. a lower-risk capability than arbitrary raw access;
+5. common retry or pagination behavior;
+6. a clearly testable compatibility contract.
 
-Prefer purpose-built, minimal result objects over serialized raw Telegram TL
-objects. Methods exposing message bodies, arbitrary peers, media, membership,
-contacts, or account mutations require separate threat-model review.
+A new Telegram RPC must never require a new Lavis release merely because no
+typed helper exists for it. Modules with explicit raw authority can use their
+own TL library/schema and `raw.invoke` immediately.
 
 ## Priority 4: module developer experience
 
@@ -333,9 +358,14 @@ The development runner should support:
 - pretty-printed protocol frames with sensitive fields redacted;
 - captured stdout/stderr and exit status;
 - deterministic fixture Telegram responses;
+- deterministic raw-TL request/response fixtures;
 - timeout and malformed-response simulation;
 - manifest and capability diagnostics with file/field context;
 - generation of a reproducible `.lmod` package.
+
+Reference SDKs should make raw calls ergonomic without making Lavis understand
+the method. For Rust this can be a helper that serializes any `RemoteCall`; for
+other languages it can use the language's Telegram TL schema implementation.
 
 ## Priority 5: installation, update, and rollback lifecycle
 
@@ -388,7 +418,7 @@ Every runtime or protocol PR must satisfy all applicable gates:
 - formatting, compilation, Clippy, tests, flake check, and package build pass;
 - no unbounded queue, collection, output, stderr capture, or task growth;
 - no child process or process-group leak on any exit path;
-- no secrets in module-visible errors or diagnostics;
+- no secrets or raw TL bodies in module-visible diagnostics or logs;
 - existing protocol fixtures remain green;
 - new wire behavior is documented before merge;
 - user-facing state matches actual filesystem and process state;
@@ -399,12 +429,15 @@ Every runtime or protocol PR must satisfy all applicable gates:
 
 ## Explicit non-goals
 
-- A generic unrestricted Telegram/MTProto proxy for modules.
+- Implicit raw Telegram authority without an explicit install-time capability
+  and grant.
+- Exposing Telegram credentials, auth keys, session bytes, or sender handles to
+  modules.
 - Treating process isolation as a security sandbox.
 - Loading unreviewed native code in the Lavis process.
 - Building arbitrary source code received through Telegram.
 - Silently modifying user Nix configuration.
-- Printing or persisting Telegram credentials, auth keys, or session contents
-  for debugging.
+- Printing or persisting Telegram credentials, auth keys, session contents, or
+  raw TL bodies for debugging.
 - Deprecating working legacy modules before v6 tooling and migration paths are
   complete.

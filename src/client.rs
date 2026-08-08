@@ -10,6 +10,16 @@ use tokio::{sync::mpsc::UnboundedReceiver, task::JoinHandle};
 
 use crate::{config::Config, error::ClientError};
 
+/// Dedicated Telegram transport exposed to the module RPC executor.
+///
+/// `client` is retained for the curated typed helpers. `raw_handle` exposes the
+/// sender-pool byte transport used by the explicit `raw.invoke` escape hatch;
+/// modules never receive either handle directly.
+pub struct ModuleRpcClient {
+    pub(crate) client: Client,
+    pub(crate) raw_handle: SenderPoolFatHandle,
+}
+
 pub struct TelegramClient {
     client: Client,
     module_rpc_handle: SenderPoolFatHandle,
@@ -45,14 +55,16 @@ impl TelegramClient {
         &self.client
     }
 
-    pub(crate) fn module_rpc_client(&self) -> Client {
-        Client::with_configuration(
-            self.module_rpc_handle.clone(),
+    pub(crate) fn module_rpc_client(&self) -> ModuleRpcClient {
+        let raw_handle = self.module_rpc_handle.clone();
+        let client = Client::with_configuration(
+            raw_handle.clone(),
             ClientConfiguration {
                 retry_policy: Box::new(NoRetries),
                 auto_cache_peers: false,
             },
-        )
+        );
+        ModuleRpcClient { client, raw_handle }
     }
 
     pub(crate) fn take_updates(

@@ -1,4 +1,6 @@
 use super::{protocol, v6_registry::V6Method};
+use crate::client::ModuleRpcClient;
+use grammers_session::Session;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use std::{future::Future, pin::Pin, sync::Arc};
@@ -7,6 +9,14 @@ use tokio::sync::Semaphore;
 pub const V6_GLOBAL_CONCURRENCY: usize = 8;
 const MAX_PAGE_LIMIT: i32 = 100;
 const MAX_SUMMARY_COLLECTIONS: usize = 64;
+
+// V6 currently uses bounded JSON-lines IPC. Keep raw TL bodies below the line
+// limit after base64 expansion; large transfers can be split into multiple
+// Telegram RPCs without extending Lavis' method surface.
+const MAX_RAW_TL_BODY_BYTES: usize = 40 * 1024;
+const RAW_BASE64_CHUNK_CHARS: usize = 7 * 1024;
+const BASE64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 #[derive(Clone)]
 pub struct V6ExecutionContext {
@@ -34,6 +44,16 @@ impl V6RpcOutput {
         Ok(Self(value))
     }
 
+    fn raw(value: serde_json::Value) -> Result<Self, V6ExecutorError> {
+        // Raw replies may exceed MAX_RESULT_BYTES, but they still have to fit
+        // the bounded V6 JSON-line transport and per-string JSON guards.
+        let encoded = serde_json::to_vec(&value).map_err(|_| V6ExecutorError::InvalidResponse)?;
+        if encoded.len() > protocol::MAX_LINE_BYTES.saturating_sub(1024) {
+            return Err(V6ExecutorError::InvalidResponse);
+        }
+        Ok(Self(value))
+    }
+
     pub fn into_value(self) -> serde_json::Value {
         self.0
     }
@@ -55,19 +75,25 @@ pub enum V6ExecutorError {
 #[derive(Clone)]
 pub struct GrammersV6Executor {
     client: grammers_client::Client,
+    raw_handle: grammers_mtsender::SenderPoolFatHandle,
     permits: Arc<Semaphore>,
 }
 
 impl GrammersV6Executor {
-    pub fn new(client: grammers_client::Client) -> Arc<Self> {
+    pub fn new(module_rpc: ModuleRpcClient) -> Arc<Self> {
         Arc::new(Self {
-            client,
+            client: module_rpc.client,
+            raw_handle: module_rpc.raw_handle,
             permits: Arc::new(Semaphore::new(V6_GLOBAL_CONCURRENCY)),
         })
     }
 
-    pub fn with_permits(client: grammers_client::Client, permits: Arc<Semaphore>) -> Arc<Self> {
-        Arc::new(Self { client, permits })
+    pub fn with_permits(module_rpc: ModuleRpcClient, permits: Arc<Semaphore>) -> Arc<Self> {
+        Arc::new(Self {
+            client: module_rpc.client,
+            raw_handle: module_rpc.raw_handle,
+            permits,
+        })
     }
 }
 
@@ -90,6 +116,7 @@ impl V6TelegramExecutor for GrammersV6Executor {
                 V6Method::ContactsGetContacts => self.get_contacts(params).await,
                 V6Method::MessagesGetHistory => self.get_history(params).await,
                 V6Method::MessagesGetDialogs => self.get_dialogs(params).await,
+                V6Method::RawInvoke => self.raw_invoke(params).await,
             }
         })
     }
@@ -119,7 +146,7 @@ impl GrammersV6Executor {
             .invoke(&request)
             .await
             .map_err(map_invocation_error)?;
-        // The adapter deliberately exposes no raw users, chats, or access hashes.
+        // The curated adapter deliberately exposes no raw users, chats, or access hashes.
         match response {
             grammers_client::tl::enums::contacts::Contacts::Contacts(response) => contacts_summary(
                 response.contacts.len(),
@@ -218,11 +245,27 @@ impl GrammersV6Executor {
             }
         }
     }
+
+    async fn raw_invoke(&self, params: Box<RawValue>) -> Result<V6RpcOutput, V6ExecutorError> {
+        let params = decode::<RawInvokeParams>(&params)?;
+        let body = decode_raw_tl_body(&params.body_base64_chunks)?;
+        let dc_id = match params.dc_id {
+            Some(dc_id) if (1..=100).contains(&dc_id) => dc_id,
+            Some(_) => return Err(V6ExecutorError::InvalidParams("dc_id out of range")),
+            None => self.raw_handle.session.home_dc_id(),
+        };
+        let response = self
+            .raw_handle
+            .invoke_in_dc(dc_id, body)
+            .await
+            .map_err(map_invocation_error)?;
+        raw_tl_result(dc_id, response)
+    }
 }
 
-fn map_invocation_error(error: grammers_client::InvocationError) -> V6ExecutorError {
+fn map_invocation_error(error: grammers_mtsender::InvocationError) -> V6ExecutorError {
     match error {
-        grammers_client::InvocationError::Rpc(error) => {
+        grammers_mtsender::InvocationError::Rpc(error) => {
             map_rpc_error(error.code, error.name, error.value)
         }
         _ => V6ExecutorError::Transport,
@@ -292,6 +335,14 @@ struct DialogsInitialParams {
     hash: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawInvokeParams {
+    #[serde(default)]
+    dc_id: Option<i32>,
+    body_base64_chunks: Vec<String>,
+}
+
 fn default_limit() -> i32 {
     50
 }
@@ -326,6 +377,121 @@ fn validate_limit(limit: i32) -> Result<(), V6ExecutorError> {
         .contains(&limit)
         .then_some(())
         .ok_or(V6ExecutorError::InvalidParams("limit out of range"))
+}
+
+fn decode_raw_tl_body(chunks: &[String]) -> Result<Vec<u8>, V6ExecutorError> {
+    if chunks.is_empty() {
+        return Err(V6ExecutorError::InvalidParams("raw body is empty"));
+    }
+    let encoded_len = chunks.iter().try_fold(0usize, |total, chunk| {
+        if chunk.is_empty() || chunk.len() > RAW_BASE64_CHUNK_CHARS {
+            return None;
+        }
+        total.checked_add(chunk.len())
+    });
+    let Some(encoded_len) = encoded_len else {
+        return Err(V6ExecutorError::InvalidParams("invalid raw body chunks"));
+    };
+    if encoded_len > MAX_RAW_TL_BODY_BYTES.div_ceil(3) * 4 {
+        return Err(V6ExecutorError::InvalidParams("raw body is too large"));
+    }
+
+    let mut encoded = String::with_capacity(encoded_len);
+    for chunk in chunks {
+        encoded.push_str(chunk);
+    }
+    let body = decode_base64(&encoded)?;
+    if body.len() < 4 || body.len() > MAX_RAW_TL_BODY_BYTES || body.len() % 4 != 0 {
+        return Err(V6ExecutorError::InvalidParams(
+            "raw TL body must be 4-byte aligned",
+        ));
+    }
+    Ok(body)
+}
+
+fn raw_tl_result(dc_id: i32, body: Vec<u8>) -> Result<V6RpcOutput, V6ExecutorError> {
+    if body.len() > MAX_RAW_TL_BODY_BYTES {
+        return Err(V6ExecutorError::InvalidResponse);
+    }
+    let encoded = encode_base64(&body);
+    let chunks = encoded
+        .as_bytes()
+        .chunks(RAW_BASE64_CHUNK_CHARS)
+        .map(|chunk| {
+            String::from_utf8(chunk.to_vec()).map_err(|_| V6ExecutorError::InvalidResponse)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    V6RpcOutput::raw(serde_json::json!({
+        "kind": "raw_tl",
+        "dc_id": dc_id,
+        "body_base64_chunks": chunks,
+    }))
+}
+
+fn encode_base64(input: &[u8]) -> String {
+    let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        let value = (u32::from(first) << 16) | (u32::from(second) << 8) | u32::from(third);
+        output.push(BASE64_ALPHABET[((value >> 18) & 0x3f) as usize] as char);
+        output.push(BASE64_ALPHABET[((value >> 12) & 0x3f) as usize] as char);
+        output.push(if chunk.len() >= 2 {
+            BASE64_ALPHABET[((value >> 6) & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        output.push(if chunk.len() == 3 {
+            BASE64_ALPHABET[(value & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    output
+}
+
+fn decode_base64(input: &str) -> Result<Vec<u8>, V6ExecutorError> {
+    let bytes = input.as_bytes();
+    if bytes.is_empty() || bytes.len() % 4 != 0 {
+        return Err(V6ExecutorError::InvalidParams("raw body is not base64"));
+    }
+    let mut output = Vec::with_capacity((bytes.len() / 4) * 3);
+    let chunk_count = bytes.len() / 4;
+    for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+        let last = index + 1 == chunk_count;
+        let a = base64_value(chunk[0])?;
+        let b = base64_value(chunk[1])?;
+        let c_padding = chunk[2] == b'=';
+        let d_padding = chunk[3] == b'=';
+        if !last && (c_padding || d_padding) || c_padding && !d_padding {
+            return Err(V6ExecutorError::InvalidParams("raw body is not base64"));
+        }
+        let c = if c_padding { 0 } else { base64_value(chunk[2])? };
+        let d = if d_padding { 0 } else { base64_value(chunk[3])? };
+        if c_padding && (b & 0x0f != 0) || d_padding && !c_padding && (c & 0x03 != 0) {
+            return Err(V6ExecutorError::InvalidParams("raw body is not base64"));
+        }
+        output.push((a << 2) | (b >> 4));
+        if !c_padding {
+            output.push((b << 4) | (c >> 2));
+        }
+        if !d_padding {
+            output.push((c << 6) | d);
+        }
+    }
+    Ok(output)
+}
+
+fn base64_value(byte: u8) -> Result<u8, V6ExecutorError> {
+    match byte {
+        b'A'..=b'Z' => Ok(byte - b'A'),
+        b'a'..=b'z' => Ok(byte - b'a' + 26),
+        b'0'..=b'9' => Ok(byte - b'0' + 52),
+        b'+' => Ok(62),
+        b'/' => Ok(63),
+        _ => Err(V6ExecutorError::InvalidParams("raw body is not base64")),
+    }
 }
 
 #[derive(Serialize)]
@@ -432,6 +598,40 @@ mod tests {
             decode::<DialogsInitialParams>(&raw(r#"{"limit":101,"hash":"1"}"#)),
             Ok(params) if validate_limit(params.limit).is_err()
         ));
+    }
+
+    #[test]
+    fn raw_tl_body_is_transport_generic_and_bounded() {
+        let body = vec![0x78, 0x56, 0x34, 0x12, 1, 0, 0, 0];
+        let encoded = encode_base64(&body);
+        let chunks = vec![encoded];
+        assert_eq!(decode_raw_tl_body(&chunks).unwrap(), body);
+
+        let unaligned = vec![encode_base64(&[1u8, 2, 3, 4, 5])];
+        assert!(decode_raw_tl_body(&unaligned).is_err());
+        assert!(decode_raw_tl_body(&[]).is_err());
+        assert!(decode_base64("AAAA=").is_err());
+        assert!(decode_base64("AA=A").is_err());
+    }
+
+    #[test]
+    fn raw_tl_result_uses_bounded_chunks() {
+        let value = raw_tl_result(2, vec![0u8; 16 * 1024])
+            .unwrap()
+            .into_value();
+        let chunks = value["body_base64_chunks"].as_array().unwrap();
+        assert!(chunks.len() > 1);
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.as_str().unwrap().len() <= RAW_BASE64_CHUNK_CHARS));
+    }
+
+    #[test]
+    fn local_base64_codec_round_trips_padding_cases() {
+        for input in [b"a".as_slice(), b"ab".as_slice(), b"abc".as_slice(), b"abcd".as_slice()] {
+            let encoded = encode_base64(input);
+            assert_eq!(decode_base64(&encoded).unwrap(), input);
+        }
     }
 
     fn raw(value: &str) -> Box<RawValue> {
