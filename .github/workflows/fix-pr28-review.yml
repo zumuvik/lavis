@@ -1,0 +1,261 @@
+name: Fix PR28 Review
+
+on:
+  push:
+    branches:
+      - feat/module-api-v6-full-telegram
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v6
+        with:
+          ref: feat/module-api-v6-full-telegram
+
+      - name: Apply review fixes
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace(path, old, new, count=1):
+              p = Path(path)
+              text = p.read_text()
+              actual = text.count(old)
+              if actual != count:
+                  raise SystemExit(f'{path}: expected {count} matches, found {actual}')
+              p.write_text(text.replace(old, new, count))
+
+          # Reuse the mature legacy diagnostics machinery from the v6 supervisor.
+          for old, new in [
+              ('struct StderrCapture {', 'pub(crate) struct StderrCapture {'),
+              ('fn lock_capture(shared: &Mutex<StderrCapture>)', 'pub(crate) fn lock_capture(shared: &Mutex<StderrCapture>)'),
+              ('async fn drain_stderr<R>', 'pub(crate) async fn drain_stderr<R>'),
+              ('async fn finish_stderr_drain(', 'pub(crate) async fn finish_stderr_drain('),
+              ('struct CrashDiagnostics {', 'pub(crate) struct CrashDiagnostics {'),
+              ('fn build_crash_diagnostics(', 'pub(crate) fn build_crash_diagnostics('),
+              ('fn emit_crash_event(', 'pub(crate) fn emit_crash_event('),
+              ('fn log_module_message(', 'pub(crate) fn log_module_message('),
+          ]:
+              replace('src/external_modules/process.rs', old, new)
+
+          replace(
+              'src/external_modules/v6_process.rs',
+              '    manifest::{ExternalCapability, ExternalModuleDescriptor},\n    protocol::{\n',
+              '    manifest::{ExternalCapability, ExternalModuleDescriptor},\n    process::{self, StderrCapture},\n    protocol::{\n',
+          )
+          replace(
+              'src/external_modules/v6_process.rs',
+              '    sync::Arc,\n',
+              '    sync::{Arc, Mutex},\n',
+          )
+          replace(
+              'src/external_modules/v6_process.rs',
+              'const V6_MAX_STDERR_CAPTURE: usize = 16 * 1024;\n',
+              '',
+          )
+          replace(
+              'src/external_modules/v6_process.rs',
+              '        let stderr_drain = tokio::spawn(drain_stderr(stderr));\n',
+              '        let stderr_capture = Arc::new(Mutex::new(StderrCapture::default()));\n        let stderr_drain = tokio::spawn(process::drain_stderr(stderr, stderr_capture.clone()));\n',
+          )
+          replace(
+              'src/external_modules/v6_process.rs',
+              '                writer,\n                stderr_drain,\n',
+              '                writer,\n                stderr_drain,\n                stderr_capture,\n',
+          )
+          replace(
+              'src/external_modules/v6_process.rs',
+              '    stderr_drain: JoinHandle<Vec<u8>>,\n',
+              '    stderr_drain: JoinHandle<()>,\n    stderr_capture: Arc<Mutex<StderrCapture>>,\n',
+          )
+          replace(
+              'src/external_modules/v6_process.rs',
+              '        writer,\n        stderr_drain,\n    } = io;\n',
+              '        writer,\n        stderr_drain,\n        stderr_capture,\n    } = io;\n',
+          )
+          replace(
+              'src/external_modules/v6_process.rs',
+              '''enum Expected {\n    Initialized,\n    Health,\n    Result,\n    EventResult,\n}\n\n''',
+              '''enum Expected {\n    Initialized,\n    Health,\n    Result,\n    EventResult,\n}\n\n#[derive(Clone, Copy)]\nenum FatalReason {\n    Unavailable,\n    ProtocolEncode,\n    ProtocolDecode,\n    LineTooLarge,\n    WrongRequestId,\n    WrongModuleId,\n    ExecutionTimeout,\n    ShutdownTimeout,\n}\n\nimpl FatalReason {\n    fn error(self) -> ExternalError {\n        match self {\n            Self::Unavailable => ExternalError::Unavailable,\n            Self::ProtocolEncode => ExternalError::ProtocolEncode,\n            Self::ProtocolDecode => ExternalError::ProtocolDecode,\n            Self::LineTooLarge => ExternalError::LineTooLarge,\n            Self::WrongRequestId => ExternalError::WrongRequestId,\n            Self::WrongModuleId => ExternalError::WrongModuleId,\n            Self::ExecutionTimeout => ExternalError::ExecutionTimeout,\n            Self::ShutdownTimeout => ExternalError::ShutdownTimeout,\n        }\n    }\n\n    fn from_inbound(error: &ExternalError) -> Self {\n        match error {\n            ExternalError::LineTooLarge => Self::LineTooLarge,\n            _ => Self::ProtocolDecode,\n        }\n    }\n}\n\n''',
+          )
+          replace(
+              'src/external_modules/v6_process.rs',
+              '    let mut force_kill = false;\n',
+              '    let mut fatal_reason = None;\n    let mut fatal_request_id = None;\n',
+          )
+          replace(
+              'src/external_modules/v6_process.rs',
+              '''                } else {\n                    break;\n                }\n            }\n            control = control_rx.recv(), if control_open => match control {\n''',
+              '''                } else {\n                    fatal_reason = Some(FatalReason::Unavailable);\n                    break;\n                }\n            }\n            control = control_rx.recv(), if control_open => match control {\n''',
+          )
+          replace(
+              'src/external_modules/v6_process.rs',
+              '''                    if queue_writer(&writer_tx, WriterCommand::Frame(frame, Flush::None)).is_err() {\n                        let _ = reply.send(Err(ExternalError::Unavailable));\n                        break;\n                    }\n''',
+              '''                    if queue_writer(&writer_tx, WriterCommand::Frame(frame, Flush::None)).is_err() {\n                        let _ = reply.send(Err(ExternalError::ProtocolEncode));\n                        fatal_reason = Some(FatalReason::ProtocolEncode);\n                        fatal_request_id = Some(request_id);\n                        break;\n                    }\n''',
+          )
+          replace(
+              'src/external_modules/v6_process.rs',
+              '''                    else if !start_shutdown(&mut closing, &mut pending, &mut workers, &writer_tx, request_id, Some(reply), &mut shutdown_reply) { break; }\n''',
+              '''                    else if !start_shutdown(&mut closing, &mut pending, &mut workers, &writer_tx, request_id, Some(reply), &mut shutdown_reply) {\n                        fatal_reason = Some(FatalReason::ProtocolEncode);\n                        break;\n                    }\n''',
+          )
+          replace(
+              'src/external_modules/v6_process.rs',
+              '''                    if !closing\n                        && !start_shutdown(&mut closing, &mut pending, &mut workers, &writer_tx, "0".to_owned(), None, &mut shutdown_reply)\n                    {\n                        break;\n                    }\n''',
+              '''                    if !closing\n                        && !start_shutdown(&mut closing, &mut pending, &mut workers, &writer_tx, "0".to_owned(), None, &mut shutdown_reply)\n                    {\n                        fatal_reason = Some(FatalReason::ProtocolEncode);\n                        break;\n                    }\n''',
+          )
+          replace(
+              'src/external_modules/v6_process.rs',
+              '''                        if !reserve_call_id(&mut active_calls, &call_id) {\n                            // Duplicate call IDs are protocol-fatal even while\n                            // closing, so their meaning is never ambiguous.\n                            break;\n                        }\n''',
+              '''                        if !reserve_call_id(&mut active_calls, &call_id) {\n                            // Duplicate call IDs are protocol-fatal even while\n                            // closing, so their meaning is never ambiguous.\n                            fatal_reason = Some(FatalReason::ProtocolDecode);\n                            break;\n                        }\n''',
+          )
+          replace(
+              'src/external_modules/v6_process.rs',
+              '''                    frame if terminal_request_id(&frame).is_some() => {\n                        let Some(request_id) = terminal_request_id(&frame) else {\n                            break;\n                        };\n                        if let Some(pending_request) = pending.remove(request_id) {\n                            if !initialized_module_matches(&descriptor, &frame) { let _ = pending_request.reply.send(Err(ExternalError::WrongModuleId)); break; }\n                            else if expected_matches(pending_request.expected, &frame) { let _ = pending_request.reply.send(Ok(frame)); }\n                            else { let _ = pending_request.reply.send(Err(ExternalError::ProtocolDecode)); }\n                        } else { break; }\n                    }\n                    V6InboundFrame::Log { .. } => {}\n                    _ => break,\n                },\n                Some(ActorEvent::Inbound(Err(_))) => break,\n''',
+              '''                    frame if terminal_request_id(&frame).is_some() => {\n                        let Some(request_id) = terminal_request_id(&frame).map(str::to_owned) else {\n                            fatal_reason = Some(FatalReason::ProtocolDecode);\n                            break;\n                        };\n                        if let Some(pending_request) = pending.remove(&request_id) {\n                            if !initialized_module_matches(&descriptor, &frame) {\n                                let _ = pending_request.reply.send(Err(ExternalError::WrongModuleId));\n                                fatal_reason = Some(FatalReason::WrongModuleId);\n                                fatal_request_id = Some(request_id);\n                                break;\n                            } else if expected_matches(pending_request.expected, &frame) {\n                                let _ = pending_request.reply.send(Ok(frame));\n                            } else {\n                                let _ = pending_request.reply.send(Err(ExternalError::ProtocolDecode));\n                                fatal_reason = Some(FatalReason::ProtocolDecode);\n                                fatal_request_id = Some(request_id);\n                                break;\n                            }\n                        } else {\n                            fatal_reason = Some(FatalReason::WrongRequestId);\n                            fatal_request_id = Some(request_id);\n                            break;\n                        }\n                    }\n                    V6InboundFrame::Log { request_id, level, message } => {\n                        if !pending.contains_key(&request_id) {\n                            fatal_reason = Some(FatalReason::WrongRequestId);\n                            fatal_request_id = Some(request_id);\n                            break;\n                        }\n                        process::log_module_message(&descriptor.id, &request_id, &level, &message);\n                    }\n                    _ => {\n                        fatal_reason = Some(FatalReason::ProtocolDecode);\n                        break;\n                    },\n                },\n                Some(ActorEvent::Inbound(Err(error))) => {\n                    fatal_reason = Some(FatalReason::from_inbound(&error));\n                    fatal_request_id = single_pending_request_id(&pending);\n                    break;\n                },\n''',
+          )
+          replace(
+              'src/external_modules/v6_process.rs',
+              '''                        if let Some(reply) = shutdown_reply.take() {\n                            let _ = reply.send(Err(ExternalError::Unavailable));\n                        }\n                        break;\n''',
+              '''                        if let Some(reply) = shutdown_reply.take() {\n                            let _ = reply.send(Err(ExternalError::Unavailable));\n                        }\n                        fatal_reason = Some(FatalReason::Unavailable);\n                        fatal_request_id = single_pending_request_id(&pending);\n                        break;\n''',
+          )
+          replace(
+              'src/external_modules/v6_process.rs',
+              '''                Some(ActorEvent::WriterFailed) | None => { if let Some(reply) = shutdown_reply.take() { let _ = reply.send(Err(ExternalError::Unavailable)); } break; },\n''',
+              '''                Some(ActorEvent::WriterFailed) | None => {\n                    if let Some(reply) = shutdown_reply.take() { let _ = reply.send(Err(ExternalError::ProtocolEncode)); }\n                    fatal_reason = Some(FatalReason::ProtocolEncode);\n                    fatal_request_id = single_pending_request_id(&pending);\n                    break;\n                },\n''',
+          )
+          replace(
+              'src/external_modules/v6_process.rs',
+              '''            _ = async { if let Some(deadline) = shutdown_deadline { tokio::time::sleep_until(deadline).await } else { future::pending::<()>().await } }, if closing => {\n                if let Some(reply) = shutdown_reply.take() { let _ = reply.send(Err(ExternalError::ShutdownTimeout)); }\n                kill_group(process_group);\n                force_kill = true;\n                break;\n            },\n            _ = sleep_until_pending_deadline(&pending), if !pending.is_empty() => {\n                expire_pending(&mut pending);\n            },\n''',
+              '''            _ = async { if let Some(deadline) = shutdown_deadline { tokio::time::sleep_until(deadline).await } else { future::pending::<()>().await } }, if closing => {\n                if let Some(reply) = shutdown_reply.take() { let _ = reply.send(Err(ExternalError::ShutdownTimeout)); }\n                fatal_reason = Some(FatalReason::ShutdownTimeout);\n                break;\n            },\n            _ = sleep_until_pending_deadline(&pending), if !pending.is_empty() => {\n                if let Some(request_id) = expired_request_id(&pending) {\n                    fatal_reason = Some(FatalReason::ExecutionTimeout);\n                    fatal_request_id = Some(request_id);\n                    break;\n                }\n            },\n''',
+          )
+          replace(
+              'src/external_modules/v6_process.rs',
+              '''    fail_pending(&mut pending);\n    workers.abort_all();\n    while workers.join_next().await.is_some() {}\n    drop(writer_tx);\n    reader.abort();\n    writer.abort();\n    stderr_drain.abort();\n    let _ = reader.await;\n    let _ = writer.await;\n    let _ = stderr_drain.await;\n    if !child_reaped {\n        if force_kill || timeout(V6_SHUTDOWN_TIMEOUT, child.wait()).await.is_err() {\n            kill_group(process_group);\n        }\n        let _ = child.wait().await;\n    }\n}\n''',
+              '''    if fatal_request_id.is_none() {\n        fatal_request_id = single_pending_request_id(&pending);\n    }\n    if let Some(reason) = fatal_reason {\n        fail_pending_with(&mut pending, reason);\n    } else {\n        fail_pending(&mut pending);\n    }\n    workers.abort_all();\n    while workers.join_next().await.is_some() {}\n    drop(writer_tx);\n    reader.abort();\n    writer.abort();\n\n    // The process group is a separate lifecycle resource from the leader PID.\n    // Always terminate it when the supervisor exits, even when child.wait()\n    // already reaped the leader, so orphaned descendants cannot survive.\n    kill_group(process_group);\n    if !child_reaped && timeout(V6_SHUTDOWN_TIMEOUT, child.wait()).await.is_err() {\n        let _ = child.kill().await;\n        let _ = child.wait().await;\n    }\n\n    process::finish_stderr_drain(stderr_drain).await;\n    let _ = reader.await;\n    let _ = writer.await;\n\n    if let Some(reason) = fatal_reason {\n        let capture = process::lock_capture(&stderr_capture).clone();\n        let error = reason.error();\n        let diagnostics = process::build_crash_diagnostics(\n            &descriptor,\n            fatal_request_id.as_deref(),\n            &error,\n            &capture,\n        );\n        process::emit_crash_event(&diagnostics);\n    }\n}\n''',
+          )
+          replace(
+              'src/external_modules/v6_process.rs',
+              '''    if !descriptor\n        .capabilities\n        .contains(&ExternalCapability::TelegramRaw)\n    {\n        return Err(V6CallError {\n            kind: "capability".to_owned(),\n            message: "telegram.raw capability is required".to_owned(),\n        });\n    }\n    let method = v6_registry::lookup(method).ok_or_else(|| V6CallError {\n''',
+              '''    let method = v6_registry::lookup(method).ok_or_else(|| V6CallError {\n''',
+          )
+          replace(
+              'src/external_modules/v6_process.rs',
+              '''    if !descriptor.telegram_methods.contains(&method) {\n        return Err(V6CallError {\n            kind: "capability".to_owned(),\n            message: "method is not granted".to_owned(),\n        });\n    }\n    Ok(method)\n}\n''',
+              '''    if !descriptor.telegram_methods.contains(&method) {\n        return Err(V6CallError {\n            kind: "capability".to_owned(),\n            message: "method is not granted".to_owned(),\n        });\n    }\n    match method {\n        v6_registry::V6Method::RawInvoke\n            if !descriptor\n                .capabilities\n                .contains(&ExternalCapability::TelegramRaw) =>\n        {\n            return Err(V6CallError {\n                kind: "capability".to_owned(),\n                message: "telegram.raw capability is required".to_owned(),\n            });\n        }\n        v6_registry::V6Method::AccountUpdateStatus\n            if !descriptor\n                .capabilities\n                .contains(&ExternalCapability::TelegramAccountStatus) =>\n        {\n            return Err(V6CallError {\n                kind: "capability".to_owned(),\n                message: "telegram.account.status capability is required".to_owned(),\n            });\n        }\n        _ => {}\n    }\n    Ok(method)\n}\n''',
+          )
+          replace(
+              'src/external_modules/v6_process.rs',
+              '''fn expire_pending(pending: &mut HashMap<String, Pending>) {\n    let now = Instant::now();\n    let retained = std::mem::take(pending);\n    for (request_id, request) in retained {\n        if request.deadline <= now {\n            let _ = request.reply.send(Err(ExternalError::ExecutionTimeout));\n        } else {\n            pending.insert(request_id, request);\n        }\n    }\n}\n\n''',
+              '''fn expired_request_id(pending: &HashMap<String, Pending>) -> Option<String> {\n    let now = Instant::now();\n    pending\n        .iter()\n        .find_map(|(request_id, request)| (request.deadline <= now).then(|| request_id.clone()))\n}\n\nfn single_pending_request_id(pending: &HashMap<String, Pending>) -> Option<String> {\n    (pending.len() == 1)\n        .then(|| pending.keys().next().cloned())\n        .flatten()\n}\n\n''',
+          )
+          replace(
+              'src/external_modules/v6_process.rs',
+              '''fn fail_pending(pending: &mut HashMap<String, Pending>) {\n    for (_, request) in pending.drain() {\n        let _ = request.reply.send(Err(ExternalError::Unavailable));\n    }\n}\n\n''',
+              '''fn fail_pending(pending: &mut HashMap<String, Pending>) {\n    for (_, request) in pending.drain() {\n        let _ = request.reply.send(Err(ExternalError::Unavailable));\n    }\n}\n\nfn fail_pending_with(pending: &mut HashMap<String, Pending>, reason: FatalReason) {\n    for (_, request) in pending.drain() {\n        let _ = request.reply.send(Err(reason.error()));\n    }\n}\n\n''',
+          )
+          # V6 now uses the shared bounded stderr capture implementation.
+          import re
+          p = Path('src/external_modules/v6_process.rs')
+          text = p.read_text()
+          pattern = re.compile(r'\nasync fn drain_stderr\(mut stderr: tokio::process::ChildStderr\) -> Vec<u8> \{.*?\n\}\n\n\#\[cfg\(test\)\]', re.S)
+          text, n = pattern.subn('\n#[cfg(test)]', text, count=1)
+          if n != 1:
+              raise SystemExit(f'v6_process.rs: failed to remove local drain_stderr ({n})')
+          p.write_text(text)
+
+          # Least privilege: only raw.invoke is coupled to telegram.raw.
+          replace(
+              'src/external_modules/manifest.rs',
+              'const MAX_V6_TELEGRAM_METHODS: usize = 4;\n',
+              'const MAX_V6_TELEGRAM_METHODS: usize = v6_registry::METHOD_SPECS.len();\n',
+          )
+          replace(
+              'src/external_modules/manifest.rs',
+              '''    let has_raw = seen_capabilities.contains(&ExternalCapability::TelegramRaw);\n    if has_raw == telegram_method_names.is_empty()\n        || telegram_method_names.len() > MAX_V6_TELEGRAM_METHODS\n        || (has_raw && manifest.schema_version != 6)\n    {\n        return Err(ExternalError::InvalidCapability);\n    }\n''',
+              '''    let has_raw = seen_capabilities.contains(&ExternalCapability::TelegramRaw);\n    let requests_raw = telegram_method_names.iter().any(|method| method == "raw.invoke");\n    if has_raw != requests_raw\n        || telegram_method_names.len() > MAX_V6_TELEGRAM_METHODS\n        || (has_raw && manifest.schema_version != 6)\n    {\n        return Err(ExternalError::InvalidCapability);\n    }\n''',
+          )
+          old_test_start = '    #[test]\n    fn v6_raw_methods_are_explicit_reviewed_and_legacy_rejects_the_field() {'
+          old_test_end = '    #[test]\n    fn peer_id_capability_requires_schema_v4_and_message_read() {'
+          p = Path('src/external_modules/manifest.rs')
+          text = p.read_text()
+          start = text.index(old_test_start)
+          end = text.index(old_test_end, start)
+          new_test = '''    #[test]\n    fn v6_method_grants_preserve_least_privilege_and_legacy_rejects_the_field() {\n        let base = temp_dir();\n        let dir = create_module_dir(&base, "echo");\n        let mut json = serde_json::from_slice::<serde_json::Value>(&valid_manifest_json()).unwrap();\n        json["schema_version"] = serde_json::json!(6);\n\n        json["capabilities"] = serde_json::json!(["telegram.account.status"]);\n        json["telegram_methods"] = serde_json::json!(["account.updateStatus"]);\n        let path = write_manifest(&dir, &serde_json::to_vec(&json).unwrap());\n        let descriptor = validate_manifest_at(&path, Some("echo")).unwrap();\n        assert_eq!(descriptor.telegram_methods[0].spec().name, "account.updateStatus");\n        assert!(!descriptor.capabilities.contains(&ExternalCapability::TelegramRaw));\n\n        json["capabilities"] = serde_json::json!([]);\n        json["telegram_methods"] = serde_json::json!(["contacts.getContacts"]);\n        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();\n        assert!(validate_manifest_at(&path, Some("echo")).is_ok());\n\n        json["telegram_methods"] = serde_json::json!(["raw.invoke"]);\n        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();\n        assert!(matches!(validate_manifest_at(&path, Some("echo")), Err(ExternalError::InvalidCapability)));\n\n        json["capabilities"] = serde_json::json!(["telegram.raw"]);\n        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();\n        let descriptor = validate_manifest_at(&path, Some("echo")).unwrap();\n        assert!(descriptor.capabilities.contains(&ExternalCapability::TelegramRaw));\n\n        json["telegram_methods"] = serde_json::json!(["account.updateStatus"]);\n        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();\n        assert!(matches!(validate_manifest_at(&path, Some("echo")), Err(ExternalError::InvalidCapability)));\n\n        json["capabilities"] = serde_json::json!([]);\n        json["telegram_methods"] = serde_json::json!(["unknown.method"]);\n        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();\n        assert!(matches!(validate_manifest_at(&path, Some("echo")), Err(ExternalError::InvalidArgument)));\n\n        json["telegram_methods"] = serde_json::json!(["account.updateStatus", "account.updateStatus"]);\n        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();\n        assert!(matches!(validate_manifest_at(&path, Some("echo")), Err(ExternalError::InvalidArgument)));\n\n        json["telegram_methods"] = serde_json::json!(["account.updateStatus"]);\n        for schema_version in 2..=5 {\n            json["schema_version"] = serde_json::json!(schema_version);\n            fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();\n            assert!(matches!(validate_manifest_at(&path, Some("echo")), Err(ExternalError::MalformedManifest)));\n        }\n        fs::remove_dir_all(&base).unwrap();\n    }\n\n'''
+          p.write_text(text[:start] + new_test + text[end:])
+
+          # Preserve Telegram cache semantics instead of pretending NotModified is empty.
+          replace(
+              'src/external_modules/v6_executor.rs',
+              '''            grammers_client::tl::enums::contacts::Contacts::NotModified => {\n                contacts_summary(0, 0, 0)\n            }\n''',
+              '''            grammers_client::tl::enums::contacts::Contacts::NotModified => not_modified_result(),\n''',
+          )
+          replace(
+              'src/external_modules/v6_executor.rs',
+              '''            grammers_client::tl::enums::messages::Messages::NotModified(_) => {\n                history_summary(0, 0, 0, 0, params.limit)\n            }\n''',
+              '''            grammers_client::tl::enums::messages::Messages::NotModified(_) => not_modified_result(),\n''',
+          )
+          replace(
+              'src/external_modules/v6_executor.rs',
+              '''            grammers_client::tl::enums::messages::Dialogs::NotModified(_) => {\n                dialogs_summary(0, 0, 0, 0, params.limit)\n            }\n''',
+              '''            grammers_client::tl::enums::messages::Dialogs::NotModified(_) => not_modified_result(),\n''',
+          )
+          replace(
+              'src/external_modules/v6_executor.rs',
+              '#[derive(Serialize)]\nstruct ContactsSummary {\n',
+              '''fn not_modified_result() -> Result<V6RpcOutput, V6ExecutorError> {\n    V6RpcOutput::new(serde_json::json!({ "kind": "not_modified" }))\n}\n\n#[derive(Serialize)]\nstruct ContactsSummary {\n''',
+          )
+          replace(
+              'src/external_modules/v6_executor.rs',
+              '''        assert_eq!(\n            contacts_summary(2, 3, 4).unwrap().into_value(),\n''',
+              '''        assert_eq!(\n            not_modified_result().unwrap().into_value(),\n            serde_json::json!({"kind": "not_modified"})\n        );\n        assert_eq!(\n            contacts_summary(2, 3, 4).unwrap().into_value(),\n''',
+          )
+
+          # Let the capped backoff actually reach its steady state before process restart.
+          replace('src/updates.rs', 'const UPDATE_STREAM_RESTART_AFTER: u32 = 3;\n', 'const UPDATE_STREAM_RESTART_AFTER: u32 = 12;\n')
+          replace('src/updates.rs', '        assert_eq!(UPDATE_STREAM_RESTART_AFTER, 3);\n', '        assert_eq!(UPDATE_STREAM_RESTART_AFTER, 12);\n')
+
+          # Generated registry drift must fail CI.
+          replace(
+              '.github/workflows/ci.yml',
+              '      - name: Check formatting\n        run: nix develop -c cargo fmt --check\n\n',
+              '      - name: Check generated v6 registry\n        run: python3 tools/generate_v6_registry.py --check\n\n      - name: Check formatting\n        run: nix develop -c cargo fmt --check\n\n',
+          )
+
+          # Update v6 tests for fatal timeout semantics and least-privilege dispatch.
+          replace(
+              'src/external_modules/v6_process.rs',
+              '''        expire_pending(&mut pending);\n        assert!(pending.is_empty());\n        assert!(matches!(\n            receiver.try_recv(),\n            Ok(Err(ExternalError::ExecutionTimeout))\n        ));\n''',
+              '''        assert_eq!(expired_request_id(&pending), Some("1".to_owned()));\n        fail_pending_with(&mut pending, FatalReason::ExecutionTimeout);\n        assert!(pending.is_empty());\n        assert!(matches!(\n            receiver.try_recv(),\n            Ok(Err(ExternalError::ExecutionTimeout))\n        ));\n''',
+          )
+          replace(
+              'src/external_modules/v6_process.rs',
+              '''    #[test]\n    fn terminal_frames_preserve_their_request_id() {\n''',
+              '''    #[test]\n    fn curated_methods_do_not_require_raw_but_raw_does() {\n        let mut descriptor = descriptor();\n        descriptor.telegram_methods = vec![v6_registry::V6Method::ContactsGetContacts];\n        assert_eq!(\n            validate_invoke(&descriptor, "contacts.getContacts", true).unwrap(),\n            v6_registry::V6Method::ContactsGetContacts\n        );\n\n        descriptor.telegram_methods = vec![v6_registry::V6Method::RawInvoke];\n        assert!(matches!(\n            validate_invoke(&descriptor, "raw.invoke", true),\n            Err(V6CallError { kind, .. }) if kind == "capability"\n        ));\n        descriptor.capabilities.push(ExternalCapability::TelegramRaw);\n        assert_eq!(\n            validate_invoke(&descriptor, "raw.invoke", true).unwrap(),\n            v6_registry::V6Method::RawInvoke\n        );\n    }\n\n    #[test]\n    fn terminal_frames_preserve_their_request_id() {\n''',
+          )
+          PY
+
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@v3
+
+      - name: Format, lint and test
+        run: |
+          nix develop -c cargo fmt
+          python3 tools/generate_v6_registry.py --check
+          nix develop -c cargo check --all-targets --all-features
+          nix develop -c cargo clippy --all-targets --all-features -- -D warnings
+          nix develop -c cargo test --all-targets --all-features
+
+      - name: Commit fixes
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/external_modules/process.rs src/external_modules/v6_process.rs src/external_modules/manifest.rs src/external_modules/v6_executor.rs src/updates.rs .github/workflows/ci.yml
+          git commit -m 'fix: address Module API v6 review blockers'
+          git push origin HEAD:feat/module-api-v6-full-telegram
