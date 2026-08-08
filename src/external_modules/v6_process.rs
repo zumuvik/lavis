@@ -2308,6 +2308,79 @@ sys.exit(0)
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn lifecycle_requests_are_serialized_but_parentless_rpc_is_not_blocked() {
+        use std::fs;
+        let root = test_root("v6-sequential");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        ensure_test_state_base();
+        let marker = root.join("marker");
+        let mut module = descriptor();
+        module.id = format!("v6sequential{}", std::process::id());
+        module.module_dir = root.clone();
+        module.entrypoint = root.join("run");
+        module.telegram_methods = vec![v6_registry::V6Method::ContactsGetContacts];
+        let script = r#"#!/usr/bin/env python3
+import json, os, select, sys, time
+
+line = sys.stdin.readline()
+rid = json.loads(line)["request_id"]
+with open("marker", "w") as f:
+    f.write("first-received")
+time.sleep(0.25)
+ready, _, _ = select.select([sys.stdin], [], [], 0.05)
+with open("marker", "a") as f:
+    f.write("|" + ("second-too-early" if ready else "no-second-before-response"))
+print(json.dumps({"protocol_version":6,"type":"initialized","request_id":rid,"module_id":"__MODULE_ID__"}), flush=True)
+
+line = sys.stdin.readline()
+frame = json.loads(line)
+assert frame["type"] == "execute"
+rid = frame["request_id"]
+print(json.dumps({"protocol_version":6,"type":"telegram.invoke","call_id":"during-execute","method":"contacts.getContacts","params":{"hash":"0"}}), flush=True)
+result = json.loads(sys.stdin.readline())
+assert result["type"] == "telegram.result"
+assert result["call_id"] == "during-execute"
+print(json.dumps({"protocol_version":6,"type":"result","request_id":rid,"text":"ok"}), flush=True)
+sys.stdin.readline()
+sys.exit(0)
+"#
+            .replace("__MODULE_ID__", &module.id);
+        write_v6_fixture(&module.entrypoint, &script);
+        let executor = Arc::new(RecordingExecutor::default());
+        let observed = executor.clone();
+        let process = V6Process::start(module.clone(), executor, 1).await.unwrap();
+        let init_process = process.clone();
+        let init =
+            tokio::spawn(async move { init_process.initialize("1".to_owned(), module.id).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let execute_process = process.clone();
+        let execute = tokio::spawn(async move {
+            execute_process
+                .execute("2".to_owned(), "go".to_owned(), String::new(), vec![])
+                .await
+        });
+        assert!(matches!(
+            init.await.unwrap(),
+            Ok(V6InboundFrame::Initialized { .. })
+        ));
+        assert!(
+            matches!(execute.await.unwrap(), Ok(V6InboundFrame::Result { ref text, .. }) if text == "ok")
+        );
+        assert_eq!(
+            fs::read_to_string(&marker).unwrap(),
+            "first-received|no-second-before-response"
+        );
+        assert_eq!(
+            observed.methods.lock().unwrap().as_slice(),
+            &[v6_registry::V6Method::ContactsGetContacts]
+        );
+        process.graceful_shutdown().await.unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn malformed_child_frame_crashes_with_retained_protocol_diagnostic() {
         use std::fs;
         let root = test_root("v6-malformed");
