@@ -777,6 +777,15 @@ impl CrashDiagnostics {
             stderr,
         )
     }
+
+    /// One-line health summary for `lm doctor`; never includes stderr or
+    /// request payloads.
+    pub(crate) fn summary(&self) -> String {
+        format!(
+            "stage={} category={} generation={}",
+            self.lifecycle_stage, self.error_category, self.restart_generation
+        )
+    }
 }
 
 /// Backwards-compatible legacy diagnostic builder. V6 uses the richer context-aware

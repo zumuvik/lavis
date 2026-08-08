@@ -72,26 +72,73 @@ pub enum V6ExecutorError {
     ShuttingDown,
 }
 
+/// Transport boundary for `raw.invoke`: Lavis hands the module's opaque
+/// serialized TL body to this abstraction and receives the opaque serialized
+/// TL response back. The production implementation speaks grammers-mtsender;
+/// tests substitute a fake so the raw protocol can be verified without a
+/// Telegram connection or credentials.
+pub trait RawTlTransport: Send + Sync {
+    /// The home DC id to use when the module omits `dc_id`. `None` means no
+    /// session is available.
+    fn home_dc_id(&self) -> Option<i32>;
+
+    /// Invoke a serialized raw TL body on the given DC. `body` and the return
+    /// value are opaque to Lavis; only the base64 chunk framing is understood.
+    fn invoke_in_dc(
+        &self,
+        dc_id: i32,
+        body: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, V6ExecutorError>> + Send + '_>>;
+}
+
+#[derive(Clone)]
+pub struct GrammersRawTlTransport {
+    raw_handle: grammers_mtsender::SenderPoolFatHandle,
+}
+
+impl RawTlTransport for GrammersRawTlTransport {
+    fn home_dc_id(&self) -> Option<i32> {
+        self.raw_handle.session.home_dc_id().ok()
+    }
+
+    fn invoke_in_dc(
+        &self,
+        dc_id: i32,
+        body: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, V6ExecutorError>> + Send + '_>> {
+        Box::pin(async move {
+            let response = self
+                .raw_handle
+                .invoke_in_dc(dc_id, body)
+                .await
+                .map_err(map_invocation_error)?;
+            Ok(response)
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct GrammersV6Executor {
     client: grammers_client::Client,
-    raw_handle: grammers_mtsender::SenderPoolFatHandle,
+    raw_transport: Arc<dyn RawTlTransport>,
     permits: Arc<Semaphore>,
 }
 
 impl GrammersV6Executor {
     pub fn new(module_rpc: ModuleRpcClient) -> Arc<Self> {
+        let ModuleRpcClient { client, raw_handle } = module_rpc;
         Arc::new(Self {
-            client: module_rpc.client,
-            raw_handle: module_rpc.raw_handle,
+            client,
+            raw_transport: Arc::new(GrammersRawTlTransport { raw_handle }),
             permits: Arc::new(Semaphore::new(V6_GLOBAL_CONCURRENCY)),
         })
     }
 
     pub fn with_permits(module_rpc: ModuleRpcClient, permits: Arc<Semaphore>) -> Arc<Self> {
+        let ModuleRpcClient { client, raw_handle } = module_rpc;
         Arc::new(Self {
-            client: module_rpc.client,
-            raw_handle: module_rpc.raw_handle,
+            client,
+            raw_transport: Arc::new(GrammersRawTlTransport { raw_handle }),
             permits,
         })
     }
@@ -241,24 +288,27 @@ impl GrammersV6Executor {
     }
 
     async fn raw_invoke(&self, params: Box<RawValue>) -> Result<V6RpcOutput, V6ExecutorError> {
-        let params = decode::<RawInvokeParams>(&params)?;
-        let body = decode_raw_tl_body(&params.body_base64_chunks)?;
-        let dc_id = match params.dc_id {
-            Some(dc_id) if (1..=100).contains(&dc_id) => dc_id,
-            Some(_) => return Err(V6ExecutorError::InvalidParams("dc_id out of range")),
-            None => self
-                .raw_handle
-                .session
-                .home_dc_id()
-                .map_err(|_| V6ExecutorError::Transport)?,
-        };
-        let response = self
-            .raw_handle
-            .invoke_in_dc(dc_id, body)
-            .await
-            .map_err(map_invocation_error)?;
-        raw_tl_result(dc_id, response)
+        raw_invoke_pipeline(self.raw_transport.as_ref(), params).await
     }
+}
+
+/// Transport-generic raw invocation: decode the module's base64 chunked TL
+/// body, resolve the target DC, invoke the opaque body on the transport, and
+/// re-encode the opaque response. Nothing here depends on grammers, so the raw
+/// protocol is testable with a fake transport.
+pub(crate) async fn raw_invoke_pipeline(
+    transport: &dyn RawTlTransport,
+    params: Box<RawValue>,
+) -> Result<V6RpcOutput, V6ExecutorError> {
+    let params = decode::<RawInvokeParams>(&params)?;
+    let body = decode_raw_tl_body(&params.body_base64_chunks)?;
+    let dc_id = match params.dc_id {
+        Some(dc_id) if (1..=100).contains(&dc_id) => dc_id,
+        Some(_) => return Err(V6ExecutorError::InvalidParams("dc_id out of range")),
+        None => transport.home_dc_id().ok_or(V6ExecutorError::Transport)?,
+    };
+    let response = transport.invoke_in_dc(dc_id, body).await?;
+    raw_tl_result(dc_id, response)
 }
 
 fn map_invocation_error(error: grammers_mtsender::InvocationError) -> V6ExecutorError {
@@ -426,7 +476,7 @@ fn raw_tl_result(dc_id: i32, body: Vec<u8>) -> Result<V6RpcOutput, V6ExecutorErr
     }))
 }
 
-fn encode_base64(input: &[u8]) -> String {
+pub(crate) fn encode_base64(input: &[u8]) -> String {
     let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let first = chunk[0];
@@ -684,5 +734,124 @@ mod tests {
                 "truncated": false,
             })
         );
+    }
+
+    /// Fake transport that records the opaque body it received and returns a
+    /// canned opaque response, proving the pipeline is transport-generic.
+    struct FakeRawTlTransport {
+        home_dc: Option<i32>,
+        response: Vec<u8>,
+        received: std::sync::Mutex<Vec<(i32, Vec<u8>)>>,
+    }
+
+    impl RawTlTransport for FakeRawTlTransport {
+        fn home_dc_id(&self) -> Option<i32> {
+            self.home_dc
+        }
+
+        fn invoke_in_dc(
+            &self,
+            dc_id: i32,
+            body: Vec<u8>,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, V6ExecutorError>> + Send + '_>> {
+            Box::pin(async move {
+                self.received.lock().unwrap().push((dc_id, body));
+                Ok(self.response.clone())
+            })
+        }
+    }
+
+    fn encoded_body_chunks(body: &[u8]) -> Vec<String> {
+        vec![encode_base64(body)]
+    }
+
+    /// Raw TL bytes for `messages.sendMessage`, a valid Telegram method that
+    /// has NO typed registry entry: the raw path must not depend on
+    /// `tools/v6-methods.json`. The body is opaque to Lavis; the 4-byte
+    /// constructor prefix plus payload is enough to be TL-plausible.
+    fn send_message_raw_body() -> Vec<u8> {
+        // constructor id 0x520c3870, little-endian, plus a minimal payload;
+        // must stay 4-byte aligned for the bounded TL framing
+        vec![0x70, 0x38, 0x0c, 0x52, 0x01, 0x00, 0x00, 0x00]
+    }
+
+    #[tokio::test]
+    async fn raw_invoke_pipeline_is_transport_generic_with_opaque_bytes() {
+        assert!(
+            super::super::v6_registry::lookup("messages.sendMessage").is_none(),
+            "fixture method must not be in the typed registry"
+        );
+        let body = send_message_raw_body();
+        let transport = FakeRawTlTransport {
+            home_dc: Some(2),
+            response: vec![0xaa, 0xbb, 0xcc, 0xdd, 0x11],
+            received: std::sync::Mutex::new(Vec::new()),
+        };
+        let params = raw(&format!(
+            r#"{{"dc_id":2,"body_base64_chunks":{}}}"#,
+            serde_json::to_string(&encoded_body_chunks(&body)).unwrap()
+        ));
+
+        let output = raw_invoke_pipeline(&transport, params).await.unwrap();
+        let value = output.into_value();
+        assert_eq!(value["kind"], "raw_tl");
+        assert_eq!(value["dc_id"], 2);
+        let chunks = value["body_base64_chunks"].as_array().unwrap();
+        let encoded = chunks
+            .iter()
+            .map(|chunk| chunk.as_str().unwrap())
+            .collect::<Vec<_>>()
+            .concat();
+        assert_eq!(decode_base64(&encoded).unwrap(), transport.response);
+
+        let received = transport.received.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].0, 2);
+        assert_eq!(
+            received[0].1, body,
+            "module body must reach the transport intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_invoke_pipeline_resolves_home_dc_and_rejects_out_of_range() {
+        let transport = FakeRawTlTransport {
+            home_dc: Some(4),
+            response: vec![0x0f; 4],
+            received: std::sync::Mutex::new(Vec::new()),
+        };
+        let body = send_message_raw_body();
+        let params = raw(&format!(
+            r#"{{"body_base64_chunks":{}}}"#,
+            serde_json::to_string(&encoded_body_chunks(&body)).unwrap()
+        ));
+        let output = raw_invoke_pipeline(&transport, params).await.unwrap();
+        assert_eq!(output.into_value()["dc_id"], 4);
+
+        let params = raw(&format!(
+            r#"{{"dc_id":101,"body_base64_chunks":{}}}"#,
+            serde_json::to_string(&encoded_body_chunks(&body)).unwrap()
+        ));
+        assert!(matches!(
+            raw_invoke_pipeline(&transport, params).await,
+            Err(V6ExecutorError::InvalidParams(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn raw_invoke_pipeline_without_session_is_a_transport_error() {
+        let transport = FakeRawTlTransport {
+            home_dc: None,
+            response: vec![],
+            received: std::sync::Mutex::new(Vec::new()),
+        };
+        let params = raw(&format!(
+            r#"{{"body_base64_chunks":{}}}"#,
+            serde_json::to_string(&encoded_body_chunks(&send_message_raw_body())).unwrap()
+        ));
+        assert!(matches!(
+            raw_invoke_pipeline(&transport, params).await,
+            Err(V6ExecutorError::Transport)
+        ));
     }
 }

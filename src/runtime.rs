@@ -816,6 +816,7 @@ impl RuntimeState {
             LmRequest::Overview | LmRequest::List => self.render_lm_list().await,
             LmRequest::Info { id } => self.lm_info(id).await,
             LmRequest::Logs { id } => self.lm_logs(id).await,
+            LmRequest::Doctor { id } => self.lm_doctor(id.as_deref()).await,
             LmRequest::Invalid => Response::plain(lm_usage(self.prefix())),
             LmRequest::Install => {
                 self.inspect_module_install(client, message_context.message)
@@ -894,6 +895,91 @@ impl RuntimeState {
                 "ℹ️ Для модуля {id} нет сохранённой runtime-ошибки."
             )),
         }
+    }
+
+    /// Health checklist over the module runtime: per-module state, process
+    /// status, and the last retained crash diagnostic (including failures that
+    /// happened before the process left the running index). With an ID the
+    /// report is narrowed to one module; without one it covers all modules.
+    async fn lm_doctor(&self, id: Option<&str>) -> Response {
+        let Some(config) = &self.module_control else {
+            return Response::plain("⚠️ Управление внешними модулями недоступно.".to_owned());
+        };
+        let state = match ExternalStateStore::load(config.state_path.clone()).await {
+            Ok(state) => state,
+            Err(_) => {
+                return Response::plain("⚠️ Состояние внешних модулей недоступно.".to_owned());
+            }
+        };
+        let list = match control::list_modules(&config.root, &config.declarative_state_path, &state)
+        {
+            Ok(list) => list,
+            Err(_) => {
+                return Response::plain(
+                    "⚠️ Не удалось прочитать список внешних модулей.".to_owned(),
+                );
+            }
+        };
+        let mut lines = Vec::new();
+        for entry in &list.modules {
+            if let Some(module) = &entry.module {
+                if let Some(target) = id
+                    && module.id != target
+                {
+                    continue;
+                }
+                let runtime = runtime_status(self, &module.id);
+                let diagnostic = if let Some(handle) = &self.external_manager {
+                    handle
+                        .diagnostic_summary(&module.id)
+                        .await
+                        .map(|summary| format!("\n  Последний сбой: {summary}"))
+                } else {
+                    None
+                };
+                lines.push(format!(
+                    "• {}\n  ID: {}\n  Состояние: {}\n  Runtime: {}\n  Управление: {}{}",
+                    module.display_name,
+                    module.id,
+                    enabled_label(module.enabled),
+                    runtime,
+                    management_label(module.management),
+                    diagnostic.unwrap_or_default(),
+                ));
+            }
+        }
+        for enabled in state.enabled_ids() {
+            let listed = list
+                .modules
+                .iter()
+                .any(|entry| entry.id.as_deref() == Some(enabled));
+            if !listed
+                && let Some(target) = id
+                && enabled != target
+            {
+                continue;
+            }
+            lines.push(format!(
+                "• {enabled}\n  Статус: включён, но каталог отсутствует"
+            ));
+        }
+        let Some(target) = id else {
+            return Response::plain(format!(
+                "🩺 Диагностика внешних модулей\n\n{}",
+                if lines.is_empty() {
+                    "Внешние модули не установлены.".to_owned()
+                } else {
+                    lines.join("\n\n")
+                }
+            ));
+        };
+        if lines.is_empty() {
+            return Response::plain(format!("ℹ️ Модуль {target} не найден."));
+        }
+        Response::plain(format!(
+            "🩺 Диагностика модуля {target}\n\n{}",
+            lines.join("\n\n")
+        ))
     }
 
     async fn lm_info(&self, id: &str) -> Response {
@@ -1384,7 +1470,7 @@ fn commands_label(
 
 fn lm_usage(prefix: &str) -> String {
     format!(
-        "⚠️ Использование:\n{prefix}lm\n{prefix}lm list\n{prefix}lm info <id>\n{prefix}lm install\n{prefix}lm confirm <ApprovalId>\n{prefix}lm cancel <ApprovalId>\n{prefix}lm enable <id>\n{prefix}lm disable <id>"
+        "⚠️ Использование:\n{prefix}lm\n{prefix}lm list\n{prefix}lm info <id>\n{prefix}lm logs <id>\n{prefix}lm doctor [<id>]\n{prefix}lm install\n{prefix}lm confirm <ApprovalId>\n{prefix}lm cancel <ApprovalId>\n{prefix}lm enable <id>\n{prefix}lm disable <id>"
     )
 }
 
@@ -2287,6 +2373,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lm_doctor_reports_installed_modules_and_unknown_targets() {
+        use std::os::unix::fs::PermissionsExt;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "lavis-runtime-doctor-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+
+        // One valid installed module (disabled) with an executable entrypoint.
+        let module_dir = directory.join("sample");
+        fs::create_dir_all(&module_dir).unwrap();
+        fs::write(
+            module_dir.join("module.json"),
+            br#"{"schema_version":6,"id":"sample","name":"Sample","version":"1","author":"A","entrypoint":"run","capabilities":[],"telegram_methods":[],"commands":[{"name":"go","summary_ru":"x","description_ru":"x","usage":"<value>"}]}"#,
+        )
+        .unwrap();
+        let entrypoint = module_dir.join("run");
+        fs::write(&entrypoint, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&entrypoint, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let (mut runtime, state_directory) = runtime_with_alias().await;
+        runtime.configure_module_control(
+            directory.clone(),
+            directory.join("state.json"),
+            directory.join("declarative.json"),
+            PeerId::user(1).unwrap(),
+        );
+
+        let doctor_all = runtime.lm_doctor(None).await;
+        assert!(doctor_all.text.contains("🩺 Диагностика внешних модулей"));
+        assert!(doctor_all.text.contains("sample"));
+        assert!(doctor_all.text.contains("Runtime: не запущен"));
+        assert!(!doctor_all.text.contains("Последний сбой"));
+
+        let doctor_one = runtime.lm_doctor(Some("sample")).await;
+        assert!(doctor_one.text.contains("🩺 Диагностика модуля sample"));
+        assert!(doctor_one.text.contains("sample"));
+
+        let doctor_missing = runtime.lm_doctor(Some("absent")).await;
+        assert!(doctor_missing.text.contains("Модуль absent не найден."));
+
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(state_directory).unwrap();
+    }
+
+    #[tokio::test]
     async fn generated_username_has_no_botfather_side_effect_before_confirmation() {
         let mut setup = super::SetupCoordinator {
             state_path: PathBuf::new(),
@@ -3018,7 +3154,7 @@ for line in sys.stdin:
     fn lm_usage_lists_each_supported_form() {
         assert_eq!(
             lm_usage("."),
-            "⚠️ Использование:\n.lm\n.lm list\n.lm info <id>\n.lm install\n.lm confirm <ApprovalId>\n.lm cancel <ApprovalId>\n.lm enable <id>\n.lm disable <id>"
+            "⚠️ Использование:\n.lm\n.lm list\n.lm info <id>\n.lm logs <id>\n.lm doctor [<id>]\n.lm install\n.lm confirm <ApprovalId>\n.lm cancel <ApprovalId>\n.lm enable <id>\n.lm disable <id>"
         );
     }
 }

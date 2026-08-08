@@ -61,6 +61,7 @@ impl V6Process {
     pub(crate) async fn start(
         descriptor: ExternalModuleDescriptor,
         executor: Arc<dyn V6TelegramExecutor>,
+        restart_generation: u64,
     ) -> Result<Self, ExternalError> {
         if descriptor.protocol_version != 6
             || !descriptor.entrypoint.starts_with(&descriptor.module_dir)
@@ -68,8 +69,8 @@ impl V6Process {
             return Err(ExternalError::InvalidArgument);
         }
 
-        let state_dir = v6_module_state_dir(&descriptor.id, &|name| std::env::var_os(name))
-            .ok_or(ExternalError::StateRead)?;
+        let state_dir =
+            resolve_v6_module_state_dir(&descriptor.id).ok_or(ExternalError::StateRead)?;
         tokio::fs::create_dir_all(&state_dir)
             .await
             .map_err(|_| ExternalError::StateWrite)?;
@@ -148,6 +149,7 @@ impl V6Process {
                 stderr_drain,
                 stderr_capture,
             },
+            restart_generation,
         ));
         Ok(Self {
             control: control_tx,
@@ -340,7 +342,7 @@ enum Expected {
     EventResult,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum FatalReason {
     Unavailable,
     ProtocolDecode,
@@ -403,10 +405,12 @@ struct Pending {
     reply: oneshot::Sender<Result<V6InboundFrame, ExternalError>>,
 }
 
+#[derive(Debug)]
 enum WriterCommand {
     Frame(V6OutboundCoreFrame, Flush),
 }
 
+#[derive(Debug)]
 enum Flush {
     None,
     Call(String),
@@ -444,6 +448,7 @@ async fn supervise(
     executor: Arc<dyn V6TelegramExecutor>,
     runtime: Arc<Mutex<V6RuntimeState>>,
     io: SupervisorIo,
+    restart_generation: u64,
 ) {
     let SupervisorIo {
         mut control_rx,
@@ -655,10 +660,14 @@ async fn supervise(
             },
             event = rpc_rx.recv() => match event {
                 Some(ActorEvent::RpcComplete { call_id, result }) => {
-                    if let Err(error) = queue_writer(&writer_tx, WriterCommand::Frame(V6OutboundCoreFrame::TelegramResult { call_id: call_id.clone(), result }, Flush::Call(call_id))) {
-                        fatal_reason = Some(FatalReason::from_writer(error));
-                        fatal_stage = "rpc";
-                        break;
+                    match handle_rpc_complete(closing, &mut active_calls, &writer_tx, call_id, result)
+                    {
+                        Ok(_) => {}
+                        Err(reason) => {
+                            fatal_reason = Some(reason);
+                            fatal_stage = "rpc";
+                            break;
+                        }
                     }
                 }
                 Some(ActorEvent::Flushed(call_id)) => { active_calls.remove(&call_id); }
@@ -751,7 +760,7 @@ async fn supervise(
                 error_category: reason.category(),
                 exit_code,
                 signal: exit_signal,
-                restart_generation: 0,
+                restart_generation,
             },
         );
         {
@@ -783,6 +792,49 @@ fn queue_writer(
         Err(mpsc::error::TrySendError::Full(_)) => Err(WriterQueueFailure::Backpressure),
         Err(mpsc::error::TrySendError::Closed(_)) => Err(WriterQueueFailure::Closed),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RpcCompleteDisposition {
+    /// The completion was written to the module's stdin.
+    Written,
+    /// The completion raced shutdown and was cancelled without a write.
+    Discarded,
+}
+
+/// Shutdown barrier for RPC completions.
+///
+/// Once shutdown has begun, no newly processed RPC completion may enqueue a
+/// `telegram.result` after the `shutdown` frame: the child may exit as soon as
+/// it observes the shutdown frame, and a late write would race the closed pipe
+/// into a false writer failure. A completion processed before shutdown may
+/// still be written before shutdown. A completion processed after `closing`
+/// becomes true is discarded cleanly and its `call_id` bookkeeping released,
+/// without turning the race into a protocol crash.
+fn handle_rpc_complete(
+    closing: bool,
+    active_calls: &mut HashSet<String>,
+    writer: &mpsc::Sender<WriterCommand>,
+    call_id: String,
+    result: Result<serde_json::Value, V6CallError>,
+) -> Result<RpcCompleteDisposition, FatalReason> {
+    if closing {
+        active_calls.remove(&call_id);
+        return Ok(RpcCompleteDisposition::Discarded);
+    }
+    if let Err(error) = queue_writer(
+        writer,
+        WriterCommand::Frame(
+            V6OutboundCoreFrame::TelegramResult {
+                call_id: call_id.clone(),
+                result,
+            },
+            Flush::Call(call_id),
+        ),
+    ) {
+        return Err(FatalReason::from_writer(error));
+    }
+    Ok(RpcCompleteDisposition::Written)
 }
 
 fn reserve_call_id(active_calls: &mut HashSet<String>, call_id: &str) -> bool {
@@ -1147,6 +1199,25 @@ where
         .then_some(base.join("lavis/modules").join(module_id))
 }
 
+#[cfg(test)]
+static TEST_STATE_BASE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn set_test_state_base(base: PathBuf) {
+    let _ = TEST_STATE_BASE.set(base);
+}
+
+/// Resolve the module state directory. Tests install a writable base so the
+/// Nix build sandbox (whose `$HOME` is not writable) can run the real-child
+/// fixtures without leaking module state into the user's home.
+fn resolve_v6_module_state_dir(module_id: &str) -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(base) = TEST_STATE_BASE.get() {
+        return Some(base.join("lavis/modules").join(module_id));
+    }
+    v6_module_state_dir(module_id, &|name| std::env::var_os(name))
+}
+
 #[cfg(unix)]
 async fn secure_directory(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -1175,6 +1246,14 @@ async fn cleanup_spawned_child(child: &mut Child, pid: Option<u32>) {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    use crate::external_modules::{
+        manifest,
+        source_inspection::{
+            AcquiredLmod, InspectionConfig, InspectionLimits, ModuleInspector, OsRandom,
+        },
+        v6_executor::{self, V6ExecutorError},
+    };
 
     fn descriptor() -> ExternalModuleDescriptor {
         ExternalModuleDescriptor {
@@ -1221,11 +1300,179 @@ mod tests {
         ))
     }
 
+    /// Point the v6 module state directory at a writable temp base. The Nix
+    /// build sandbox has a non-writable `$HOME`, so the real-child fixtures
+    /// must not depend on the environment; every child-spawning test calls
+    /// this before `V6Process::start`.
+    fn ensure_test_state_base() {
+        let base = std::env::temp_dir().join(format!("lavis-v6-test-state-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        set_test_state_base(base);
+    }
+
+    /// Absolute path to a `python3` interpreter found via the test process
+    /// PATH, mirroring the legacy process fixtures. The child environment is
+    /// cleared (`PATH=/usr/bin:/bin`), so fixture scripts must carry an
+    /// absolute interpreter path that exists in the sandbox.
+    fn python_executable() -> PathBuf {
+        std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+            .map(|directory| directory.join("python3"))
+            .find(|candidate| candidate.is_file())
+            .expect("fixture tests require python3 in PATH")
+    }
+
+    /// Write a v6 fixture script whose `#!/usr/bin/env python3` shebang is
+    /// rewritten to the absolute interpreter path, so the cleared child
+    /// environment can still execute it.
     #[cfg(unix)]
-    fn write_executable(path: &Path, contents: &str) {
+    fn write_v6_fixture(path: &Path, body: &str) {
         use std::{fs, os::unix::fs::PermissionsExt};
-        fs::write(path, contents).unwrap();
+        let body = body.replacen(
+            "#!/usr/bin/env python3",
+            &format!("#!{}", python_executable().display()),
+            1,
+        );
+        fs::write(path, body).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// In-memory variant of `write_v6_fixture` for archive payloads.
+    #[cfg(unix)]
+    fn fixture_script(body: &str) -> Vec<u8> {
+        body.replacen(
+            "#!/usr/bin/env python3",
+            &format!("#!{}", python_executable().display()),
+            1,
+        )
+        .into_bytes()
+    }
+
+    // Minimal STORED-only zip writer for packaged-module fixtures. Mirrors the
+    // source_inspection test helper; no compression is used, so the archive is
+    // inspectable by the production `inspect_into` path.
+    const LOCAL: u32 = 0x0403_4b50;
+    const CENTRAL: u32 = 0x0201_4b50;
+    const EOCD: u32 = 0x0605_4b50;
+
+    struct ArchiveEntry {
+        name: String,
+        data: Vec<u8>,
+        mode: u32,
+    }
+
+    fn put16(out: &mut Vec<u8>, value: u16) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn put32(out: &mut Vec<u8>, value: u32) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn zip_entries(entries: &[ArchiveEntry]) -> Vec<u8> {
+        let mut output = Vec::new();
+        let mut offsets = Vec::new();
+        for entry in entries {
+            offsets.push(output.len() as u32);
+            put32(&mut output, LOCAL);
+            put16(&mut output, 20);
+            put16(&mut output, 0);
+            put16(&mut output, 0);
+            put32(&mut output, 0);
+            put32(&mut output, 0);
+            put32(&mut output, entry.data.len() as u32);
+            put32(&mut output, entry.data.len() as u32);
+            put16(&mut output, entry.name.len() as u16);
+            put16(&mut output, 0);
+            output.extend_from_slice(entry.name.as_bytes());
+            output.extend_from_slice(&entry.data);
+        }
+        let central_start = output.len() as u32;
+        for (entry, offset) in entries.iter().zip(offsets) {
+            put32(&mut output, CENTRAL);
+            put16(&mut output, 0x0314);
+            put16(&mut output, 20);
+            put16(&mut output, 0);
+            put16(&mut output, 0);
+            put32(&mut output, 0);
+            put32(&mut output, 0);
+            put32(&mut output, entry.data.len() as u32);
+            put32(&mut output, entry.data.len() as u32);
+            put16(&mut output, entry.name.len() as u16);
+            put16(&mut output, 0);
+            put16(&mut output, 0);
+            put16(&mut output, 0);
+            put16(&mut output, 0);
+            put32(&mut output, entry.mode << 16);
+            put32(&mut output, offset);
+            output.extend_from_slice(entry.name.as_bytes());
+        }
+        let central_length = output.len() as u32 - central_start;
+        put32(&mut output, EOCD);
+        put16(&mut output, 0);
+        put16(&mut output, 0);
+        put16(&mut output, entries.len() as u16);
+        put16(&mut output, entries.len() as u16);
+        put32(&mut output, central_length);
+        put32(&mut output, central_start);
+        put16(&mut output, 0);
+        output
+    }
+
+    /// Opaque bodies received by a fake transport.
+    type ReceivedCalls = Arc<std::sync::Mutex<Vec<(i32, Vec<u8>)>>>;
+
+    /// Fake transport recording the opaque bodies it receives and answering
+    /// with opaque bytes, so the packaged module's `raw.invoke` can be verified
+    /// end-to-end without Telegram.
+    struct FakeRawTlTransport {
+        home_dc: Option<i32>,
+        response: Vec<u8>,
+        received: ReceivedCalls,
+    }
+
+    impl v6_executor::RawTlTransport for FakeRawTlTransport {
+        fn home_dc_id(&self) -> Option<i32> {
+            self.home_dc
+        }
+
+        fn invoke_in_dc(
+            &self,
+            dc_id: i32,
+            body: Vec<u8>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<u8>, V6ExecutorError>> + Send + '_>,
+        > {
+            Box::pin(async move {
+                self.received.lock().unwrap().push((dc_id, body));
+                Ok(self.response.clone())
+            })
+        }
+    }
+
+    /// Executor routing `raw.invoke` through the transport-generic pipeline.
+    struct PipelineExecutor {
+        transport: Arc<dyn v6_executor::RawTlTransport>,
+    }
+
+    impl V6TelegramExecutor for PipelineExecutor {
+        fn execute<'a>(
+            &'a self,
+            _context: V6ExecutionContext,
+            method: v6_registry::V6Method,
+            params: Box<serde_json::value::RawValue>,
+        ) -> super::super::v6_executor::V6ExecutorFuture<'a> {
+            let transport = self.transport.clone();
+            Box::pin(async move {
+                match method {
+                    v6_registry::V6Method::RawInvoke => {
+                        v6_executor::raw_invoke_pipeline(transport.as_ref(), params).await
+                    }
+                    _ => Err(V6ExecutorError::InvalidParams("unexpected method")),
+                }
+            })
+        }
     }
 
     #[test]
@@ -1271,6 +1518,327 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rpc_complete_before_shutdown_is_written() {
+        let (writer, mut receiver) = mpsc::channel(1);
+        let mut active_calls = HashSet::from(["call-1".to_owned()]);
+        let disposition = handle_rpc_complete(
+            false,
+            &mut active_calls,
+            &writer,
+            "call-1".to_owned(),
+            Ok(serde_json::json!({"fixture": true})),
+        )
+        .unwrap();
+        assert_eq!(disposition, RpcCompleteDisposition::Written);
+        assert!(active_calls.contains("call-1"));
+        match receiver.try_recv().unwrap() {
+            WriterCommand::Frame(
+                V6OutboundCoreFrame::TelegramResult { call_id, .. },
+                Flush::Call(flush_id),
+            ) => {
+                assert_eq!(call_id, "call-1");
+                assert_eq!(flush_id, "call-1");
+            }
+            other => panic!("unexpected writer command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rpc_complete_after_shutdown_is_discarded_without_write() {
+        let (writer, mut receiver) = mpsc::channel(1);
+        let mut active_calls = HashSet::from(["call-2".to_owned()]);
+        let disposition = handle_rpc_complete(
+            true,
+            &mut active_calls,
+            &writer,
+            "call-2".to_owned(),
+            Ok(serde_json::json!({"fixture": true})),
+        )
+        .unwrap();
+        assert_eq!(disposition, RpcCompleteDisposition::Discarded);
+        assert!(!active_calls.contains("call-2"));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn rpc_complete_releases_bookkeeping_for_unknown_call() {
+        let (writer, mut receiver) = mpsc::channel(1);
+        let mut active_calls = HashSet::from(["call-3".to_owned()]);
+        let disposition = handle_rpc_complete(
+            true,
+            &mut active_calls,
+            &writer,
+            "unknown".to_owned(),
+            Ok(serde_json::json!({})),
+        )
+        .unwrap();
+        assert_eq!(disposition, RpcCompleteDisposition::Discarded);
+        assert!(active_calls.contains("call-3"));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn rpc_complete_writer_backpressure_is_fatal() {
+        let (writer, _receiver) = mpsc::channel(1);
+        // Fill the queue so the completion hits backpressure.
+        writer
+            .try_send(WriterCommand::Frame(
+                V6OutboundCoreFrame::Health {
+                    request_id: "fill".to_owned(),
+                },
+                Flush::None,
+            ))
+            .unwrap();
+        let mut active_calls = HashSet::new();
+        let error = handle_rpc_complete(
+            false,
+            &mut active_calls,
+            &writer,
+            "call-4".to_owned(),
+            Ok(serde_json::json!({})),
+        )
+        .unwrap_err();
+        assert!(matches!(error, FatalReason::Backpressure));
+    }
+
+    /// Executor that records when the RPC future starts and only completes
+    /// after a delay, so the completion reliably lands after shutdown begins.
+    #[derive(Default)]
+    struct DelayedExecutor {
+        started: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl V6TelegramExecutor for DelayedExecutor {
+        fn execute<'a>(
+            &'a self,
+            _context: V6ExecutionContext,
+            _method: v6_registry::V6Method,
+            _params: Box<serde_json::value::RawValue>,
+        ) -> super::super::v6_executor::V6ExecutorFuture<'a> {
+            let started = self.started.clone();
+            Box::pin(async move {
+                started.store(true, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                super::super::v6_executor::V6RpcOutput::new(serde_json::json!({"fixture": true}))
+            })
+        }
+    }
+
+    /// Regression: an RPC completing after shutdown began must not enqueue a
+    /// `telegram.result` behind the `shutdown` frame. The child exits 5 if it
+    /// ever observes a `telegram.result`; with the barrier it only receives the
+    /// shutdown frame, exits 0, and shutdown completes cleanly.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rpc_completing_during_shutdown_is_discarded_and_shutdown_stays_clean() {
+        use std::fs;
+        let root = test_root("v6-rpc-shutdown-barrier");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let entrypoint = root.join("run");
+        ensure_test_state_base();
+
+        let mut module = descriptor();
+        module.id = format!("v6rpcshutdown{}", std::process::id());
+        module.module_dir = root.clone();
+        module.entrypoint = entrypoint.clone();
+        module.telegram_methods = vec![v6_registry::V6Method::ContactsGetContacts];
+
+        let script = r#"#!/usr/bin/env python3
+import sys, json
+
+def req_id(line):
+    return json.loads(line)["request_id"]
+
+line = sys.stdin.readline()
+rid = req_id(line)
+print(json.dumps({"protocol_version": 6, "type": "initialized", "request_id": rid, "module_id": "__MODULE_ID__"}), flush=True)
+line = sys.stdin.readline()
+rid = req_id(line)
+print(json.dumps({"protocol_version": 6, "type": "health", "request_id": rid}), flush=True)
+print('{"protocol_version":6,"type":"telegram.invoke","call_id":"race-1","method":"contacts.getContacts","params":{"hash":"0"}}', flush=True)
+line = sys.stdin.readline()
+if line and '"telegram.result"' in line:
+    print('telegram.result delivered after shutdown', file=sys.stderr)
+    sys.stderr.flush()
+    sys.exit(5)
+sys.exit(0)
+"#
+        .replace("__MODULE_ID__", &module.id);
+        write_v6_fixture(&entrypoint, &script);
+
+        let executor = Arc::new(DelayedExecutor::default());
+        let v6proc = V6Process::start(module.clone(), executor.clone(), 1)
+            .await
+            .unwrap();
+        v6proc.initialize("1".to_owned(), module.id).await.unwrap();
+        v6proc.health("2".to_owned()).await.unwrap();
+
+        // Wait until the RPC is in flight, then begin shutdown so the
+        // completion lands while the supervisor is closing.
+        for _ in 0..100 {
+            if executor.started.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(executor.started.load(std::sync::atomic::Ordering::SeqCst));
+
+        assert!(v6proc.graceful_shutdown().await.is_ok());
+        assert_eq!(v6proc.status(), process::ProcessStatus::Terminated);
+        assert!(v6proc.diagnostic().is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Packaged `.lmod` conformance: the archive is inspected and validated
+    /// through the production pipeline (zip inspection + manifest validation),
+    /// then the v6 child is started and drives `raw.invoke` with opaque TL
+    /// bytes for `messages.sendMessage` — a valid method with no typed registry
+    /// entry — through a fake transport and back into the module.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn packaged_lmod_conforms_through_raw_invoke_with_opaque_bytes() {
+        use std::fs;
+        let root = test_root("v6-packaged");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let module_id = format!("packagedv6{}", std::process::id());
+        let body = vec![0x70, 0x38, 0x0c, 0x52, 0x01, 0x00, 0x00, 0x00]; // messages.sendMessage
+        assert!(
+            v6_registry::lookup("messages.sendMessage").is_none(),
+            "fixture method must not be in the typed registry"
+        );
+        let body_base64 = v6_executor::encode_base64(&body);
+        let marker = "marker.txt";
+        let script = r#"#!/usr/bin/env python3
+import sys, json, base64
+
+def req_id(line):
+    return json.loads(line)["request_id"]
+
+line = sys.stdin.readline()
+if not line:
+    sys.exit(60)
+rid = req_id(line)
+print(json.dumps({"protocol_version": 6, "type": "initialized", "request_id": rid, "module_id": "__MODULE_ID__"}), flush=True)
+line = sys.stdin.readline()
+if not line:
+    sys.exit(61)
+rid = req_id(line)
+print(json.dumps({"protocol_version": 6, "type": "health", "request_id": rid}), flush=True)
+print('{"protocol_version":6,"type":"telegram.invoke","call_id":"pkg-1","method":"raw.invoke","params":{"dc_id":2,"body_base64_chunks":["__BODY_BASE64__"]}}', flush=True)
+line = sys.stdin.readline()
+try:
+    frame = json.loads(line)
+    assert frame["type"] == "telegram.result", frame.get("type")
+    result = frame["result"]
+    assert result["kind"] == "raw_tl", result.get("kind")
+    assert result["dc_id"] == 2, result.get("dc_id")
+    decoded = base64.b64decode("".join(result["body_base64_chunks"]))
+    with open("__MARKER__", "w") as f:
+        f.write(decoded.decode("latin-1"))
+except Exception as error:
+    with open("__MARKER__", "w") as f:
+        f.write("FAILED: " + repr(error))
+    sys.exit(62)
+line = sys.stdin.readline()
+sys.exit(0)
+"#
+        .replace("__MODULE_ID__", &module_id)
+        .replace("__BODY_BASE64__", &body_base64)
+        .replace("__MARKER__", marker);
+
+        let manifest_json = format!(
+            r#"{{"schema_version":6,"id":"{module_id}","name":"Packaged","version":"1","author":"A","entrypoint":"run","capabilities":["telegram.raw"],"telegram_methods":["raw.invoke"],"commands":[{{"name":"go","summary_ru":"x","description_ru":"x","usage":"<value>"}}]}}"#
+        );
+        let archive = zip_entries(&[
+            ArchiveEntry {
+                name: "module.json".to_owned(),
+                data: manifest_json.into_bytes(),
+                mode: 0o100644,
+            },
+            ArchiveEntry {
+                name: "run".to_owned(),
+                data: fixture_script(&script),
+                mode: 0o100755,
+            },
+        ]);
+
+        // Production inspection pipeline: staging, zip inspection, manifest
+        // validation, then the validated descriptor.
+        let config = InspectionConfig {
+            staging_root: root.clone(),
+            limits: InspectionLimits::default(),
+        };
+        let mut inspector = ModuleInspector::new(&config, OsRandom);
+        let pending = inspector
+            .inspect(
+                AcquiredLmod::archive(archive),
+                std::time::SystemTime::now(),
+                std::time::SystemTime::now(),
+            )
+            .expect("packaged module must pass inspection");
+        let payload = pending.stage.take_wrapper().unwrap().join("payload");
+        let descriptor =
+            manifest::validate_manifest_at(&payload.join("module.json"), Some(&module_id))
+                .expect("production manifest validation");
+        assert_eq!(descriptor.protocol_version, 6);
+        assert_eq!(
+            descriptor.telegram_methods,
+            vec![v6_registry::V6Method::RawInvoke]
+        );
+
+        ensure_test_state_base();
+        let transport = FakeRawTlTransport {
+            home_dc: Some(2),
+            response: b"opaque-response-ok".to_vec(),
+            received: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let received = transport.received.clone();
+        let executor = Arc::new(PipelineExecutor {
+            transport: Arc::new(transport),
+        });
+        let v6proc = V6Process::start(descriptor, executor, 1).await.unwrap();
+        v6proc
+            .initialize("1".to_owned(), module_id.clone())
+            .await
+            .unwrap();
+        v6proc.health("2".to_owned()).await.unwrap();
+
+        let marker_path = payload.join(marker);
+        let mut verified = false;
+        for _ in 0..300 {
+            if marker_path.exists() {
+                verified = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(verified, "module must receive the raw response");
+        let marker_text = fs::read_to_string(&marker_path).unwrap();
+        assert!(
+            !marker_text.starts_with("FAILED"),
+            "module rejected the response: {marker_text}"
+        );
+        assert_eq!(marker_text, "opaque-response-ok");
+
+        // Both directions verified with opaque bytes: the exact module body
+        // reached the transport, and the exact transport response reached the
+        // module.
+        {
+            let received = received.lock().unwrap();
+            assert_eq!(received.len(), 1);
+            assert_eq!(received[0].0, 2);
+            assert_eq!(received[0].1, body);
+        }
+
+        assert!(v6proc.graceful_shutdown().await.is_ok());
+        assert_eq!(v6proc.status(), process::ProcessStatus::Terminated);
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn nonzero_shutdown_is_crash_and_retains_exit_and_stderr() {
@@ -1279,16 +1847,17 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let entrypoint = root.join("run");
-        write_executable(
+        ensure_test_state_base();
+        write_v6_fixture(
             &entrypoint,
-            "#!/bin/sh\nread line\necho shutdown-broke >&2\nexit 7\n",
+            "#!/usr/bin/env python3\nimport sys, os\nsys.stdin.readline()\nprint('shutdown-broke', file=sys.stderr)\nsys.stderr.flush()\nsys.exit(7)\n",
         );
 
         let mut module = descriptor();
         module.id = format!("v6badshutdown{}", std::process::id());
         module.module_dir = root.clone();
         module.entrypoint = entrypoint;
-        let v6proc = V6Process::start(module, Arc::new(RecordingExecutor::default()))
+        let v6proc = V6Process::start(module, Arc::new(RecordingExecutor::default()), 1)
             .await
             .unwrap();
 
@@ -1320,13 +1889,17 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let entrypoint = root.join("run");
-        write_executable(&entrypoint, "#!/bin/sh\necho $$ > leader.pid\nsleep 30\n");
+        ensure_test_state_base();
+        write_v6_fixture(
+            &entrypoint,
+            "#!/usr/bin/env python3\nimport os, time\nwith open('leader.pid', 'w') as f:\n    f.write(str(os.getpid()))\ntime.sleep(30)\n",
+        );
 
         let mut module = descriptor();
         module.id = format!("v6force{}", std::process::id());
         module.module_dir = root.clone();
         module.entrypoint = entrypoint;
-        let v6proc = V6Process::start(module, Arc::new(RecordingExecutor::default()))
+        let v6proc = V6Process::start(module, Arc::new(RecordingExecutor::default()), 1)
             .await
             .unwrap();
         let pid_path = root.join("leader.pid");
@@ -1364,16 +1937,17 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let entrypoint = root.join("run");
-        write_executable(
+        ensure_test_state_base();
+        write_v6_fixture(
             &entrypoint,
-            "#!/bin/sh\nread line\necho '{broken-json'\necho malformed-frame >&2\nsleep 30\n",
+            "#!/usr/bin/env python3\nimport sys, time\nsys.stdin.readline()\nprint('{broken-json')\nsys.stdout.flush()\nprint('malformed-frame', file=sys.stderr)\nsys.stderr.flush()\ntime.sleep(30)\n",
         );
 
         let mut module = descriptor();
         module.id = format!("v6malformed{}", std::process::id());
         module.module_dir = root.clone();
         module.entrypoint = entrypoint;
-        let v6proc = V6Process::start(module.clone(), Arc::new(RecordingExecutor::default()))
+        let v6proc = V6Process::start(module.clone(), Arc::new(RecordingExecutor::default()), 1)
             .await
             .unwrap();
         assert!(matches!(
@@ -1402,13 +1976,17 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let entrypoint = root.join("run");
-        write_executable(&entrypoint, "#!/bin/sh\nread line\nsleep 30\n");
+        ensure_test_state_base();
+        write_v6_fixture(
+            &entrypoint,
+            "#!/usr/bin/env python3\nimport sys, time\nsys.stdin.readline()\ntime.sleep(30)\n",
+        );
 
         let mut module = descriptor();
         module.id = format!("v6timeout{}", std::process::id());
         module.module_dir = root.clone();
         module.entrypoint = entrypoint;
-        let v6proc = V6Process::start(module.clone(), Arc::new(RecordingExecutor::default()))
+        let v6proc = V6Process::start(module.clone(), Arc::new(RecordingExecutor::default()), 1)
             .await
             .unwrap();
         assert!(matches!(
@@ -1447,37 +2025,51 @@ mod tests {
         ];
         module.capabilities.push(ExternalCapability::TelegramRaw);
 
-        let script = r#"#!/bin/sh
-req_id() {
-  value=${1#*request_id}
-  value=${value#*:}
-  value=${value#*\"}
-  value=${value%%\"*}
-  printf '%s' "$value"
-}
-read line || exit 80
-rid=$(req_id "$line")
-printf '{"protocol_version":6,"type":"initialized","request_id":"%s","module_id":"__MODULE_ID__"}\n' "$rid"
-read line || exit 81
-rid=$(req_id "$line")
-printf '{"protocol_version":6,"type":"result","request_id":"%s","text":"ok"}\n' "$rid"
-read line || exit 82
-rid=$(req_id "$line")
-printf '{"protocol_version":6,"type":"event_result","request_id":"%s","actions":[]}\n' "$rid"
-printf '%s\n' '{"protocol_version":6,"type":"telegram.invoke","call_id":"curated-1","method":"contacts.getContacts","params":{"hash":"0"}}'
-read line || exit 83
-printf '%s\n' '{"protocol_version":6,"type":"telegram.invoke","call_id":"raw-1","method":"raw.invoke","params":{"body_base64_chunks":["eFY0EgEAAAA="]}}'
-read line || exit 84
-read line || exit 85
-rid=$(req_id "$line")
-printf '{"protocol_version":6,"type":"health","request_id":"%s"}\n' "$rid"
-read line || exit 86
-exit 0
-"#.replace("__MODULE_ID__", &module.id);
-        write_executable(&entrypoint, &script);
+        ensure_test_state_base();
+        let script = r#"#!/usr/bin/env python3
+import sys, json
+
+def req_id(line):
+    return json.loads(line)["request_id"]
+
+line = sys.stdin.readline()
+if not line:
+    sys.exit(80)
+rid = req_id(line)
+print(json.dumps({"protocol_version": 6, "type": "initialized", "request_id": rid, "module_id": "__MODULE_ID__"}), flush=True)
+line = sys.stdin.readline()
+if not line:
+    sys.exit(81)
+rid = req_id(line)
+print(json.dumps({"protocol_version": 6, "type": "result", "request_id": rid, "text": "ok"}), flush=True)
+line = sys.stdin.readline()
+if not line:
+    sys.exit(82)
+rid = req_id(line)
+print(json.dumps({"protocol_version": 6, "type": "event_result", "request_id": rid, "actions": []}), flush=True)
+print('{"protocol_version":6,"type":"telegram.invoke","call_id":"curated-1","method":"contacts.getContacts","params":{"hash":"0"}}', flush=True)
+line = sys.stdin.readline()
+if not line:
+    sys.exit(83)
+print('{"protocol_version":6,"type":"telegram.invoke","call_id":"raw-1","method":"raw.invoke","params":{"body_base64_chunks":["eFY0EgEAAAA="]}}', flush=True)
+line = sys.stdin.readline()
+if not line:
+    sys.exit(84)
+line = sys.stdin.readline()
+if not line:
+    sys.exit(85)
+rid = req_id(line)
+print(json.dumps({"protocol_version": 6, "type": "health", "request_id": rid}), flush=True)
+line = sys.stdin.readline()
+if not line:
+    sys.exit(86)
+sys.exit(0)
+"#
+        .replace("__MODULE_ID__", &module.id);
+        write_v6_fixture(&entrypoint, &script);
 
         let executor = Arc::new(RecordingExecutor::default());
-        let v6proc = V6Process::start(module.clone(), executor.clone())
+        let v6proc = V6Process::start(module.clone(), executor.clone(), 1)
             .await
             .unwrap();
         assert!(matches!(
@@ -1682,7 +2274,7 @@ exit 0
     #[cfg(unix)]
     #[tokio::test]
     async fn supervisor_kills_descendant_after_leader_exit() {
-        use std::{fs, os::unix::fs::PermissionsExt};
+        use std::fs;
 
         struct NoopExecutor;
         impl V6TelegramExecutor for NoopExecutor {
@@ -1704,18 +2296,17 @@ exit 0
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let entrypoint = root.join("run");
-        fs::write(
+        ensure_test_state_base();
+        write_v6_fixture(
             &entrypoint,
-            "#!/bin/sh\nsleep 30 &\necho $! > child.pid\nexit 0\n",
-        )
-        .unwrap();
-        fs::set_permissions(&entrypoint, fs::Permissions::from_mode(0o700)).unwrap();
+            "#!/usr/bin/env python3\nimport subprocess, sys\np = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\nwith open('child.pid', 'w') as f:\n    f.write(str(p.pid))\nsys.exit(0)\n",
+        );
 
         let mut module = descriptor();
         module.id = format!("v6desc{}", std::process::id());
         module.module_dir = root.clone();
         module.entrypoint = entrypoint;
-        let process = V6Process::start(module, Arc::new(NoopExecutor))
+        let process = V6Process::start(module, Arc::new(NoopExecutor), 1)
             .await
             .unwrap();
 

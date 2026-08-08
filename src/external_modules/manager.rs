@@ -38,6 +38,13 @@ pub struct ExternalManager {
     processes: BTreeMap<String, ManagedProcess>,
     gateway: Option<Arc<dyn super::gateway::TelegramGateway>>,
     v6_executor: Option<Arc<dyn V6TelegramExecutor>>,
+    /// Last known crash/startup-failure diagnostic per module, retained even
+    /// after the process leaves the running index (startup failure, crash
+    /// cleanup). A successful healthy start clears the entry.
+    latest_diagnostics: BTreeMap<String, super::process::CrashDiagnostics>,
+    /// Monotonic restart generation per module, incremented at every start
+    /// attempt. Flows into crash diagnostics so restarts are distinguishable.
+    restart_generations: BTreeMap<String, u64>,
 }
 
 #[derive(Clone)]
@@ -92,6 +99,20 @@ impl ManagedProcess {
     }
 }
 
+/// Wait for the v6 supervisor to record its crash diagnostic. The supervisor
+/// builds the diagnostic during teardown, after the failed request reply, so a
+/// synchronous read right after an `initialize`/`health` error can still see
+/// `None`; poll briefly rather than dropping the process without the failure.
+async fn retain_v6_diagnostic(process: &V6Process) -> Option<super::process::CrashDiagnostics> {
+    for _ in 0..200 {
+        if let Some(diagnostic) = process.diagnostic() {
+            return Some(diagnostic);
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+    None
+}
+
 async fn shutdown_process(id: &str, process: ManagedProcess) {
     match process {
         ManagedProcess::Legacy(process) => {
@@ -127,6 +148,8 @@ impl ExternalManager {
             processes: BTreeMap::new(),
             gateway: None,
             v6_executor: None,
+            latest_diagnostics: BTreeMap::new(),
+            restart_generations: BTreeMap::new(),
         }
     }
 
@@ -182,6 +205,8 @@ impl ExternalManager {
                     ProcessStatus::Failed | ProcessStatus::Crashed => "ошибка",
                     ProcessStatus::Terminated => "остановлен",
                 }
+            } else if self.latest_diagnostics.contains_key(&desc.id) {
+                "ошибка"
             } else {
                 "установлен, выключен"
             };
@@ -289,6 +314,12 @@ impl ExternalManager {
         if let Some(proc) = self.processes.get(module_id)
             && proc.status() == Some(ProcessStatus::Crashed)
         {
+            if let ManagedProcess::V6(process) = &self.processes[module_id]
+                && let Some(diagnostic) = process.diagnostic()
+            {
+                self.latest_diagnostics
+                    .insert(module_id.to_owned(), diagnostic);
+            }
             self.processes.remove(module_id);
         }
     }
@@ -368,9 +399,30 @@ impl ExternalManagerHandle {
 
     pub async fn diagnostic_text(&self, module_id: &str) -> Option<String> {
         let mgr = self.inner.lock().await;
-        mgr.processes
+        match mgr
+            .processes
             .get(module_id)
             .and_then(ManagedProcess::diagnostic_text)
+        {
+            Some(text) => Some(text),
+            None => mgr
+                .latest_diagnostics
+                .get(module_id)
+                .map(|diagnostic| diagnostic.render_user()),
+        }
+    }
+
+    /// One-line crash summary (live process or retained), for `lm doctor`.
+    pub async fn diagnostic_summary(&self, module_id: &str) -> Option<String> {
+        let mgr = self.inner.lock().await;
+        if let Some(ManagedProcess::V6(process)) = mgr.processes.get(module_id)
+            && let Some(diagnostic) = process.diagnostic()
+        {
+            return Some(diagnostic.summary());
+        }
+        mgr.latest_diagnostics
+            .get(module_id)
+            .map(|diagnostic| diagnostic.summary())
     }
 
     /// Starts children without retaining the manager mutex. Process I/O belongs
@@ -395,38 +447,60 @@ impl ExternalManagerHandle {
                 match process_start_kind(descriptor.protocol_version, v6_executor.is_some()) {
                     Ok(ProcessStartKind::V6) => match v6_executor.clone() {
                         Some(executor) => {
-                            match V6Process::start(descriptor.clone(), executor).await {
-                                Ok(process) => match process
-                                    .initialize(super::protocol::request_id(), id.clone())
-                                    .await
-                                {
-                                    Ok(super::protocol::V6InboundFrame::Initialized {
-                                        module_id,
-                                        ..
-                                    }) if module_id == id => {
-                                        match process.health(super::protocol::request_id()).await {
-                                            Ok(super::protocol::V6InboundFrame::Health {
-                                                ..
-                                            }) => Ok(ManagedProcess::V6(process)),
-                                            Ok(_) => {
-                                                process.terminate().await;
-                                                Err(ExternalError::ProtocolDecode)
-                                            }
-                                            Err(error) => {
-                                                process.terminate().await;
-                                                Err(error)
+                            let restart_generation = {
+                                let mut manager = self.inner.lock().await;
+                                let next =
+                                    manager.restart_generations.get(&id).copied().unwrap_or(0) + 1;
+                                manager.restart_generations.insert(id.clone(), next);
+                                next
+                            };
+                            match V6Process::start(descriptor.clone(), executor, restart_generation)
+                                .await
+                            {
+                                Ok(process) => {
+                                    let handshake: Result<(), ExternalError> = match process
+                                        .initialize(super::protocol::request_id(), id.clone())
+                                        .await
+                                    {
+                                        Ok(super::protocol::V6InboundFrame::Initialized {
+                                            module_id,
+                                            ..
+                                        }) if module_id == id => {
+                                            match process
+                                                .health(super::protocol::request_id())
+                                                .await
+                                            {
+                                                Ok(super::protocol::V6InboundFrame::Health {
+                                                    ..
+                                                }) => Ok(()),
+                                                Ok(_) => Err(ExternalError::ProtocolDecode),
+                                                Err(error) => Err(error),
                                             }
                                         }
+                                        Ok(_) => Err(ExternalError::ProtocolDecode),
+                                        Err(error) => Err(error),
+                                    };
+                                    match handshake {
+                                        Ok(()) => Ok(ManagedProcess::V6(process)),
+                                        Err(error) => {
+                                            // The supervisor records the crash
+                                            // diagnostic during teardown, after
+                                            // the failed request reply; poll
+                                            // briefly so the failure is not
+                                            // lost when the process is dropped.
+                                            if let Some(diagnostic) =
+                                                retain_v6_diagnostic(&process).await
+                                            {
+                                                let mut manager = self.inner.lock().await;
+                                                manager
+                                                    .latest_diagnostics
+                                                    .insert(id.clone(), diagnostic);
+                                            }
+                                            process.terminate().await;
+                                            Err(error)
+                                        }
                                     }
-                                    Ok(_) => {
-                                        process.terminate().await;
-                                        Err(ExternalError::ProtocolDecode)
-                                    }
-                                    Err(error) => {
-                                        process.terminate().await;
-                                        Err(error)
-                                    }
-                                },
+                                }
                                 Err(error) => Err(error),
                             }
                         }
@@ -441,8 +515,10 @@ impl ExternalManagerHandle {
                 };
             match process {
                 Ok(process) => {
+                    // A healthy fresh start clears any retained crash history.
                     let replaced = {
                         let mut manager = self.inner.lock().await;
+                        manager.latest_diagnostics.remove(&id);
                         manager.processes.insert(id.clone(), process)
                     };
                     if let Some(replaced) = replaced {
@@ -618,5 +694,77 @@ mod tests {
             .await;
 
         assert!(!handle.lock().await.has_running_process("sample"));
+    }
+
+    #[test]
+    fn retained_diagnostic_marks_the_module_as_error_without_a_process() {
+        let mut manager = ExternalManager::new();
+        manager.set_descriptors(vec![descriptor("sample", "1.0")]);
+        assert_eq!(manager.statuses()[0].status, "установлен, выключен");
+
+        let diagnostic = super::super::process::CrashDiagnostics {
+            module_id: "sample".to_owned(),
+            protocol_version: 6,
+            lifecycle_stage: "initialize".to_owned(),
+            request_id: "-".to_owned(),
+            error_category: "execution_timeout".to_owned(),
+            error: "timed out".to_owned(),
+            exit_code: None,
+            signal: None,
+            stderr_truncated: false,
+            stderr: "-".to_owned(),
+            timestamp_unix_ms: 1,
+            restart_generation: 1,
+        };
+        manager
+            .latest_diagnostics
+            .insert("sample".to_owned(), diagnostic);
+        assert_eq!(manager.statuses()[0].status, "ошибка");
+    }
+
+    #[test]
+    fn remove_crashed_retains_the_last_diagnostic_before_removal() {
+        let mut manager = ExternalManager::new();
+        manager.set_descriptors(vec![descriptor("sample", "1.0")]);
+        assert!(manager.latest_diagnostics.is_empty());
+
+        // Only crashed v6 processes leave a retained diagnostic; a missing or
+        // running process must not populate the retention map.
+        manager.remove_crashed("sample");
+        assert!(manager.latest_diagnostics.is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_diagnostic_text_falls_back_to_retained_diagnostics() {
+        let mut manager = ExternalManager::new();
+        manager.set_descriptors(vec![descriptor("sample", "1.0")]);
+        manager.latest_diagnostics.insert(
+            "sample".to_owned(),
+            super::super::process::CrashDiagnostics {
+                module_id: "sample".to_owned(),
+                protocol_version: 6,
+                lifecycle_stage: "initialize".to_owned(),
+                request_id: "-".to_owned(),
+                error_category: "execution_timeout".to_owned(),
+                error: "timed out".to_owned(),
+                exit_code: None,
+                signal: None,
+                stderr_truncated: false,
+                stderr: "-".to_owned(),
+                timestamp_unix_ms: 1,
+                restart_generation: 3,
+            },
+        );
+        let handle = super::ExternalManagerHandle::new(manager);
+
+        let text = handle.diagnostic_text("sample").await.expect("diagnostic");
+        assert!(text.contains("stage=initialize"));
+        assert!(text.contains("category=execution_timeout"));
+        assert!(text.contains("generation=3"));
+        assert_eq!(
+            handle.diagnostic_summary("sample").await.as_deref(),
+            Some("stage=initialize category=execution_timeout generation=3")
+        );
+        assert_eq!(handle.lock().await.statuses()[0].status, "ошибка");
     }
 }

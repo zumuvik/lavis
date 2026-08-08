@@ -343,6 +343,7 @@ pub enum LmRequest {
     Cancel { approval_id: ApprovalId },
     Info { id: String },
     Logs { id: String },
+    Doctor { id: Option<String> },
     Enable { id: String },
     Disable { id: String },
     Invalid,
@@ -394,6 +395,16 @@ fn parse_lm_request(args: &str) -> LmRequest {
         "logs" => parse_lm_id(tokens)
             .map(|id| LmRequest::Logs { id })
             .unwrap_or(LmRequest::Invalid),
+        "doctor" => {
+            let mut id_tokens = tokens.clone();
+            match (id_tokens.next(), id_tokens.next()) {
+                (None, _) => LmRequest::Doctor { id: None },
+                (Some(id), None) => LmRequest::Doctor {
+                    id: Some(id.to_owned()),
+                },
+                _ => LmRequest::Invalid,
+            }
+        }
         "enable" => parse_lm_id(tokens)
             .map(|id| LmRequest::Enable { id })
             .unwrap_or(LmRequest::Invalid),
@@ -855,6 +866,22 @@ mod tests {
             }))
         );
         assert_eq!(
+            lm("logs echo"),
+            Some(Action::Lm(LmRequest::Logs {
+                id: "echo".to_owned()
+            }))
+        );
+        assert_eq!(
+            lm("doctor"),
+            Some(Action::Lm(LmRequest::Doctor { id: None }))
+        );
+        assert_eq!(
+            lm("doctor echo"),
+            Some(Action::Lm(LmRequest::Doctor {
+                id: Some("echo".to_owned())
+            }))
+        );
+        assert_eq!(
             lm("enable echo"),
             Some(Action::Lm(LmRequest::Enable {
                 id: "echo".to_owned()
@@ -884,6 +911,7 @@ mod tests {
             "list extra",
             "install https://example.invalid/module.lmod",
             "install extra",
+            "doctor extra args",
             "confirm",
             "cancel",
             "confirm 0123-4567-89AB-CDE",
