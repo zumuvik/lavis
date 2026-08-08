@@ -815,6 +815,7 @@ impl RuntimeState {
         match request {
             LmRequest::Overview | LmRequest::List => self.render_lm_list().await,
             LmRequest::Info { id } => self.lm_info(id).await,
+            LmRequest::Logs { id } => self.lm_logs(id).await,
             LmRequest::Invalid => Response::plain(lm_usage(self.prefix())),
             LmRequest::Install => {
                 self.inspect_module_install(client, message_context.message)
@@ -879,6 +880,22 @@ impl RuntimeState {
         )
     }
 
+    async fn lm_logs(&self, id: &str) -> Response {
+        let Some(handle) = &self.external_manager else {
+            return Response::plain("⚠️ Runtime внешних модулей недоступен.".to_owned());
+        };
+        match handle.diagnostic_text(id).await {
+            Some(diagnostic) => Response::plain(format!(
+                "📋 Последняя ошибка модуля {id}
+
+{diagnostic}"
+            )),
+            None => Response::plain(format!(
+                "ℹ️ Для модуля {id} нет сохранённой runtime-ошибки."
+            )),
+        }
+    }
+
     async fn lm_info(&self, id: &str) -> Response {
         let Some(config) = &self.module_control else {
             return Response::plain("⚠️ Управление внешними модулями недоступно.".to_owned());
@@ -889,9 +906,14 @@ impl RuntimeState {
                 return Response::plain("⚠️ Состояние внешних модулей недоступно.".to_owned());
             }
         };
+        let diagnostic = if let Some(handle) = &self.external_manager {
+            handle.diagnostic_text(id).await
+        } else {
+            None
+        };
         match control::module_info(&config.root, &config.declarative_state_path, &state, id) {
             Ok(module) => Response::plain(format!(
-                "📦 {}\nID: {}\nВерсия: {}\nАвтор: {}\nСостояние: {}\nИсточник: {}\nТочка входа: {}\nSchema/API protocol: v{}\nВозможности: {}\nПредоставляемые команды: {}",
+                "📦 {}\nID: {}\nВерсия: {}\nАвтор: {}\nСостояние: {}\nИсточник: {}\nТочка входа: {}\nSchema/API protocol: v{}\nВозможности: {}\nПредоставляемые команды: {}\nRuntime: {}\nПоследняя ошибка: {}",
                 module.display_name,
                 module.id,
                 module.version,
@@ -901,7 +923,9 @@ impl RuntimeState {
                 module.entrypoint,
                 module.protocol_version,
                 capabilities_label(&module.capabilities),
-                commands_label(&module.commands)
+                commands_label(&module.commands),
+                runtime_status(self, &module.id),
+                diagnostic.as_deref().unwrap_or("нет")
             )),
             Err(control::ModuleControlError::InvalidInstalledModule) => {
                 Response::plain("⚠️ Манифест установленного модуля некорректен.".to_owned())

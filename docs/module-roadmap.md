@@ -271,8 +271,8 @@ API v6 deliberately has two Telegram access levels.
 
 Curated helpers:
 
-- require `telegram.raw` and an explicit entry in `telegram_methods` under the
-  current v6 manifest model;
+- require an explicit entry in `telegram_methods` under the current v6 manifest model;
+- do not require `telegram.raw`; that high-risk capability is reserved for `raw.invoke`;
 - use strict typed decoding with unknown fields rejected;
 - expose bounded, intentionally shaped outputs.
 

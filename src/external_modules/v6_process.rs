@@ -41,6 +41,20 @@ const V6_MAX_PENDING: usize = 8;
 pub(crate) struct V6Process {
     control: mpsc::Sender<Control>,
     descriptor: Arc<ExternalModuleDescriptor>,
+    runtime: Arc<Mutex<V6RuntimeState>>,
+}
+
+#[derive(Debug, Clone)]
+struct V6RuntimeState {
+    status: process::ProcessStatus,
+    diagnostic: Option<process::CrashDiagnostics>,
+}
+
+fn lock_runtime_state(state: &Mutex<V6RuntimeState>) -> std::sync::MutexGuard<'_, V6RuntimeState> {
+    match state.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 impl V6Process {
@@ -113,11 +127,16 @@ impl V6Process {
         let writer = tokio::spawn(write_stdin(stdin, writer_rx, rpc_tx.clone()));
         let stderr_capture = Arc::new(Mutex::new(StderrCapture::default()));
         let stderr_drain = tokio::spawn(process::drain_stderr(stderr, stderr_capture.clone()));
+        let runtime = Arc::new(Mutex::new(V6RuntimeState {
+            status: process::ProcessStatus::Running,
+            diagnostic: None,
+        }));
         tokio::spawn(supervise(
             child,
             process_group,
             descriptor.clone(),
             executor,
+            runtime.clone(),
             SupervisorIo {
                 control_rx,
                 reader_rx,
@@ -133,6 +152,7 @@ impl V6Process {
         Ok(Self {
             control: control_tx,
             descriptor: Arc::new(descriptor),
+            runtime,
         })
     }
 
@@ -141,11 +161,11 @@ impl V6Process {
     }
 
     pub(crate) fn status(&self) -> super::process::ProcessStatus {
-        if self.control.is_closed() {
-            super::process::ProcessStatus::Crashed
-        } else {
-            super::process::ProcessStatus::Running
-        }
+        lock_runtime_state(&self.runtime).status
+    }
+
+    pub(crate) fn diagnostic(&self) -> Option<process::CrashDiagnostics> {
+        lock_runtime_state(&self.runtime).diagnostic.clone()
     }
 
     pub(crate) async fn execute_command(
@@ -203,7 +223,15 @@ impl V6Process {
     }
 
     pub(crate) async fn terminate(&self) {
-        let _ = self.graceful_shutdown().await;
+        let (reply, response) = oneshot::channel();
+        if self
+            .control
+            .send(Control::ForceTerminate { reply })
+            .await
+            .is_ok()
+        {
+            let _ = response.await;
+        }
     }
 
     pub(crate) async fn initialize(
@@ -299,6 +327,9 @@ enum Control {
         request_id: String,
         reply: oneshot::Sender<Result<(), ExternalError>>,
     },
+    ForceTerminate {
+        reply: oneshot::Sender<()>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -319,6 +350,8 @@ enum FatalReason {
     WrongModuleId,
     ExecutionTimeout,
     ShutdownTimeout,
+    Backpressure,
+    WriterUnavailable,
 }
 
 impl FatalReason {
@@ -332,6 +365,30 @@ impl FatalReason {
             Self::WrongModuleId => ExternalError::WrongModuleId,
             Self::ExecutionTimeout => ExternalError::ExecutionTimeout,
             Self::ShutdownTimeout => ExternalError::ShutdownTimeout,
+            Self::Backpressure => ExternalError::Backpressure,
+            Self::WriterUnavailable => ExternalError::WriterUnavailable,
+        }
+    }
+
+    fn category(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::ProtocolEncode => "protocol_encode",
+            Self::ProtocolDecode => "protocol_decode",
+            Self::LineTooLarge => "line_too_large",
+            Self::WrongRequestId => "wrong_request_id",
+            Self::WrongModuleId => "wrong_module_id",
+            Self::ExecutionTimeout => "execution_timeout",
+            Self::ShutdownTimeout => "shutdown_timeout",
+            Self::Backpressure => "backpressure",
+            Self::WriterUnavailable => "writer_unavailable",
+        }
+    }
+
+    fn from_writer(error: WriterQueueFailure) -> Self {
+        match error {
+            WriterQueueFailure::Backpressure => Self::Backpressure,
+            WriterQueueFailure::Closed => Self::WriterUnavailable,
         }
     }
 
@@ -388,6 +445,7 @@ async fn supervise(
     process_group: u32,
     descriptor: ExternalModuleDescriptor,
     executor: Arc<dyn V6TelegramExecutor>,
+    runtime: Arc<Mutex<V6RuntimeState>>,
     io: SupervisorIo,
 ) {
     let SupervisorIo {
@@ -406,6 +464,7 @@ async fn supervise(
     let mut workers = JoinSet::new();
     let mut closing = false;
     let mut shutdown_reply: Option<oneshot::Sender<Result<(), ExternalError>>> = None;
+    let mut force_reply: Option<oneshot::Sender<()>> = None;
     let mut shutdown_deadline = None;
     let mut shutdown_flushed = false;
     let mut stored_child_exit = None;
@@ -414,77 +473,104 @@ async fn supervise(
     let mut control_open = true;
     let mut fatal_reason = None;
     let mut fatal_request_id = None;
+    let mut fatal_stage = "runtime";
+    let mut terminal_status = process::ProcessStatus::Crashed;
+    let mut exit_code = None;
+    let mut exit_signal = None;
+
     loop {
         tokio::select! {
             child_exit = child.wait(), if stored_child_exit.is_none() => {
+                capture_exit_status(&child_exit, &mut exit_code, &mut exit_signal);
                 child_reaped = child_exit.is_ok();
                 if closing {
-                    // The writer may already own and successfully flush the
-                    // shutdown line. Do not classify this exit until it tells
-                    // us definitively whether that flush happened.
                     stored_child_exit = Some(child_exit);
                     if shutdown_flushed {
-                        let Some(child_exit) = stored_child_exit.take() else {
-                            break;
-                        };
-                        if let Some(reply) = shutdown_reply.take() {
-                            let _ = reply.send(shutdown_child_exit_result(true, child_exit));
+                        let result = shutdown_child_exit_result(true, stored_child_exit.take().expect("stored exit"));
+                        let clean = result.is_ok();
+                        if let Some(reply) = shutdown_reply.take() { let _ = reply.send(result); }
+                        if clean {
+                            terminal_status = process::ProcessStatus::Terminated;
+                        } else {
+                            fatal_reason = Some(FatalReason::Unavailable);
+                            fatal_stage = "shutdown";
                         }
                         break;
                     }
                 } else {
                     fatal_reason = Some(FatalReason::Unavailable);
+                    fatal_stage = pending_stage(&pending);
                     break;
                 }
             }
             control = control_rx.recv(), if control_open => match control {
                 Some(Control::Request { frame, expected, reply }) => {
                     if closing { let _ = reply.send(Err(ExternalError::Unavailable)); continue; }
+                    let request_stage = outbound_stage(&frame);
                     let Some(request_id) = request_id(&frame).map(str::to_owned) else { let _ = reply.send(Err(ExternalError::ProtocolEncode)); continue; };
                     if pending.contains_key(&request_id) { let _ = reply.send(Err(ExternalError::WrongRequestId)); continue; }
-                    if pending.len() == V6_MAX_PENDING { let _ = reply.send(Err(ExternalError::Unavailable)); continue; }
-                    if queue_writer(&writer_tx, WriterCommand::Frame(frame, Flush::None)).is_err() {
-                        let _ = reply.send(Err(ExternalError::ProtocolEncode));
-                        fatal_reason = Some(FatalReason::ProtocolEncode);
+                    if pending.len() == V6_MAX_PENDING { let _ = reply.send(Err(ExternalError::Backpressure)); continue; }
+                    if let Err(error) = queue_writer(&writer_tx, WriterCommand::Frame(frame, Flush::None)) {
+                        let reason = FatalReason::from_writer(error);
+                        let _ = reply.send(Err(reason.error()));
+                        fatal_reason = Some(reason);
                         fatal_request_id = Some(request_id);
+                        fatal_stage = request_stage;
                         break;
                     }
                     pending.insert(request_id, Pending { expected, deadline: Instant::now() + V6_LIFECYCLE_TIMEOUT, reply });
                 }
                 Some(Control::Shutdown { request_id, reply }) => {
                     if closing { let _ = reply.send(Err(ExternalError::Unavailable)); }
-                    else if !start_shutdown(&mut closing, &mut pending, &mut workers, &writer_tx, request_id, Some(reply), &mut shutdown_reply) {
-                        fatal_reason = Some(FatalReason::ProtocolEncode);
+                    else if let Err(reason) = start_shutdown(&mut closing, &mut pending, &mut workers, &writer_tx, request_id, Some(reply), &mut shutdown_reply) {
+                        fatal_reason = Some(reason);
+                        fatal_stage = "shutdown";
                         break;
                     }
-                },
+                }
+                Some(Control::ForceTerminate { reply }) => {
+                    closing = true;
+                    fail_pending(&mut pending);
+                    workers.abort_all();
+                    force_reply = Some(reply);
+                    terminal_status = process::ProcessStatus::Terminated;
+                    break;
+                }
                 None => {
                     control_open = false;
                     if !closing
-                        && !start_shutdown(&mut closing, &mut pending, &mut workers, &writer_tx, "0".to_owned(), None, &mut shutdown_reply)
+                        && let Err(reason) = start_shutdown(&mut closing, &mut pending, &mut workers, &writer_tx, "0".to_owned(), None, &mut shutdown_reply)
                     {
-                        fatal_reason = Some(FatalReason::ProtocolEncode);
+                        fatal_reason = Some(reason);
+                        fatal_stage = "shutdown";
                         break;
                     }
-                },
+                }
             },
             event = reader_rx.recv(), if reader_open => match event {
                 Some(ActorEvent::Inbound(Ok(frame))) => match frame {
                     V6InboundFrame::TelegramInvoke(V6ModuleFrame::TelegramInvoke { call_id, method, params }) => {
                         if !reserve_call_id(&mut active_calls, &call_id) {
-                            // Duplicate call IDs are protocol-fatal even while
-                            // closing, so their meaning is never ambiguous.
                             fatal_reason = Some(FatalReason::ProtocolDecode);
+                            fatal_stage = "rpc";
                             break;
                         }
                         if closing {
                             let rejected = V6CallError { kind: "shutdown".to_owned(), message: "module is shutting down".to_owned() };
-                            if queue_writer(&writer_tx, WriterCommand::Frame(V6OutboundCoreFrame::TelegramResult { call_id: call_id.clone(), result: Err(rejected) }, Flush::Call(call_id))).is_err() { break; }
+                            if let Err(error) = queue_writer(&writer_tx, WriterCommand::Frame(V6OutboundCoreFrame::TelegramResult { call_id: call_id.clone(), result: Err(rejected) }, Flush::Call(call_id))) {
+                                fatal_reason = Some(FatalReason::from_writer(error));
+                                fatal_stage = "rpc";
+                                break;
+                            }
                             continue;
                         }
                         if active_calls.len() > V6_MAX_ACTIVE_RPCS {
                             let error = V6CallError { kind: "capacity".to_owned(), message: "too many active calls".to_owned() };
-                            if queue_writer(&writer_tx, WriterCommand::Frame(V6OutboundCoreFrame::TelegramResult { call_id: call_id.clone(), result: Err(error) }, Flush::Call(call_id))).is_err() { break; }
+                            if let Err(queue_error) = queue_writer(&writer_tx, WriterCommand::Frame(V6OutboundCoreFrame::TelegramResult { call_id: call_id.clone(), result: Err(error) }, Flush::Call(call_id))) {
+                                fatal_reason = Some(FatalReason::from_writer(queue_error));
+                                fatal_stage = "rpc";
+                                break;
+                            }
                             continue;
                         }
                         match validate_invoke(&descriptor, &method, true) {
@@ -495,13 +581,17 @@ async fn supervise(
                                 workers.spawn(async move {
                                     let result = match timeout(V6_RPC_TIMEOUT, executor.execute(V6ExecutionContext { module_id }, method, params)).await {
                                         Ok(result) => result,
-                                        Err(_) => Err(V6ExecutorError::Transport),
+                                        Err(_) => Err(V6ExecutorError::Timeout),
                                     };
                                     let _ = tx.send(ActorEvent::RpcComplete { call_id, result: map_executor_result(result) }).await;
                                 });
                             }
                             Err(error) => {
-                                if queue_writer(&writer_tx, WriterCommand::Frame(V6OutboundCoreFrame::TelegramResult { call_id: call_id.clone(), result: Err(error) }, Flush::Call(call_id))).is_err() { break; }
+                                if let Err(queue_error) = queue_writer(&writer_tx, WriterCommand::Frame(V6OutboundCoreFrame::TelegramResult { call_id: call_id.clone(), result: Err(error) }, Flush::Call(call_id))) {
+                                    fatal_reason = Some(FatalReason::from_writer(queue_error));
+                                    fatal_stage = "rpc";
+                                    break;
+                                }
                             }
                         }
                     }
@@ -511,10 +601,12 @@ async fn supervise(
                             break;
                         };
                         if let Some(pending_request) = pending.remove(&request_id) {
+                            let stage = expected_stage(pending_request.expected);
                             if !initialized_module_matches(&descriptor, &frame) {
                                 let _ = pending_request.reply.send(Err(ExternalError::WrongModuleId));
                                 fatal_reason = Some(FatalReason::WrongModuleId);
                                 fatal_request_id = Some(request_id);
+                                fatal_stage = stage;
                                 break;
                             } else if expected_matches(pending_request.expected, &frame) {
                                 let _ = pending_request.reply.send(Ok(frame));
@@ -522,11 +614,13 @@ async fn supervise(
                                 let _ = pending_request.reply.send(Err(ExternalError::ProtocolDecode));
                                 fatal_reason = Some(FatalReason::ProtocolDecode);
                                 fatal_request_id = Some(request_id);
+                                fatal_stage = stage;
                                 break;
                             }
                         } else {
                             fatal_reason = Some(FatalReason::WrongRequestId);
                             fatal_request_id = Some(request_id);
+                            fatal_stage = "runtime";
                             break;
                         }
                     }
@@ -534,28 +628,30 @@ async fn supervise(
                         if !pending.contains_key(&request_id) {
                             fatal_reason = Some(FatalReason::WrongRequestId);
                             fatal_request_id = Some(request_id);
+                            fatal_stage = "runtime";
                             break;
                         }
                         process::log_module_message(&descriptor.id, &request_id, &level, &message);
                     }
                     _ => {
                         fatal_reason = Some(FatalReason::ProtocolDecode);
+                        fatal_stage = pending_stage(&pending);
                         break;
                     },
                 },
                 Some(ActorEvent::Inbound(Err(error))) => {
                     fatal_reason = Some(FatalReason::from_inbound(&error));
                     fatal_request_id = single_pending_request_id(&pending);
+                    fatal_stage = pending_stage(&pending);
                     break;
                 },
                 Some(ActorEvent::ReaderEof) | None => {
                     reader_open = false;
                     if reader_eof_is_fatal(closing) {
-                        if let Some(reply) = shutdown_reply.take() {
-                            let _ = reply.send(Err(ExternalError::Unavailable));
-                        }
+                        if let Some(reply) = shutdown_reply.take() { let _ = reply.send(Err(ExternalError::Unavailable)); }
                         fatal_reason = Some(FatalReason::Unavailable);
                         fatal_request_id = single_pending_request_id(&pending);
+                        fatal_stage = pending_stage(&pending);
                         break;
                     }
                 },
@@ -563,23 +659,34 @@ async fn supervise(
             },
             event = rpc_rx.recv() => match event {
                 Some(ActorEvent::RpcComplete { call_id, result }) => {
-                    if queue_writer(&writer_tx, WriterCommand::Frame(V6OutboundCoreFrame::TelegramResult { call_id: call_id.clone(), result }, Flush::Call(call_id))).is_err() { break; }
+                    if let Err(error) = queue_writer(&writer_tx, WriterCommand::Frame(V6OutboundCoreFrame::TelegramResult { call_id: call_id.clone(), result }, Flush::Call(call_id))) {
+                        fatal_reason = Some(FatalReason::from_writer(error));
+                        fatal_stage = "rpc";
+                        break;
+                    }
                 }
                 Some(ActorEvent::Flushed(call_id)) => { active_calls.remove(&call_id); }
                 Some(ActorEvent::ShutdownFlushed) => {
                     shutdown_flushed = true;
                     shutdown_deadline = Some(Instant::now() + V6_SHUTDOWN_TIMEOUT);
                     if let Some(child_exit) = stored_child_exit.take() {
-                        if let Some(reply) = shutdown_reply.take() {
-                            let _ = reply.send(shutdown_child_exit_result(true, child_exit));
+                        let result = shutdown_child_exit_result(true, child_exit);
+                        let clean = result.is_ok();
+                        if let Some(reply) = shutdown_reply.take() { let _ = reply.send(result); }
+                        if clean {
+                            terminal_status = process::ProcessStatus::Terminated;
+                        } else {
+                            fatal_reason = Some(FatalReason::Unavailable);
+                            fatal_stage = "shutdown";
                         }
                         break;
                     }
                 }
                 Some(ActorEvent::WriterFailed) | None => {
-                    if let Some(reply) = shutdown_reply.take() { let _ = reply.send(Err(ExternalError::ProtocolEncode)); }
-                    fatal_reason = Some(FatalReason::ProtocolEncode);
+                    if let Some(reply) = shutdown_reply.take() { let _ = reply.send(Err(ExternalError::WriterUnavailable)); }
+                    fatal_reason = Some(FatalReason::WriterUnavailable);
                     fatal_request_id = single_pending_request_id(&pending);
+                    fatal_stage = if closing { "shutdown" } else { pending_stage(&pending) };
                     break;
                 },
                 _ => {}
@@ -587,10 +694,12 @@ async fn supervise(
             _ = async { if let Some(deadline) = shutdown_deadline { tokio::time::sleep_until(deadline).await } else { future::pending::<()>().await } }, if closing => {
                 if let Some(reply) = shutdown_reply.take() { let _ = reply.send(Err(ExternalError::ShutdownTimeout)); }
                 fatal_reason = Some(FatalReason::ShutdownTimeout);
+                fatal_stage = "shutdown";
                 break;
             },
             _ = sleep_until_pending_deadline(&pending), if !pending.is_empty() => {
                 if let Some(request_id) = expired_request_id(&pending) {
+                    fatal_stage = pending.get(&request_id).map(|request| expected_stage(request.expected)).unwrap_or("runtime");
                     fatal_reason = Some(FatalReason::ExecutionTimeout);
                     fatal_request_id = Some(request_id);
                     break;
@@ -599,10 +708,12 @@ async fn supervise(
         }
         while workers.try_join_next().is_some() {}
     }
+
     if fatal_request_id.is_none() {
         fatal_request_id = single_pending_request_id(&pending);
     }
     if let Some(reason) = fatal_reason {
+        lock_runtime_state(&runtime).status = process::ProcessStatus::Crashed;
         fail_pending_with(&mut pending, reason);
     } else {
         fail_pending(&mut pending);
@@ -613,13 +724,18 @@ async fn supervise(
     reader.abort();
     writer.abort();
 
-    // The process group is a separate lifecycle resource from the leader PID.
-    // Always terminate it when the supervisor exits, even when child.wait()
-    // already reaped the leader, so orphaned descendants cannot survive.
     kill_group(process_group);
-    if !child_reaped && timeout(V6_SHUTDOWN_TIMEOUT, child.wait()).await.is_err() {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
+    if !child_reaped {
+        match timeout(V6_SHUTDOWN_TIMEOUT, child.wait()).await {
+            Ok(result) => {
+                capture_exit_status(&result, &mut exit_code, &mut exit_signal);
+            }
+            Err(_) => {
+                let _ = child.kill().await;
+                let result = child.wait().await;
+                capture_exit_status(&result, &mut exit_code, &mut exit_signal);
+            }
+        }
     }
 
     process::finish_stderr_drain(stderr_drain).await;
@@ -629,18 +745,46 @@ async fn supervise(
     if let Some(reason) = fatal_reason {
         let capture = process::lock_capture(&stderr_capture).clone();
         let error = reason.error();
-        let diagnostics = process::build_crash_diagnostics(
+        let diagnostics = process::build_crash_diagnostics_with_context(
             &descriptor,
             fatal_request_id.as_deref(),
             &error,
             &capture,
+            fatal_stage,
+            reason.category(),
+            exit_code,
+            exit_signal,
+            0,
         );
+        {
+            let mut state = lock_runtime_state(&runtime);
+            state.status = process::ProcessStatus::Crashed;
+            state.diagnostic = Some(diagnostics.clone());
+        }
         process::emit_crash_event(&diagnostics);
+    } else {
+        lock_runtime_state(&runtime).status = terminal_status;
+    }
+    if let Some(reply) = force_reply {
+        let _ = reply.send(());
     }
 }
 
-fn queue_writer(writer: &mpsc::Sender<WriterCommand>, command: WriterCommand) -> Result<(), ()> {
-    writer.try_send(command).map_err(|_| ())
+#[derive(Clone, Copy)]
+enum WriterQueueFailure {
+    Backpressure,
+    Closed,
+}
+
+fn queue_writer(
+    writer: &mpsc::Sender<WriterCommand>,
+    command: WriterCommand,
+) -> Result<(), WriterQueueFailure> {
+    match writer.try_send(command) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(_)) => Err(WriterQueueFailure::Backpressure),
+        Err(mpsc::error::TrySendError::Closed(_)) => Err(WriterQueueFailure::Closed),
+    }
 }
 
 fn reserve_call_id(active_calls: &mut HashSet<String>, call_id: &str) -> bool {
@@ -655,30 +799,75 @@ fn start_shutdown(
     request_id: String,
     reply: Option<oneshot::Sender<Result<(), ExternalError>>>,
     shutdown_reply: &mut Option<oneshot::Sender<Result<(), ExternalError>>>,
-) -> bool {
+) -> Result<(), FatalReason> {
     if *closing {
-        // A dropped control sender must not overwrite a live shutdown reply.
-        return true;
+        return Ok(());
     }
     *closing = true;
     fail_pending(pending);
     workers.abort_all();
-    if queue_writer(
+    if let Err(error) = queue_writer(
         writer,
         WriterCommand::Frame(
             V6OutboundCoreFrame::Shutdown { request_id },
             Flush::Shutdown,
         ),
-    )
-    .is_err()
-    {
+    ) {
+        let reason = FatalReason::from_writer(error);
         if let Some(reply) = reply {
-            let _ = reply.send(Err(ExternalError::Unavailable));
+            let _ = reply.send(Err(reason.error()));
         }
-        return false;
+        return Err(reason);
     }
     *shutdown_reply = reply;
-    true
+    Ok(())
+}
+
+fn expected_stage(expected: Expected) -> &'static str {
+    match expected {
+        Expected::Initialized => "initialize",
+        Expected::Health => "health",
+        Expected::Result => "execute",
+        Expected::EventResult => "event",
+    }
+}
+
+fn outbound_stage(frame: &V6OutboundCoreFrame) -> &'static str {
+    match frame {
+        V6OutboundCoreFrame::Initialize { .. } => "initialize",
+        V6OutboundCoreFrame::Execute { .. } => "execute",
+        V6OutboundCoreFrame::Event { .. } => "event",
+        V6OutboundCoreFrame::Health { .. } => "health",
+        V6OutboundCoreFrame::Shutdown { .. } => "shutdown",
+        V6OutboundCoreFrame::TelegramResult { .. } => "rpc",
+    }
+}
+
+fn pending_stage(pending: &HashMap<String, Pending>) -> &'static str {
+    if pending.len() == 1 {
+        pending
+            .values()
+            .next()
+            .map(|request| expected_stage(request.expected))
+            .unwrap_or("runtime")
+    } else {
+        "runtime"
+    }
+}
+
+fn capture_exit_status(
+    result: &std::io::Result<std::process::ExitStatus>,
+    exit_code: &mut Option<i32>,
+    signal: &mut Option<i32>,
+) {
+    if let Ok(status) = result {
+        *exit_code = status.code();
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            *signal = status.signal();
+        }
+    }
 }
 
 async fn read_stdout(
@@ -824,6 +1013,10 @@ fn v6_executor_error(error: V6ExecutorError) -> V6CallError {
             kind: "transport".to_owned(),
             message: "Telegram transport unavailable".to_owned(),
         },
+        V6ExecutorError::Timeout => V6CallError {
+            kind: "timeout".to_owned(),
+            message: "Telegram RPC deadline exceeded".to_owned(),
+        },
         V6ExecutorError::InvalidResponse => V6CallError {
             kind: "internal".to_owned(),
             message: "invalid gateway response".to_owned(),
@@ -887,9 +1080,10 @@ fn shutdown_child_exit_result(
     if !flushed {
         return Err(ExternalError::Unavailable);
     }
-    child_exit
-        .map(|_| ())
-        .map_err(|_| ExternalError::Unavailable)
+    match child_exit {
+        Ok(status) if status.success() => Ok(()),
+        Ok(_) | Err(_) => Err(ExternalError::Unavailable),
+    }
 }
 
 fn reader_eof_is_fatal(closing: bool) -> bool {
@@ -1060,6 +1254,7 @@ mod tests {
                 message: "invalid parameters".to_owned()
             }
         );
+        assert_eq!(v6_executor_error(V6ExecutorError::Timeout).kind, "timeout");
         assert_eq!(
             v6_executor_error(V6ExecutorError::Rpc {
                 code: 420,
@@ -1079,6 +1274,13 @@ mod tests {
             let exited = Ok(std::process::ExitStatus::from_raw(0));
             assert!(matches!(
                 shutdown_child_exit_result(false, exited),
+                Err(ExternalError::Unavailable)
+            ));
+            assert!(
+                shutdown_child_exit_result(true, Ok(std::process::ExitStatus::from_raw(0))).is_ok()
+            );
+            assert!(matches!(
+                shutdown_child_exit_result(true, Ok(std::process::ExitStatus::from_raw(1 << 8))),
                 Err(ExternalError::Unavailable)
             ));
         }

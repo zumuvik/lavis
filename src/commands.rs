@@ -122,13 +122,14 @@ const COMMAND_SPECS: [CommandDefinition; 10] = [
     CommandDefinition {
         kind: CommandKind::Lm,
         name: "lm",
-        usage: "lm [list|info <id>|install|confirm <approval-id>|cancel <approval-id>|enable <id>|disable <id>]",
+        usage: "lm [list|info <id>|logs <id>|install|confirm <approval-id>|cancel <approval-id>|enable <id>|disable <id>]",
         summary_ru: "Проверить и установить внешний модуль",
         description_ru: "Показывает внешние модули или запускает проверяемую установку с отдельным подтверждением.",
         examples: &[
             "lm",
             "lm list",
             "lm info <id>",
+            "lm logs <id>",
             "lm install",
             "lm confirm <approval-id>",
             "lm cancel <approval-id>",
@@ -341,6 +342,7 @@ pub enum LmRequest {
     Confirm { approval_id: ApprovalId },
     Cancel { approval_id: ApprovalId },
     Info { id: String },
+    Logs { id: String },
     Enable { id: String },
     Disable { id: String },
     Invalid,
@@ -388,6 +390,9 @@ fn parse_lm_request(args: &str) -> LmRequest {
             .unwrap_or(LmRequest::Invalid),
         "info" => parse_lm_id(tokens)
             .map(|id| LmRequest::Info { id })
+            .unwrap_or(LmRequest::Invalid),
+        "logs" => parse_lm_id(tokens)
+            .map(|id| LmRequest::Logs { id })
             .unwrap_or(LmRequest::Invalid),
         "enable" => parse_lm_id(tokens)
             .map(|id| LmRequest::Enable { id })

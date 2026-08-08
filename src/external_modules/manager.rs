@@ -81,6 +81,15 @@ impl ManagedProcess {
             Self::V6(process) => Some(process.descriptor().clone()),
         }
     }
+
+    fn diagnostic_text(&self) -> Option<String> {
+        match self {
+            Self::Legacy(_) => None,
+            Self::V6(process) => process
+                .diagnostic()
+                .map(|diagnostic| diagnostic.render_user()),
+        }
+    }
 }
 
 async fn shutdown_process(id: &str, process: ManagedProcess) {
@@ -355,6 +364,13 @@ impl ExternalManagerHandle {
     pub async fn snapshot(&self) -> ExternalRuntimeSnapshot {
         let mgr = self.inner.lock().await;
         ExternalRuntimeSnapshot::from_manager(&mgr)
+    }
+
+    pub async fn diagnostic_text(&self, module_id: &str) -> Option<String> {
+        let mgr = self.inner.lock().await;
+        mgr.processes
+            .get(module_id)
+            .and_then(ManagedProcess::diagnostic_text)
     }
 
     /// Starts children without retaining the manager mutex. Process I/O belongs

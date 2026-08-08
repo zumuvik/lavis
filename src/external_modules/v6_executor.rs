@@ -67,6 +67,7 @@ pub enum V6ExecutorError {
         retry_after_seconds: Option<u32>,
     },
     Transport,
+    Timeout,
     InvalidResponse,
     ShuttingDown,
 }
