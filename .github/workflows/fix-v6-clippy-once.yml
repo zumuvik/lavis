@@ -93,6 +93,11 @@ jobs:
               '''        json["timer_subscriptions"] = serde_json::json!([]);\n        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();\n        assert!(matches!(\n            validate_manifest_at(&path, Some("echo")),\n            Err(ExternalError::MalformedManifest)\n        ));\n''',
           )
           replace(
+              'src/external_modules/manifest.rs',
+              '''        json["subscriptions"] = serde_json::json!([{"type": "timer.tick", "interval_seconds": 30}]);\n        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();\n        assert!(matches!(\n            validate_manifest_at(&path, Some("echo")),\n            Err(ExternalError::InvalidArgument)\n        ));\n        for schema_version in 2..=4 {\n''',
+              '''        json["subscriptions"] = serde_json::json!([{"type": "timer.tick", "interval_seconds": 30}]);\n        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();\n        assert!(matches!(\n            validate_manifest_at(&path, Some("echo")),\n            Err(ExternalError::MalformedManifest)\n        ));\n        for schema_version in 2..=4 {\n''',
+          )
+          replace(
               'src/external_modules/protocol.rs',
               '''    #[serde(rename = "telegram.invoke")]\n    TelegramInvoke {\n        protocol_version: u32,\n        call_id: String,\n        method: String,\n        params: Box<RawValue>,\n    },\n}\n\n#[derive(Deserialize)]\n#[serde(deny_unknown_fields)]\nstruct V6WireSuccess {\n''',
               '''}\n\n#[derive(Deserialize)]\n#[serde(deny_unknown_fields)]\nstruct V6WireInvoke {\n    protocol_version: u32,\n    #[serde(rename = "type")]\n    message_type: String,\n    call_id: String,\n    method: String,\n    params: Box<RawValue>,\n}\n\n#[derive(Deserialize)]\n#[serde(deny_unknown_fields)]\nstruct V6WireSuccess {\n''',
