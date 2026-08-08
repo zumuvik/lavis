@@ -1,0 +1,97 @@
+name: Fix V6 Clippy Once
+
+on:
+  push:
+    branches:
+      - feat/module-api-v6-full-telegram
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v6
+        with:
+          ref: feat/module-api-v6-full-telegram
+
+      - name: Apply V6 fixes
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace(path, old, new, count=1):
+              p = Path(path)
+              text = p.read_text()
+              actual = text.count(old)
+              if actual != count:
+                  raise SystemExit(f'{path}: expected {count} matches, found {actual}')
+              p.write_text(text.replace(old, new, count))
+
+          replace(
+              'src/external_modules/v6_process.rs',
+              '''    pub(crate) async fn event(\n        &self,\n        request_id: String,\n        event: MessageEventKind,\n        payload: MessageEvent,\n    ) -> Result<V6InboundFrame, ExternalError> {\n        self.request(\n            V6OutboundCoreFrame::Event {\n                request_id,\n                event,\n                payload,\n            },\n            Expected::EventResult,\n        )\n        .await\n    }\n\n    pub(crate) async fn shutdown(&self, request_id: String) -> Result<(), ExternalError> {\n''',
+              '''    pub(crate) async fn event(\n        &self,\n        request_id: String,\n        event: MessageEventKind,\n        payload: MessageEvent,\n    ) -> Result<V6InboundFrame, ExternalError> {\n        self.request(\n            V6OutboundCoreFrame::Event {\n                request_id,\n                event,\n                payload,\n            },\n            Expected::EventResult,\n        )\n        .await\n    }\n\n    pub(crate) async fn health(\n        &self,\n        request_id: String,\n    ) -> Result<V6InboundFrame, ExternalError> {\n        self.request(\n            V6OutboundCoreFrame::Health { request_id },\n            Expected::Health,\n        )\n        .await\n    }\n\n    pub(crate) async fn shutdown(&self, request_id: String) -> Result<(), ExternalError> {\n''',
+          )
+          replace(
+              'src/external_modules/v6_process.rs',
+              '''        if let Some(event) = event {\n            if tx.send(event).await.is_err() {\n                return;\n            }\n        }\n''',
+              '''        if let Some(event) = event\n            && tx.send(event).await.is_err()\n        {\n            return;\n        }\n''',
+          )
+          replace(
+              'src/external_modules/v6_process.rs',
+              '        message: "method is not allowlisted".to_owned(),\n',
+              '        message: "gateway method is not recognized".to_owned(),\n',
+          )
+          replace(
+              'src/external_modules/v6_executor.rs',
+              '    if bytes.is_empty() || bytes.len() % 4 != 0 {\n',
+              '    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {\n',
+          )
+          replace(
+              'src/external_modules/v6_executor.rs',
+              '        if !last && (c_padding || d_padding) || c_padding && !d_padding {\n',
+              '        if !last && d_padding || c_padding && !d_padding {\n',
+          )
+          replace(
+              'src/external_modules/manager.rs',
+              '''                                    Ok(super::protocol::V6InboundFrame::Initialized {\n                                        module_id,\n                                        ..\n                                    }) if module_id == id => Ok(ManagedProcess::V6(process)),\n''',
+              '''                                    Ok(super::protocol::V6InboundFrame::Initialized {\n                                        module_id,\n                                        ..\n                                    }) if module_id == id => match process\n                                        .health(super::protocol::request_id())\n                                        .await\n                                    {\n                                        Ok(super::protocol::V6InboundFrame::Health { .. }) => {\n                                            Ok(ManagedProcess::V6(process))\n                                        }\n                                        Ok(_) => {\n                                            process.terminate().await;\n                                            Err(ExternalError::ProtocolDecode)\n                                        }\n                                        Err(error) => {\n                                            process.terminate().await;\n                                            Err(error)\n                                        }\n                                    },\n''',
+          )
+          replace(
+              'src/external_modules/source_inspection.rs',
+              '    /// `telegram.raw` grants reviewed RPC methods but does not sandbox a module.\n',
+              '    /// `telegram.raw` grants raw Telegram RPC authority and does not sandbox a module.\n',
+          )
+          replace(
+              'src/external_modules/source_inspection.rs',
+              '            AcquiredLmod::archive(v6_archive("account.updateStatus")),\n',
+              '            AcquiredLmod::archive(v6_archive("raw.invoke")),\n',
+          )
+          replace(
+              'src/external_modules/source_inspection.rs',
+              '            vec!["account.updateStatus".to_owned()]\n',
+              '            vec!["raw.invoke".to_owned()]\n',
+          )
+          PY
+
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@v3
+
+      - name: Format, lint and test
+        run: |
+          nix develop -c cargo fmt
+          nix develop -c cargo clippy --all-targets --all-features -- -D warnings
+          nix develop -c cargo test --all-targets --all-features
+
+      - name: Commit fixes
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -- '*.rs'
+          git commit -m 'fix: complete Module API v6 health and lint contract'
+          git push origin HEAD:feat/module-api-v6-full-telegram
