@@ -722,7 +722,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        crate::external_modules::v6_process::set_test_state_base(root.join("state"));
+        crate::external_modules::v6_process::ensure_test_state_base();
         let mut module = descriptor("sample", "1.0");
         module.protocol_version = 6;
         module.module_dir = root.clone();
@@ -779,7 +779,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        crate::external_modules::v6_process::set_test_state_base(root.join("state"));
+        crate::external_modules::v6_process::ensure_test_state_base();
         let entrypoint = root.join("run");
         let mut module = descriptor("sample", "1.0");
         module.protocol_version = 6;

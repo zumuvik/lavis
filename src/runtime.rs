@@ -2512,7 +2512,7 @@ mod tests {
             Some("sample"),
         )
         .unwrap();
-        crate::external_modules::v6_process::set_test_state_base(directory.join("state-base"));
+        crate::external_modules::v6_process::ensure_test_state_base();
         let handle = crate::external_modules::manager::ExternalManagerHandle::new(
             crate::external_modules::manager::ExternalManager::new(),
         );

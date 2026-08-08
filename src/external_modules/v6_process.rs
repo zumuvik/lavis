@@ -1388,6 +1388,13 @@ pub(crate) fn set_test_state_base(base: PathBuf) {
     let _ = TEST_STATE_BASE.set(base);
 }
 
+#[cfg(test)]
+pub(crate) fn ensure_test_state_base() {
+    let base = std::env::temp_dir().join(format!("lavis-v6-test-state-{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+    set_test_state_base(base);
+}
+
 /// Resolve the module state directory. Tests install a writable base so the
 /// Nix build sandbox (whose `$HOME` is not writable) can run the real-child
 /// fixtures without leaking module state into the user's home.
@@ -1479,16 +1486,6 @@ mod tests {
             std::process::id(),
             protocol::request_id()
         ))
-    }
-
-    /// Point the v6 module state directory at a writable temp base. The Nix
-    /// build sandbox has a non-writable `$HOME`, so the real-child fixtures
-    /// must not depend on the environment; every child-spawning test calls
-    /// this before `V6Process::start`.
-    fn ensure_test_state_base() {
-        let base = std::env::temp_dir().join(format!("lavis-v6-test-state-{}", std::process::id()));
-        std::fs::create_dir_all(&base).unwrap();
-        set_test_state_base(base);
     }
 
     /// Absolute path to a `python3` interpreter found via the test process
