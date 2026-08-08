@@ -35,10 +35,11 @@ to 64 bytes.
 
 Lavis drives lifecycle requests strictly in order. At most one lifecycle request
 is sent and awaiting a response at a time. Additional lifecycle requests wait
-in a bounded queue (`V6_MAX_PENDING`); their timeout starts when Lavis dispatches
-the request to the module, not while it is queued. Parentless `telegram.invoke`
-calls remain independent and may be processed while a lifecycle response is
-pending.
+in a bounded queue (`V6_MAX_PENDING`); their response timeout starts only after
+the lifecycle frame has been written and flushed to the module's stdin, not
+while it is queued or being submitted to the writer. Parentless
+`telegram.invoke` calls remain independent and may be processed while a
+lifecycle response is pending.
 
 | Direction | Frame | Response |
 | --- | --- | --- |
@@ -232,7 +233,7 @@ protocol-transport change, not a Telegram method-surface change.
 | Reader queue | 8 (`V6_READER_QUEUE`) |
 | Writer queue | 8 (`V6_WRITER_QUEUE`) |
 | RPC event queue | 8 (`V6_RPC_QUEUE`) |
-| Maximum pending lifecycle requests | 8 (`V6_MAX_PENDING`) |
+| Maximum queued lifecycle requests | 8 (`V6_MAX_PENDING`) |
 | Maximum active Telegram calls | 8 (`V6_MAX_ACTIVE_RPCS`) |
 | Global RPC concurrency (all modules) | 8 (`V6_GLOBAL_CONCURRENCY`) |
 | Lifecycle request timeout | 5 s (`V6_LIFECYCLE_TIMEOUT`) |
@@ -240,7 +241,7 @@ protocol-transport change, not a Telegram method-surface change.
 | Write timeout | 1 s (`V6_WRITE_TIMEOUT`) |
 | Shutdown grace | 1 s (`V6_SHUTDOWN_TIMEOUT`) |
 
-A full lifecycle queue (`V6_MAX_PENDING`) rejects new requests with a
+A full waiting lifecycle queue (`V6_MAX_PENDING`) rejects new requests with a
 backpressure category. A full RPC queue rejects an excess `telegram.invoke`
 with a `capacity` error. These are distinct from a protocol crash: transient
 backpressure must not be indistinguishable from a writer failure.

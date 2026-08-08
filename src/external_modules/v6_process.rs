@@ -448,9 +448,9 @@ impl FatalReason {
 struct Pending {
     request_id: String,
     expected: Expected,
-    /// Deadline set only when the request is actually dispatched to the module
-    /// (written to stdin), never when it merely enters the waiting queue.
-    deadline: Instant,
+    /// Deadline set only after the writer confirms the frame was written and
+    /// flushed to module stdin; it is absent while queued or awaiting flush.
+    deadline: Option<Instant>,
     reply: oneshot::Sender<Result<V6InboundFrame, ExternalError>>,
 }
 
@@ -471,8 +471,10 @@ enum WriterCommand {
 
 #[derive(Debug)]
 enum Flush {
+    #[cfg(test)]
     None,
     Call(String),
+    Lifecycle(String),
     Shutdown,
 }
 
@@ -483,6 +485,7 @@ enum ActorEvent {
         result: Result<serde_json::Value, V6CallError>,
     },
     Flushed(String),
+    LifecycleFlushed(String),
     ShutdownFlushed,
     WriterFailed,
     ReaderEof,
@@ -522,6 +525,11 @@ async fn supervise(
     } = io;
     let mut in_flight: Option<Pending> = None;
     let mut waiting: VecDeque<QueuedRequest> = VecDeque::new();
+    // A module can answer immediately after the kernel accepts a flushed
+    // frame, before the writer task gets scheduled to report its ack. Keep
+    // those ids so the valid late acknowledgement is consumed rather than
+    // mistaken for a correlation failure.
+    let mut completed_before_flush_ack = HashSet::new();
     let mut active_calls = HashSet::new();
     let mut workers = JoinSet::new();
     let mut closing = false;
@@ -683,6 +691,9 @@ async fn supervise(
                             fatal_stage = stage;
                             break;
                         } else if expected_matches(pending_request.expected, &frame) {
+                            if pending_request.deadline.is_none() {
+                                completed_before_flush_ack.insert(terminal_id.clone());
+                            }
                             let _ = pending_request.reply.send(Ok(frame));
                         } else {
                             let _ = pending_request.reply.send(Err(ExternalError::ProtocolDecode));
@@ -696,10 +707,11 @@ async fn supervise(
                         // deadline begins here, at dispatch.
                         if let Some(queued) = waiting.pop_front() {
                             let queued_id = request_id(&queued.frame).map(str::to_owned);
+                            let queued_stage = outbound_stage(&queued.frame);
                             if let Err(reason) = dispatch_lifecycle(&mut in_flight, &writer_tx, queued.frame, queued.expected, queued.reply) {
                                 fatal_reason = Some(reason);
                                 fatal_request_id = queued_id;
-                                fatal_stage = stage;
+                                fatal_stage = queued_stage;
                                 break;
                             }
                         }
@@ -753,6 +765,18 @@ async fn supervise(
                     }
                 }
                 Some(ActorEvent::Flushed(call_id)) => { active_calls.remove(&call_id); }
+                Some(ActorEvent::LifecycleFlushed(request_id)) => {
+                    if let Err(reason) = handle_lifecycle_flushed(
+                        &mut in_flight,
+                        &mut completed_before_flush_ack,
+                        &request_id,
+                    ) {
+                        fatal_reason = Some(reason);
+                        fatal_request_id = Some(request_id);
+                        fatal_stage = in_flight_stage(&in_flight);
+                        break;
+                    }
+                }
                 Some(ActorEvent::ShutdownFlushed) => {
                     shutdown_flushed = true;
                     shutdown_deadline = Some(Instant::now() + V6_SHUTDOWN_TIMEOUT);
@@ -784,9 +808,9 @@ async fn supervise(
                 fatal_stage = "shutdown";
                 break;
             },
-            _ = sleep_until_in_flight_deadline(&in_flight), if in_flight.is_some() => {
+            _ = sleep_until_in_flight_deadline(&in_flight), if lifecycle_deadline_started(&in_flight) => {
                 if let Some(request) = in_flight.as_ref()
-                    && request.deadline <= Instant::now()
+                    && request.deadline.is_some_and(|deadline| deadline <= Instant::now())
                 {
                     let stage = expected_stage(request.expected);
                     let request_id = request.request_id.clone();
@@ -996,7 +1020,10 @@ fn dispatch_lifecycle(
         let _ = reply.send(Err(ExternalError::ProtocolEncode));
         return Ok(());
     };
-    if let Err(error) = queue_writer(writer, WriterCommand::Frame(frame, Flush::None)) {
+    if let Err(error) = queue_writer(
+        writer,
+        WriterCommand::Frame(frame, Flush::Lifecycle(request_id.clone())),
+    ) {
         let reason = FatalReason::from_writer(error);
         let _ = reply.send(Err(reason.error()));
         return Err(reason);
@@ -1004,7 +1031,7 @@ fn dispatch_lifecycle(
     *in_flight = Some(Pending {
         request_id,
         expected,
-        deadline: Instant::now() + lifecycle_timeout(),
+        deadline: None,
         reply,
     });
     Ok(())
@@ -1047,11 +1074,37 @@ fn in_flight_stage(in_flight: &Option<Pending>) -> &'static str {
 }
 
 async fn sleep_until_in_flight_deadline(in_flight: &Option<Pending>) {
-    let deadline = in_flight
+    match in_flight.as_ref().and_then(|request| request.deadline) {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => future::pending::<()>().await,
+    }
+}
+
+fn lifecycle_deadline_started(in_flight: &Option<Pending>) -> bool {
+    in_flight
         .as_ref()
-        .map(|request| request.deadline)
-        .unwrap_or_else(Instant::now);
-    tokio::time::sleep_until(deadline).await;
+        .is_some_and(|request| request.deadline.is_some())
+}
+
+fn handle_lifecycle_flushed(
+    in_flight: &mut Option<Pending>,
+    completed_before_flush_ack: &mut HashSet<String>,
+    request_id: &str,
+) -> Result<(), FatalReason> {
+    if let Some(pending) = in_flight.as_mut()
+        && pending.request_id == request_id
+    {
+        if pending.deadline.is_some() {
+            return Err(FatalReason::WrongRequestId);
+        }
+        pending.deadline = Some(Instant::now() + lifecycle_timeout());
+        return Ok(());
+    }
+    if completed_before_flush_ack.remove(request_id) {
+        Ok(())
+    } else {
+        Err(FatalReason::WrongRequestId)
+    }
 }
 
 fn fail_lifecycle(in_flight: &mut Option<Pending>, waiting: &mut VecDeque<QueuedRequest>) {
@@ -1153,8 +1206,10 @@ async fn write_stdin(
             return;
         }
         let event = match flush {
+            #[cfg(test)]
             Flush::None => None,
             Flush::Call(call_id) => Some(ActorEvent::Flushed(call_id)),
+            Flush::Lifecycle(request_id) => Some(ActorEvent::LifecycleFlushed(request_id)),
             Flush::Shutdown => Some(ActorEvent::ShutdownFlushed),
         };
         if let Some(event) = event
@@ -2888,7 +2943,7 @@ sys.exit(0)
         let mut in_flight = Some(Pending {
             request_id: "1".to_owned(),
             expected: Expected::Health,
-            deadline: Instant::now() - Duration::from_secs(1),
+            deadline: Some(Instant::now() - Duration::from_secs(1)),
             reply,
         });
         let (queued_reply, mut queued_receiver) = oneshot::channel();
@@ -2930,7 +2985,6 @@ sys.exit(0)
         }]);
         tokio::time::sleep(Duration::from_millis(100)).await;
         let queued = waiting.pop_front().expect("queued request");
-        let dispatched_at = Instant::now();
         dispatch_lifecycle(
             &mut in_flight,
             &writer,
@@ -2941,15 +2995,25 @@ sys.exit(0)
         .expect("dispatch must write the frame");
         let dispatched = in_flight.expect("in flight after dispatch");
         assert_eq!(dispatched.request_id, "7");
-        // The deadline is anchored at dispatch time, not at enqueue time.
-        let expected = dispatched_at + lifecycle_timeout();
+        assert!(dispatched.deadline.is_none());
+        let mut in_flight = Some(dispatched);
+        let mut completed_before_flush_ack = HashSet::new();
+        let acknowledgement_at = Instant::now();
+        handle_lifecycle_flushed(&mut in_flight, &mut completed_before_flush_ack, "7")
+            .expect("matching flush acknowledgement");
+        let deadline = in_flight
+            .as_ref()
+            .and_then(|request| request.deadline)
+            .expect("flush acknowledgement starts deadline");
+        // The deadline is anchored at the flush acknowledgement, not enqueue.
+        let expected = acknowledgement_at + lifecycle_timeout();
         let window = Duration::from_millis(50);
         assert!(
-            dispatched.deadline >= expected - window && dispatched.deadline <= expected + window,
-            "deadline must start at dispatch"
+            deadline >= expected - window && deadline <= expected + window,
+            "deadline must start at flush acknowledgement"
         );
         assert!(
-            dispatched.deadline > enqueued_at + lifecycle_timeout() + window,
+            deadline > enqueued_at + lifecycle_timeout() + window,
             "queued time must not consume the lifecycle deadline"
         );
         // The frame reached the writer queue exactly once.
@@ -2957,11 +3021,63 @@ sys.exit(0)
             writer_rx.try_recv(),
             Ok(WriterCommand::Frame(
                 V6OutboundCoreFrame::Health { .. },
-                Flush::None
+                Flush::Lifecycle(_),
             ))
         ));
         assert!(writer_rx.try_recv().is_err());
         drop(receiver);
+    }
+
+    #[test]
+    fn lifecycle_flush_ack_requires_matching_non_duplicate_request_id() {
+        let (reply, _receiver) = oneshot::channel();
+        let mut in_flight = Some(Pending {
+            request_id: "7".to_owned(),
+            expected: Expected::Health,
+            deadline: None,
+            reply,
+        });
+        let mut completed_before_flush_ack = HashSet::new();
+        assert!(matches!(
+            handle_lifecycle_flushed(&mut in_flight, &mut completed_before_flush_ack, "8"),
+            Err(FatalReason::WrongRequestId)
+        ));
+        handle_lifecycle_flushed(&mut in_flight, &mut completed_before_flush_ack, "7")
+            .expect("matching acknowledgement");
+        assert!(matches!(
+            handle_lifecycle_flushed(&mut in_flight, &mut completed_before_flush_ack, "7"),
+            Err(FatalReason::WrongRequestId)
+        ));
+    }
+
+    #[test]
+    fn writer_failure_before_lifecycle_flush_ack_replies_and_fails() {
+        let (writer, _reader) = mpsc::channel(1);
+        writer
+            .try_send(WriterCommand::Frame(
+                V6OutboundCoreFrame::Health {
+                    request_id: "busy".to_owned(),
+                },
+                Flush::Lifecycle("busy".to_owned()),
+            ))
+            .unwrap();
+        let (reply, mut receiver) = oneshot::channel();
+        let mut in_flight = None;
+        let result = dispatch_lifecycle(
+            &mut in_flight,
+            &writer,
+            V6OutboundCoreFrame::Health {
+                request_id: "7".to_owned(),
+            },
+            Expected::Health,
+            reply,
+        );
+        assert!(matches!(result, Err(FatalReason::Backpressure)));
+        assert!(in_flight.is_none());
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Err(ExternalError::Backpressure))
+        ));
     }
 
     #[tokio::test]
@@ -2970,7 +3086,7 @@ sys.exit(0)
         let in_flight = Some(Pending {
             request_id: "1".to_owned(),
             expected: Expected::Health,
-            deadline: Instant::now(),
+            deadline: Some(Instant::now()),
             reply,
         });
         tokio::time::timeout(
