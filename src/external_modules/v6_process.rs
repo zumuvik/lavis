@@ -1713,7 +1713,15 @@ sys.exit(0)
         let body_base64 = v6_executor::encode_base64(&body);
         let marker = "marker.txt";
         let script = r#"#!/usr/bin/env python3
-import sys, json, base64
+import sys, json, base64, os
+
+def write_marker(content):
+    # Atomic visibility: the marker path only appears with full content, so a
+    # poller can never observe a partially-buffered write.
+    tmp = "__MARKER__.tmp"
+    with open(tmp, "w") as f:
+        f.write(content)
+    os.replace(tmp, "__MARKER__")
 
 def req_id(line):
     return json.loads(line)["request_id"]
@@ -1737,11 +1745,9 @@ try:
     assert result["kind"] == "raw_tl", result.get("kind")
     assert result["dc_id"] == 2, result.get("dc_id")
     decoded = base64.b64decode("".join(result["body_base64_chunks"]))
-    with open("__MARKER__", "w") as f:
-        f.write(decoded.decode("latin-1"))
+    write_marker(decoded.decode("latin-1"))
 except Exception as error:
-    with open("__MARKER__", "w") as f:
-        f.write("FAILED: " + repr(error))
+    write_marker("FAILED: " + repr(error))
     sys.exit(62)
 line = sys.stdin.readline()
 sys.exit(0)
