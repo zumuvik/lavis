@@ -1030,6 +1030,9 @@ impl RuntimeState {
             Err(control::ModuleControlError::InvalidInstalledModule) => {
                 Response::plain("⚠️ Манифест установленного модуля некорректен.".to_owned())
             }
+            Err(control::ModuleControlError::ModuleNotInstalled) => {
+                Response::plain("⚠️ Модуль не установлен.".to_owned())
+            }
             Err(_) => Response::plain("⚠️ Модуль не установлен или недоступен.".to_owned()),
         }
     }
@@ -2454,6 +2457,24 @@ mod tests {
         assert!(doctor_missing.text.contains("Модуль absent не найден."));
 
         fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(state_directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn lm_info_distinguishes_a_missing_module_directory() {
+        let (mut runtime, state_directory) = runtime_with_alias().await;
+        let module_root = state_directory.join("modules");
+        fs::create_dir_all(&module_root).unwrap();
+        runtime.configure_module_control(
+            module_root.clone(),
+            state_directory.join("module-state.json"),
+            state_directory.join("declarative.json"),
+            PeerId::user(1).unwrap(),
+        );
+
+        let response = runtime.lm_info("missing").await;
+
+        assert_eq!(response.text, "⚠️ Модуль не установлен.");
         fs::remove_dir_all(state_directory).unwrap();
     }
 

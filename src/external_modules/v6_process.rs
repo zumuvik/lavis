@@ -37,7 +37,7 @@ const V6_MAX_ACTIVE_RPCS: usize = V6_RPC_QUEUE;
 const V6_MAX_PENDING: usize = 8;
 
 /// Lifecycle response deadline. Queued requests do not receive this deadline
-/// until they are dispatched to the module.
+/// until their frame has been written and flushed to the module.
 fn lifecycle_timeout() -> Duration {
     V6_LIFECYCLE_TIMEOUT
 }
@@ -449,7 +449,8 @@ struct Pending {
     request_id: String,
     expected: Expected,
     /// Deadline set only after the writer confirms the frame was written and
-    /// flushed to module stdin; it is absent while queued or awaiting flush.
+    /// flushed by the transport writer; it is absent while queued or awaiting
+    /// flush.
     deadline: Option<Instant>,
     reply: oneshot::Sender<Result<V6InboundFrame, ExternalError>>,
 }
@@ -457,7 +458,7 @@ struct Pending {
 /// A lifecycle request accepted by the supervisor but not yet sent to the
 /// module, because the documented sequential contract allows at most one
 /// in-flight lifecycle request at a time. Queued requests have no deadline;
-/// their `V6_LIFECYCLE_TIMEOUT` begins at dispatch.
+/// their `V6_LIFECYCLE_TIMEOUT` begins after the dispatch flush acknowledgement.
 struct QueuedRequest {
     frame: V6OutboundCoreFrame,
     expected: Expected,
@@ -529,6 +530,10 @@ async fn supervise(
     // reports one successful write+flush acknowledgement. This bookkeeping
     // survives response completion and shutdown cancellation.
     let mut awaiting_lifecycle_flush = HashSet::new();
+    // Graceful shutdown cancels at most the one lifecycle request currently
+    // dispatched. Keep its id boundedly so late frames for that request can be
+    // drained without being mistaken for an unknown request.
+    let mut cancelled_lifecycle_request = None;
     let mut active_calls = HashSet::new();
     let mut workers = JoinSet::new();
     let mut closing = false;
@@ -582,7 +587,8 @@ async fn supervise(
                     }
                     // Sequential contract: at most one lifecycle request is
                     // written to the module at a time. The rest wait in a
-                    // bounded queue; their deadlines start only at dispatch.
+                    // bounded queue; their deadlines start only after dispatch
+                    // has been written and flushed.
                     if in_flight.is_some() {
                         if waiting.len() == V6_MAX_PENDING {
                             let _ = reply.send(Err(ExternalError::Backpressure)); continue;
@@ -599,7 +605,7 @@ async fn supervise(
                 }
                 Some(Control::Shutdown { request_id, reply }) => {
                     if closing { let _ = reply.send(Err(ExternalError::Unavailable)); }
-                    else if let Err(reason) = start_shutdown(&mut closing, &mut in_flight, &mut waiting, &mut workers, &writer_tx, request_id, Some(reply), &mut shutdown_reply) {
+                    else if let Err(reason) = start_shutdown(&mut closing, &mut in_flight, &mut waiting, &mut workers, &writer_tx, request_id, Some(reply), &mut shutdown_reply, &mut cancelled_lifecycle_request) {
                         fatal_reason = Some(reason);
                         fatal_stage = "shutdown";
                         break;
@@ -615,7 +621,7 @@ async fn supervise(
                 None => {
                     control_open = false;
                     if !closing
-                        && let Err(reason) = start_shutdown(&mut closing, &mut in_flight, &mut waiting, &mut workers, &writer_tx, "0".to_owned(), None, &mut shutdown_reply)
+                        && let Err(reason) = start_shutdown(&mut closing, &mut in_flight, &mut waiting, &mut workers, &writer_tx, "0".to_owned(), None, &mut shutdown_reply, &mut cancelled_lifecycle_request)
                     {
                         fatal_reason = Some(reason);
                         fatal_stage = "shutdown";
@@ -626,19 +632,16 @@ async fn supervise(
             event = reader_rx.recv(), if reader_open => match event {
                 Some(ActorEvent::Inbound(Ok(frame))) => match frame {
                     V6InboundFrame::TelegramInvoke(V6ModuleFrame::TelegramInvoke { call_id, method, params }) => {
+                        if closing {
+                            // The shutdown frame is a writer barrier: module
+                            // work observed after it must not reserve a call or
+                            // enqueue a result behind the barrier.
+                            continue;
+                        }
                         if !reserve_call_id(&mut active_calls, &call_id) {
                             fatal_reason = Some(FatalReason::ProtocolDecode);
                             fatal_stage = "rpc";
                             break;
-                        }
-                        if closing {
-                            let rejected = V6CallError { kind: "shutdown".to_owned(), message: "module is shutting down".to_owned() };
-                            if let Err(error) = queue_writer(&writer_tx, WriterCommand::Frame(V6OutboundCoreFrame::TelegramResult { call_id: call_id.clone(), result: Err(rejected) }, Flush::Call(call_id))) {
-                                fatal_reason = Some(FatalReason::from_writer(error));
-                                fatal_stage = "rpc";
-                                break;
-                            }
-                            continue;
                         }
                         if active_calls.len() > V6_MAX_ACTIVE_RPCS {
                             let error = V6CallError { kind: "capacity".to_owned(), message: "too many active calls".to_owned() };
@@ -676,6 +679,11 @@ async fn supervise(
                             fatal_reason = Some(FatalReason::ProtocolDecode);
                             break;
                         };
+                        if closing
+                            && cancelled_lifecycle_frame(&frame, &terminal_id, &cancelled_lifecycle_request)
+                        {
+                            continue;
+                        }
                         let Some(pending_request) = take_in_flight(&mut in_flight, &terminal_id) else {
                             fatal_reason = Some(FatalReason::WrongRequestId);
                             fatal_request_id = Some(terminal_id);
@@ -700,7 +708,7 @@ async fn supervise(
                         }
                         // The in-flight request completed; the next queued
                         // lifecycle request (if any) may now be dispatched. Its
-                        // deadline begins here, at dispatch.
+                        // deadline begins after the dispatch flush acknowledgement.
                         if let Some(queued) = waiting.pop_front() {
                             let queued_id = request_id(&queued.frame).map(str::to_owned);
                             let queued_stage = outbound_stage(&queued.frame);
@@ -713,6 +721,11 @@ async fn supervise(
                         }
                     }
                     V6InboundFrame::Log { request_id, level, message } => {
+                        if closing
+                            && cancelled_lifecycle_request.as_deref() == Some(request_id.as_str())
+                        {
+                            continue;
+                        }
                         if in_flight
                             .as_ref()
                             .is_none_or(|request| request.request_id != request_id)
@@ -957,11 +970,13 @@ fn start_shutdown(
     request_id: String,
     reply: Option<oneshot::Sender<Result<(), ExternalError>>>,
     shutdown_reply: &mut Option<oneshot::Sender<Result<(), ExternalError>>>,
+    cancelled_lifecycle_request: &mut Option<String>,
 ) -> Result<(), FatalReason> {
     if *closing {
         return Ok(());
     }
     *closing = true;
+    *cancelled_lifecycle_request = in_flight.as_ref().map(|request| request.request_id.clone());
     // Fail the in-flight request and every queued lifecycle request so no
     // reply or write is leaked behind the shutdown frame.
     fail_lifecycle(in_flight, waiting);
@@ -981,6 +996,15 @@ fn start_shutdown(
     }
     *shutdown_reply = reply;
     Ok(())
+}
+
+fn cancelled_lifecycle_frame(
+    frame: &V6InboundFrame,
+    request_id: &str,
+    cancelled_request: &Option<String>,
+) -> bool {
+    cancelled_request.as_deref() == Some(request_id)
+        && terminal_request_id(frame) == Some(request_id)
 }
 
 fn expected_stage(expected: Expected) -> &'static str {
@@ -1003,8 +1027,8 @@ fn outbound_stage(frame: &V6OutboundCoreFrame) -> &'static str {
     }
 }
 
-/// Submit a lifecycle request to the writer. The writer starts the response
-/// deadline only after it reports that stdin write+flush completed.
+/// Submit a lifecycle request to the writer. The response deadline starts only
+/// after the writer reports that transport write+flush completed.
 fn dispatch_lifecycle(
     in_flight: &mut Option<Pending>,
     awaiting_lifecycle_flush: &mut HashSet<String>,
@@ -1897,10 +1921,169 @@ sys.exit(0)
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[cfg(unix)]
+    async fn late_cancelled_lifecycle_frame_is_drained(kind: &str) {
+        use std::fs;
+
+        let root = test_root(&format!("v6-late-cancelled-{kind}"));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let entrypoint = root.join("run");
+        ensure_test_state_base();
+
+        let mut module = descriptor();
+        module.id = format!("v6late{}{}", kind, std::process::id());
+        module.module_dir = root.clone();
+        module.entrypoint = entrypoint.clone();
+        let late_expression = match kind {
+            "result" => r#"{'protocol_version':6,'type':'result','request_id':rid,'text':'late'}"#,
+            "error" => {
+                r#"{'protocol_version':6,'type':'error','request_id':rid,'code':'late','message':'late'}"#
+            }
+            "event_result" => {
+                r#"{'protocol_version':6,'type':'event_result','request_id':rid,'actions':[]}"#
+            }
+            "health" => r#"{'protocol_version':6,'type':'health','request_id':rid}"#,
+            "log" => {
+                r#"{'protocol_version':6,'type':'log','request_id':rid,'level':'info','message':'late'}"#
+            }
+            _ => panic!("unsupported late frame kind"),
+        };
+        let script = r#"#!/usr/bin/env python3
+import json, sys
+
+line = sys.stdin.readline()
+rid = json.loads(line)["request_id"]
+print(json.dumps({"protocol_version":6,"type":"initialized","request_id":rid,"module_id":"__MODULE_ID__"}), flush=True)
+line = sys.stdin.readline()
+frame = json.loads(line)
+assert frame["type"] == "execute"
+rid = frame["request_id"]
+open("execute-received", "w").close()
+# Wait for the shutdown barrier, then emit a response to the cancelled request.
+line = sys.stdin.readline()
+assert json.loads(line)["type"] == "shutdown"
+print(json.dumps(__LATE_FRAME__), flush=True)
+sys.exit(0)
+"#
+            .replace("__MODULE_ID__", &module.id)
+            .replace("__LATE_FRAME__", late_expression);
+        write_v6_fixture(&entrypoint, &script);
+
+        let process = V6Process::start(module.clone(), Arc::new(RecordingExecutor::default()), 1)
+            .await
+            .unwrap();
+        process.initialize("1".to_owned(), module.id).await.unwrap();
+        let execute = {
+            let process = process.clone();
+            tokio::spawn(async move {
+                process
+                    .execute("2".to_owned(), "go".to_owned(), String::new(), vec![])
+                    .await
+            })
+        };
+        for _ in 0..100 {
+            if root.join("execute-received").exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(root.join("execute-received").exists());
+        process.graceful_shutdown().await.unwrap();
+        assert!(matches!(
+            execute.await.unwrap(),
+            Err(ExternalError::Unavailable)
+        ));
+        assert_eq!(process.status(), process::ProcessStatus::Terminated);
+        assert!(process.diagnostic().is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn late_cancelled_lifecycle_result_does_not_crash_shutdown() {
+        late_cancelled_lifecycle_frame_is_drained("result").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn late_cancelled_lifecycle_log_does_not_crash_shutdown() {
+        late_cancelled_lifecycle_frame_is_drained("log").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn late_cancelled_lifecycle_terminal_variants_do_not_crash_shutdown() {
+        for kind in ["error", "event_result", "health"] {
+            late_cancelled_lifecycle_frame_is_drained(kind).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn post_shutdown_telegram_invoke_does_not_cross_barrier() {
+        use std::fs;
+
+        let root = test_root("v6-post-shutdown-invoke");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let entrypoint = root.join("run");
+        ensure_test_state_base();
+        let mut module = descriptor();
+        module.id = format!("v6postinvoke{}", std::process::id());
+        module.module_dir = root.clone();
+        module.entrypoint = entrypoint.clone();
+        module.telegram_methods = vec![v6_registry::V6Method::ContactsGetContacts];
+        write_v6_fixture(
+            &entrypoint,
+            &format!(
+                r#"#!/usr/bin/env python3
+import json, os, select, sys, time
+line = sys.stdin.readline()
+rid = json.loads(line)["request_id"]
+print(json.dumps({{"protocol_version":6,"type":"initialized","request_id":rid,"module_id":"{}"}}), flush=True)
+line = sys.stdin.readline()
+assert json.loads(line)["type"] == "shutdown"
+print('{{"protocol_version":6,"type":"telegram.invoke","call_id":"after-shutdown","method":"contacts.getContacts","params":{{"hash":"0"}}}}', flush=True)
+# The shutdown frame has already crossed the writer barrier. Keep the child
+# alive for a bounded nonblocking/select window and reject any host-directed
+# frame, including a trailing telegram.result.
+fd = sys.stdin.fileno()
+os.set_blocking(fd, False)
+deadline = time.monotonic() + 0.2
+while time.monotonic() < deadline:
+    ready, _, _ = select.select([fd], [], [], min(0.02, deadline - time.monotonic()))
+    if not ready:
+        continue
+    try:
+        data = os.read(fd, 65536)
+    except BlockingIOError:
+        continue
+    if data:
+        print("host-directed frame observed", file=sys.stderr)
+        sys.exit(9)
+    break
+sys.exit(0)
+"#,
+                module.id
+            ),
+        );
+        let executor = Arc::new(RecordingExecutor::default());
+        let process = V6Process::start(module.clone(), executor.clone(), 1)
+            .await
+            .unwrap();
+        process.initialize("1".to_owned(), module.id).await.unwrap();
+        process.graceful_shutdown().await.unwrap();
+        assert_eq!(process.status(), process::ProcessStatus::Terminated);
+        assert!(process.diagnostic().is_none());
+        assert!(executor.methods.lock().unwrap().is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// Packaged `.lmod` conformance: the archive is inspected and validated
     /// through the production pipeline (zip inspection + manifest validation),
     /// then the v6 child is started and drives `raw.invoke` with opaque TL
-    /// bytes for `messages.sendMessage` — a valid method with no typed registry
+    /// bytes for `messages.getPinnedDialogs` — a valid method with no typed registry
     /// entry — through a fake transport and back into the module.
     #[cfg(unix)]
     #[tokio::test]
@@ -2965,8 +3148,8 @@ sys.exit(0)
     #[tokio::test]
     async fn queued_request_has_no_deadline_until_dispatch() {
         // The sequential gate: a queued (not yet sent) lifecycle request must
-        // not carry a deadline. Its timeout begins only when dispatch_lifecycle
-        // actually writes it to the module stdin.
+        // not carry a deadline. Its timeout begins only after the writer
+        // acknowledges the completed transport flush.
         let (writer, mut writer_rx) = mpsc::channel(8);
         let (reply, receiver) = oneshot::channel();
         let mut in_flight = None;
@@ -2989,7 +3172,7 @@ sys.exit(0)
             queued.expected,
             queued.reply,
         )
-        .expect("dispatch must write the frame");
+        .expect("dispatch must submit the frame");
         let dispatched = in_flight.expect("in flight after dispatch");
         assert_eq!(dispatched.request_id, "7");
         assert!(dispatched.deadline.is_none());
@@ -3090,6 +3273,7 @@ sys.exit(0)
         let (writer, mut writer_rx) = mpsc::channel(1);
         let (shutdown_reply, _shutdown_response) = oneshot::channel();
         let mut saved_shutdown_reply = None;
+        let mut cancelled_lifecycle_request = None;
         let mut closing = false;
 
         // Exact controlled ordering: lifecycle write has flushed, shutdown
@@ -3103,10 +3287,12 @@ sys.exit(0)
             "8".to_owned(),
             Some(shutdown_reply),
             &mut saved_shutdown_reply,
+            &mut cancelled_lifecycle_request,
         )
         .expect("shutdown submission");
         assert!(closing);
         assert!(in_flight.is_none());
+        assert_eq!(cancelled_lifecycle_request.as_deref(), Some("7"));
         assert!(matches!(
             lifecycle_response.try_recv(),
             Ok(Err(ExternalError::Unavailable))

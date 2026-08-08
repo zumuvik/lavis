@@ -1,8 +1,8 @@
 # Module runtime roadmap
 
 This roadmap defines the order in which the external-module runtime should be
-stabilized and extended. Runtime observability and recovery are release gates,
-not optional follow-up work.
+stabilized and extended. The Priority 0 release gate is scoped to API v6;
+legacy diagnostics remain Priority 7 work and are not a PR #28 prerequisite.
 
 ## Current baseline
 
@@ -40,13 +40,13 @@ Typed helpers are convenience and policy surfaces. They are not the ceiling of
 what a v6 module can do. A module that explicitly receives `telegram.raw` and
 the `raw.invoke` grant owns TL serialization/deserialization for raw calls.
 
-## Priority 0: module observability and failure recovery
+## Priority 0: module observability and failure recovery (v6 only)
 
 This work must land before expanding the curated helper surface.
 
 ### Structured failure records
 
-Every module termination must retain a bounded diagnostic record containing:
+Every v6 module termination must retain a bounded diagnostic record containing:
 
 - module ID and protocol version;
 - lifecycle stage: spawn, initialize, execute, event, health, RPC, or shutdown;
@@ -57,9 +57,14 @@ Every module termination must retain a bounded diagnostic record containing:
 - whether output was truncated;
 - timestamp and restart generation.
 
-Diagnostics must never include Telegram credentials, session data, raw access
-hashes, environment secrets, raw TL request/response bodies, or unrestricted
-request payloads.
+Legacy v2-v5 remain supported; their retained-diagnostic backport stays
+Priority 7 work and is not a PR #28 prerequisite.
+
+Lavis must not intentionally include Telegram credentials, session data, raw
+access hashes, environment secrets, raw TL request/response bodies, or
+unrestricted request payloads. Module-controlled stderr remains untrusted text
+and may itself contain sensitive content; bounding and filtering it is not an
+absolute secrecy guarantee.
 
 ### Runtime logging
 
@@ -124,6 +129,10 @@ Given a fixture that returns an invalid lifecycle response, Lavis must:
 6. keep other modules and the Telegram update loop operational.
 
 ## Priority 0B: Telegram authorization diagnostics and session recovery
+
+Priority 0B is an independent authorization/session-recovery milestone. It is
+not an unconditional API v6 runtime or protocol gate, is not required for PR
+#28, and is not currently implemented merely because it is described here.
 
 Authorization failures must preserve an actionable, sanitized cause instead of
 collapsing every `Client::is_authorized()` failure into
@@ -283,15 +292,19 @@ Raw escape hatch:
 - accepts an opaque, bounded, 4-byte-aligned serialized TL request body;
 - sends it only through Lavis' existing authorized `SenderPoolHandle`;
 - returns opaque bounded TL response bytes;
-- may target an explicitly selected known datacenter;
-- never exposes auth keys, session storage, the sender handle, or credentials;
+- may target an explicitly selected, bounded `dc_id`; this is not finite
+  known-DC validation;
+- Lavis does not transmit auth keys, session storage, the sender handle, or API
+  credentials through the Module API v6 IPC protocol;
 - never logs or persists raw TL bodies;
 - shares the same global concurrency, timeout, shutdown, and process-lifecycle
   controls as typed helpers.
 
 The install plan and fingerprint must make both `telegram.raw` and `raw.invoke`
 visible. Granting `raw.invoke` means trusting the module to act with the
-Telegram authority of the signed-in account; it is not a sandbox boundary.
+Telegram authority of the signed-in account. The capability is an API/IPC
+authority guarantee, not an OS sandbox; capabilities are not a sandbox
+boundary.
 
 ### Acceptance gate
 
@@ -418,22 +431,26 @@ Every runtime or protocol PR must satisfy all applicable gates:
 - formatting, compilation, Clippy, tests, flake check, and package build pass;
 - no unbounded queue, collection, output, stderr capture, or task growth;
 - no child process or process-group leak on any exit path;
-- no secrets or raw TL bodies in module-visible diagnostics or logs;
+- no intentional exposure of secrets or raw TL bodies in module-visible
+  diagnostics or logs (module-controlled stderr remains untrusted);
 - existing protocol fixtures remain green;
 - new wire behavior is documented before merge;
 - user-facing state matches actual filesystem and process state;
 - module failures produce actionable diagnostics rather than only
   `Unavailable`;
-- Telegram authorization failures preserve an actionable sanitized category
-  rather than only `AuthorizationCheck`.
+- changes affecting Telegram authorization or session management preserve
+  actionable sanitized authorization categories rather than collapsing
+  failures to `AuthorizationCheck`; unrelated runtime/protocol PRs are not
+  blocked by unfinished Priority 0B work.
 
 ## Explicit non-goals
 
 - Implicit raw Telegram authority without an explicit install-time capability
   and grant.
-- Exposing Telegram credentials, auth keys, session bytes, or sender handles to
-  modules.
-- Treating process isolation as a security sandbox.
+- Transmitting Telegram credentials, auth keys, session bytes, or sender handles
+  through Module API v6 IPC.
+- Treating process isolation or capabilities as an OS security sandbox; the v6
+  threat model is an API/IPC guarantee, not sandboxing.
 - Loading unreviewed native code in the Lavis process.
 - Building arbitrary source code received through Telegram.
 - Silently modifying user Nix configuration.

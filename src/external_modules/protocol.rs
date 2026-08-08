@@ -1299,6 +1299,92 @@ mod tests {
     }
 
     #[test]
+    fn v6_execute_serializes_argument_entities_under_context() {
+        let frame = V6OutboundCoreFrame::Execute {
+            request_id: "12".to_owned(),
+            command: "manage".to_owned(),
+            arguments: "добавить 🦀".to_owned(),
+            argument_entities: vec![CustomEmojiEntity {
+                offset_utf16: 9,
+                length_utf16: 2,
+                document_id: "5456140674028019486".to_owned(),
+            }],
+        };
+        let value: serde_json::Value = serde_json::from_str(&frame.serialize().unwrap()).unwrap();
+
+        assert_eq!(value["type"], "execute");
+        assert_eq!(
+            value["context"]["argument_entities"][0]["type"],
+            "custom_emoji"
+        );
+        assert_eq!(value["context"]["argument_entities"][0]["offset_utf16"], 9);
+        assert_eq!(value["context"]["argument_entities"][0]["length_utf16"], 2);
+        assert_eq!(
+            value["context"]["argument_entities"][0]["document_id"],
+            "5456140674028019486"
+        );
+    }
+
+    #[test]
+    fn v6_event_serializes_kind_payload_entities_and_optional_peer_id() {
+        let created = V6OutboundCoreFrame::Event {
+            request_id: "13".to_owned(),
+            event: MessageEventKind::Created,
+            payload: MessageEvent {
+                event_id: "evt-created".to_owned(),
+                message_ref: "ref-created".to_owned(),
+                message_key: "key-created".to_owned(),
+                peer_id: Some(-1002871795336),
+                text: "Привет 🦀".to_owned(),
+                outgoing: true,
+                entities: vec![CustomEmojiEntity {
+                    offset_utf16: 7,
+                    length_utf16: 2,
+                    document_id: "5456140674028019486".to_owned(),
+                }],
+            },
+        };
+        let created_value: serde_json::Value =
+            serde_json::from_str(&created.serialize().unwrap()).unwrap();
+        assert_eq!(created_value["event"], "message.created");
+        assert_eq!(created_value["payload"]["event_id"], "evt-created");
+        assert_eq!(created_value["payload"]["message_ref"], "ref-created");
+        assert_eq!(created_value["payload"]["message_key"], "key-created");
+        assert_eq!(created_value["payload"]["text"], "Привет 🦀");
+        assert_eq!(created_value["payload"]["outgoing"], true);
+        assert_eq!(created_value["payload"]["peer_id"], -1002871795336_i64);
+        assert_eq!(
+            created_value["payload"]["entities"][0]["type"],
+            "custom_emoji"
+        );
+        assert_eq!(created_value["payload"]["entities"][0]["offset_utf16"], 7);
+        assert_eq!(created_value["payload"]["entities"][0]["length_utf16"], 2);
+        assert_eq!(
+            created_value["payload"]["entities"][0]["document_id"],
+            "5456140674028019486"
+        );
+
+        let edited = V6OutboundCoreFrame::Event {
+            request_id: "14".to_owned(),
+            event: MessageEventKind::Edited,
+            payload: MessageEvent {
+                event_id: "evt-edited".to_owned(),
+                message_ref: "ref-edited".to_owned(),
+                message_key: "key-edited".to_owned(),
+                peer_id: None,
+                text: "edited".to_owned(),
+                outgoing: false,
+                entities: vec![],
+            },
+        };
+        let edited_value: serde_json::Value =
+            serde_json::from_str(&edited.serialize().unwrap()).unwrap();
+        assert_eq!(edited_value["event"], "message.edited");
+        assert_eq!(edited_value["payload"]["event_id"], "evt-edited");
+        assert!(edited_value["payload"].get("peer_id").is_none());
+    }
+
+    #[test]
     fn v6_core_result_has_only_call_correlation() {
         let line = V6OutboundCoreFrame::TelegramResult {
             call_id: "call".to_owned(),

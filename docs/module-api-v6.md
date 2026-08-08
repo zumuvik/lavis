@@ -16,8 +16,9 @@ The Telegram surface therefore has two layers:
    TL request itself; Lavis transports the opaque bytes through the already
    authenticated sender pool and returns the opaque TL response bytes.
 
-`raw.invoke` is not a way to retrieve the Telegram session or auth key. Those
-never cross the module boundary.
+`raw.invoke` is not a way to retrieve the Telegram session or auth key. Lavis
+does not transmit session data, auth keys, or API credentials through Module
+API v6 IPC.
 
 ## Framing
 
@@ -44,8 +45,8 @@ lifecycle response is pending.
 | Direction | Frame | Response |
 | --- | --- | --- |
 | Lavis → module | `{"type":"initialize","request_id":"1","module_id":"<id>"}` | `{"type":"initialized","request_id":"1","module_id":"<id>"}` |
-| Lavis → module | `{"type":"execute","request_id":"2","command":"name","arguments":"...","argument_entities":[]}` | `{"type":"result","request_id":"2","text":"..."}` |
-| Lavis → module | `{"type":"event","request_id":"3","text":"...","entities":[]}` | `{"type":"event_result","request_id":"3","actions":[]}` |
+| Lavis → module | `{"type":"execute","request_id":"2","command":"name","arguments":"...","context":{"argument_entities":[]}}` | `{"type":"result","request_id":"2","text":"..."}` |
+| Lavis → module | `{"type":"event","request_id":"3","event":"message.created","payload":{"event_id":"...","message_ref":"...","message_key":"...","text":"...","outgoing":false,"entities":[],"peer_id":123}}` | `{"type":"event_result","request_id":"3","actions":[]}` |
 | Lavis → module | `{"type":"health","request_id":"4"}` | `{"type":"health","request_id":"4"}` |
 | Lavis → module | `{"type":"shutdown","request_id":"5"}` | no response; the module exits |
 
@@ -57,6 +58,21 @@ action).
 The module may emit `telegram.invoke` frames at any time, including between
 lifecycle requests.
 
+`log` is lifecycle-correlated: it contains `request_id`, `level`, and
+`message`, and its request ID must identify the currently pending lifecycle
+request. It may be emitted while that lifecycle request is in flight, but is
+not a replacement for its response. `error` is likewise permitted only as the
+response to the active lifecycle request, with the matching `request_id`.
+Lifecycle responses use the matching request ID and the response type permitted
+for that request. `telegram.invoke` is permitted while lifecycle requests are
+pending and is correlated independently by `call_id`. If a log races
+cancellation of the active lifecycle request during closing, Lavis drains that
+log without crashing the module runtime.
+
+The event `event` field is the event kind (the example uses exactly
+`message.created`). Event data is nested under `payload`; `payload.peer_id` is
+optional and is included only when the event has a peer.
+
 ### Parentless Telegram calls
 
 A module starts a Telegram call with:
@@ -66,8 +82,8 @@ A module starts a Telegram call with:
   "protocol_version": 6,
   "type": "telegram.invoke",
   "call_id": "rpc-1",
-  "method": "messages.getHistory",
-  "params": {}
+  "method": "contacts.getContacts",
+  "params": {"hash": "0"}
 }
 ```
 
@@ -116,7 +132,9 @@ need to be added to Lavis merely so a module can use them.
 
 Curated helpers have strict typed parameter decoding: unknown fields are
 rejected, peer values are limited to the authenticated user's own `self`, and
-page `limit` values are clamped to `1..=100`.
+page `limit` values outside `1..=100` are rejected. Curated limits are strict
+validation limits; Lavis does not silently clamp invalid input. The same
+reject-on-limit rule applies to curated helper collection and result bounds.
 
 ## Raw Telegram invocation
 
@@ -150,7 +168,9 @@ The module then sends:
 the complete serialized TL function body, including its constructor ID. The
 body must be non-empty, 4-byte aligned, and fit the bounded v6 IPC transport.
 
-An optional datacenter can be selected explicitly:
+An optional datacenter can be selected explicitly. `dc_id` is a bounded integer
+transport selector; this contract does not promise validation against a finite
+list of known datacenters:
 
 ```json
 {
@@ -187,8 +207,8 @@ Lavis must still enforce these boundaries:
 - raw calls share RPC timeouts and shutdown cancellation;
 - request and response bodies are bounded;
 - raw bodies are never logged or persisted;
-- session bytes, auth keys, API credentials, and sender handles are never
-  exposed to the module;
+- Lavis does not transmit session bytes, auth keys, API credentials, or sender
+  handles through the Module API v6 IPC protocol;
 - RPC failures returned to the module are sanitized.
 
 Per-module fairness/concurrency limits are separate follow-up work; the current
@@ -200,7 +220,10 @@ V6 remains a bounded protocol.
 
 ### JSON guards
 
-Applied to every v6 frame and to helper parameters/results:
+Inbound module JSON and curated-helper parameters/results are validated
+strictly with these guards. Typed host-generated lifecycle frames are bounded
+by the serialized line limit as well; their fields are generated by Lavis and
+are not passed through the generic inbound untrusted-JSON tree guards.
 
 | Limit | Value |
 | --- | --- |
@@ -211,6 +234,11 @@ Applied to every v6 frame and to helper parameters/results:
 | Maximum curated result | 32 KiB (`MAX_RESULT_BYTES`) |
 | Maximum error message | 256 chars (`MAX_ERROR_MESSAGE_CHARS`) |
 | Maximum log message | 1024 chars (`MAX_LOG_MESSAGE_CHARS`) |
+
+The 256-character bound applies independently to inbound `error.code` and
+`error.message`; the 1024-character bound applies independently to inbound
+`log.level` and `log.message`. Values over these bounds are rejected, not
+truncated.
 
 ### Raw TL bodies
 
@@ -253,12 +281,12 @@ Graceful shutdown proceeds as follows:
 1. Lavis stops accepting new lifecycle requests and marks the module as
    closing.
 2. A `shutdown` frame is flushed to the module's stdin.
-3. New `telegram.invoke` frames arriving after shutdown begins are rejected
-   with a sanitized `shutdown` error.
-4. In-flight Telegram calls are cancelled at shutdown: a completion that lands
-   after shutdown began is discarded and never written behind the `shutdown`
-   frame. This is a hard barrier — a late write would race the module's exit
-   and a closed pipe into a false writer failure.
+3. Lavis establishes a hard shutdown barrier. After the barrier, no new
+   module-directed frame is written.
+4. A `telegram.invoke` received after the barrier is discarded without a
+   `telegram.result`; an RPC completion that arrives late is also discarded.
+   No late result is written behind the `shutdown` frame. This prevents a race
+   with module exit and a closed pipe.
 5. The module exits; exit status zero completes the shutdown. A non-zero exit
    during shutdown is recorded as a crash with the exit code and retained
    stderr.
@@ -277,6 +305,12 @@ protocol version; lifecycle stage (`spawn`, `initialize`, `execute`, `event`,
 category; exit status or signal; bounded UTF-8-lossy stderr; truncation flag;
 timestamp; and a restart generation.
 
+The exact module-to-host error fields are `protocol_version`, `type: "error"`,
+`request_id`, `code`, and `message`. The exact module log fields are
+`protocol_version`, `type: "log"`, `request_id`, `level`, and `message`.
+Lifecycle responses and logs correlate with `request_id`; Telegram requests
+and results correlate with `call_id`.
+
 Stable error categories include:
 
 | Category | Meaning |
@@ -294,8 +328,9 @@ Stable error categories include:
 Diagnostics are retained by the runtime even after the process leaves the
 running index (startup failure, crash cleanup), and are surfaced through
 `lm logs <id>` and `lm doctor`. Lavis does not intentionally add credentials,
-session data, or raw TL bodies to diagnostics; module-controlled stderr is
-untrusted and may contain sensitive content.
+session data, or raw TL bodies to diagnostics. Module-controlled stderr is
+untrusted text and may contain sensitive content; bounding and retaining it is
+not an absolute secrecy guarantee.
 
 ## Capability and typed-helper grant rules
 
