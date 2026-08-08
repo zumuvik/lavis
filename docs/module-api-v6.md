@@ -148,13 +148,16 @@ high-risk install-time capability.
 
 Lavis must still enforce these boundaries:
 
-- raw calls share global/per-module concurrency limits;
+- raw calls share the global v6 RPC concurrency limit and bounded module queues;
 - raw calls share RPC timeouts and shutdown cancellation;
 - request and response bodies are bounded;
 - raw bodies are never logged or persisted;
 - session bytes, auth keys, API credentials, and sender handles are never
   exposed to the module;
 - RPC failures returned to the module are sanitized.
+
+Per-module fairness/concurrency limits are separate follow-up work; the current
+v6 contract does not claim they already exist.
 
 ## Resource limits
 
