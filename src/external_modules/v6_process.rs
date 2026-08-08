@@ -525,11 +525,10 @@ async fn supervise(
     } = io;
     let mut in_flight: Option<Pending> = None;
     let mut waiting: VecDeque<QueuedRequest> = VecDeque::new();
-    // A module can answer immediately after the kernel accepts a flushed
-    // frame, before the writer task gets scheduled to report its ack. Keep
-    // those ids so the valid late acknowledgement is consumed rather than
-    // mistaken for a correlation failure.
-    let mut completed_before_flush_ack = HashSet::new();
+    // A submitted lifecycle frame remains correlated until its writer task
+    // reports one successful write+flush acknowledgement. This bookkeeping
+    // survives response completion and shutdown cancellation.
+    let mut awaiting_lifecycle_flush = HashSet::new();
     let mut active_calls = HashSet::new();
     let mut workers = JoinSet::new();
     let mut closing = false;
@@ -578,7 +577,7 @@ async fn supervise(
                     if closing { let _ = reply.send(Err(ExternalError::Unavailable)); continue; }
                     let request_stage = outbound_stage(&frame);
                     let Some(request_id) = request_id(&frame).map(str::to_owned) else { let _ = reply.send(Err(ExternalError::ProtocolEncode)); continue; };
-                    if lifecycle_request_id_present(&in_flight, &waiting, &request_id) {
+                    if lifecycle_request_id_present(&in_flight, &waiting, &awaiting_lifecycle_flush, &request_id) {
                         let _ = reply.send(Err(ExternalError::WrongRequestId)); continue;
                     }
                     // Sequential contract: at most one lifecycle request is
@@ -591,7 +590,7 @@ async fn supervise(
                         waiting.push_back(QueuedRequest { frame, expected, reply });
                         continue;
                     }
-                    if let Err(reason) = dispatch_lifecycle(&mut in_flight, &writer_tx, frame, expected, reply) {
+                    if let Err(reason) = dispatch_lifecycle(&mut in_flight, &mut awaiting_lifecycle_flush, &writer_tx, frame, expected, reply) {
                         fatal_reason = Some(reason);
                         fatal_request_id = Some(request_id);
                         fatal_stage = request_stage;
@@ -691,9 +690,6 @@ async fn supervise(
                             fatal_stage = stage;
                             break;
                         } else if expected_matches(pending_request.expected, &frame) {
-                            if pending_request.deadline.is_none() {
-                                completed_before_flush_ack.insert(terminal_id.clone());
-                            }
                             let _ = pending_request.reply.send(Ok(frame));
                         } else {
                             let _ = pending_request.reply.send(Err(ExternalError::ProtocolDecode));
@@ -708,7 +704,7 @@ async fn supervise(
                         if let Some(queued) = waiting.pop_front() {
                             let queued_id = request_id(&queued.frame).map(str::to_owned);
                             let queued_stage = outbound_stage(&queued.frame);
-                            if let Err(reason) = dispatch_lifecycle(&mut in_flight, &writer_tx, queued.frame, queued.expected, queued.reply) {
+                            if let Err(reason) = dispatch_lifecycle(&mut in_flight, &mut awaiting_lifecycle_flush, &writer_tx, queued.frame, queued.expected, queued.reply) {
                                 fatal_reason = Some(reason);
                                 fatal_request_id = queued_id;
                                 fatal_stage = queued_stage;
@@ -768,7 +764,7 @@ async fn supervise(
                 Some(ActorEvent::LifecycleFlushed(request_id)) => {
                     if let Err(reason) = handle_lifecycle_flushed(
                         &mut in_flight,
-                        &mut completed_before_flush_ack,
+                        &mut awaiting_lifecycle_flush,
                         &request_id,
                     ) {
                         fatal_reason = Some(reason);
@@ -1007,10 +1003,11 @@ fn outbound_stage(frame: &V6OutboundCoreFrame) -> &'static str {
     }
 }
 
-/// Dispatch a lifecycle request to the module: write its frame to stdin and
-/// start its deadline now. Called only when no lifecycle request is in flight.
+/// Submit a lifecycle request to the writer. The writer starts the response
+/// deadline only after it reports that stdin write+flush completed.
 fn dispatch_lifecycle(
     in_flight: &mut Option<Pending>,
+    awaiting_lifecycle_flush: &mut HashSet<String>,
     writer: &mpsc::Sender<WriterCommand>,
     frame: V6OutboundCoreFrame,
     expected: Expected,
@@ -1028,6 +1025,7 @@ fn dispatch_lifecycle(
         let _ = reply.send(Err(reason.error()));
         return Err(reason);
     }
+    awaiting_lifecycle_flush.insert(request_id.clone());
     *in_flight = Some(Pending {
         request_id,
         expected,
@@ -1042,6 +1040,7 @@ fn dispatch_lifecycle(
 fn lifecycle_request_id_present(
     in_flight: &Option<Pending>,
     waiting: &VecDeque<QueuedRequest>,
+    awaiting_lifecycle_flush: &HashSet<String>,
     query_id: &str,
 ) -> bool {
     in_flight
@@ -1050,6 +1049,7 @@ fn lifecycle_request_id_present(
         || waiting
             .iter()
             .any(|queued| request_id(&queued.frame) == Some(query_id))
+        || awaiting_lifecycle_flush.contains(query_id)
 }
 
 fn take_in_flight(in_flight: &mut Option<Pending>, request_id: &str) -> Option<Pending> {
@@ -1088,9 +1088,12 @@ fn lifecycle_deadline_started(in_flight: &Option<Pending>) -> bool {
 
 fn handle_lifecycle_flushed(
     in_flight: &mut Option<Pending>,
-    completed_before_flush_ack: &mut HashSet<String>,
+    awaiting_lifecycle_flush: &mut HashSet<String>,
     request_id: &str,
 ) -> Result<(), FatalReason> {
+    if !awaiting_lifecycle_flush.remove(request_id) {
+        return Err(FatalReason::WrongRequestId);
+    }
     if let Some(pending) = in_flight.as_mut()
         && pending.request_id == request_id
     {
@@ -1098,13 +1101,8 @@ fn handle_lifecycle_flushed(
             return Err(FatalReason::WrongRequestId);
         }
         pending.deadline = Some(Instant::now() + lifecycle_timeout());
-        return Ok(());
     }
-    if completed_before_flush_ack.remove(request_id) {
-        Ok(())
-    } else {
-        Err(FatalReason::WrongRequestId)
-    }
+    Ok(())
 }
 
 fn fail_lifecycle(in_flight: &mut Option<Pending>, waiting: &mut VecDeque<QueuedRequest>) {
@@ -2985,8 +2983,10 @@ sys.exit(0)
         }]);
         tokio::time::sleep(Duration::from_millis(100)).await;
         let queued = waiting.pop_front().expect("queued request");
+        let mut awaiting_lifecycle_flush = HashSet::new();
         dispatch_lifecycle(
             &mut in_flight,
+            &mut awaiting_lifecycle_flush,
             &writer,
             queued.frame,
             queued.expected,
@@ -2997,10 +2997,11 @@ sys.exit(0)
         assert_eq!(dispatched.request_id, "7");
         assert!(dispatched.deadline.is_none());
         let mut in_flight = Some(dispatched);
-        let mut completed_before_flush_ack = HashSet::new();
+        assert!(awaiting_lifecycle_flush.contains("7"));
         let acknowledgement_at = Instant::now();
-        handle_lifecycle_flushed(&mut in_flight, &mut completed_before_flush_ack, "7")
+        handle_lifecycle_flushed(&mut in_flight, &mut awaiting_lifecycle_flush, "7")
             .expect("matching flush acknowledgement");
+        assert!(!awaiting_lifecycle_flush.contains("7"));
         let deadline = in_flight
             .as_ref()
             .and_then(|request| request.deadline)
@@ -3037,16 +3038,53 @@ sys.exit(0)
             deadline: None,
             reply,
         });
-        let mut completed_before_flush_ack = HashSet::new();
+        let mut awaiting_lifecycle_flush = HashSet::from(["7".to_owned()]);
         assert!(matches!(
-            handle_lifecycle_flushed(&mut in_flight, &mut completed_before_flush_ack, "8"),
+            handle_lifecycle_flushed(&mut in_flight, &mut awaiting_lifecycle_flush, "8"),
             Err(FatalReason::WrongRequestId)
         ));
-        handle_lifecycle_flushed(&mut in_flight, &mut completed_before_flush_ack, "7")
+        handle_lifecycle_flushed(&mut in_flight, &mut awaiting_lifecycle_flush, "7")
             .expect("matching acknowledgement");
         assert!(matches!(
-            handle_lifecycle_flushed(&mut in_flight, &mut completed_before_flush_ack, "7"),
+            handle_lifecycle_flushed(&mut in_flight, &mut awaiting_lifecycle_flush, "7"),
             Err(FatalReason::WrongRequestId)
+        ));
+    }
+
+    #[test]
+    fn response_before_flush_ack_consumes_the_late_ack() {
+        let mut in_flight = None;
+        let mut awaiting = HashSet::from(["7".to_owned()]);
+        handle_lifecycle_flushed(&mut in_flight, &mut awaiting, "7")
+            .expect("valid response-before-ack ordering");
+        assert!(awaiting.is_empty());
+    }
+
+    #[test]
+    fn shutdown_before_flush_ack_consumes_the_valid_ack_without_crashing() {
+        let mut in_flight = None;
+        let mut awaiting = HashSet::from(["7".to_owned()]);
+        // This models fail_lifecycle() having cancelled the caller before the
+        // writer acknowledgement event was selected by the supervisor.
+        handle_lifecycle_flushed(&mut in_flight, &mut awaiting, "7")
+            .expect("shutdown cancellation must not reject a valid ack");
+        assert!(awaiting.is_empty());
+        assert!(matches!(
+            handle_lifecycle_flushed(&mut in_flight, &mut awaiting, "7"),
+            Err(FatalReason::WrongRequestId)
+        ));
+    }
+
+    #[test]
+    fn request_id_reuse_is_blocked_until_flush_ack_consumption() {
+        let in_flight = None;
+        let waiting = VecDeque::new();
+        let awaiting = HashSet::from(["7".to_owned()]);
+        assert!(lifecycle_request_id_present(
+            &in_flight, &waiting, &awaiting, "7"
+        ));
+        assert!(!lifecycle_request_id_present(
+            &in_flight, &waiting, &awaiting, "8"
         ));
     }
 
@@ -3063,8 +3101,10 @@ sys.exit(0)
             .unwrap();
         let (reply, mut receiver) = oneshot::channel();
         let mut in_flight = None;
+        let mut awaiting_lifecycle_flush = HashSet::new();
         let result = dispatch_lifecycle(
             &mut in_flight,
+            &mut awaiting_lifecycle_flush,
             &writer,
             V6OutboundCoreFrame::Health {
                 request_id: "7".to_owned(),
