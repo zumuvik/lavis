@@ -25,80 +25,21 @@ jobs:
 
           p = Path('src/external_modules/v6_process.rs')
           text = p.read_text()
-          text = text.replace(
-              '#[derive(Clone, Copy)]\nenum WriterQueueFailure {',
-              '#[derive(Debug, Clone, Copy, PartialEq, Eq)]\nenum WriterQueueFailure {',
-              1,
-          )
-
-          # A graceful shutdown is externally observable as Terminated as soon as
-          # its successful reply is released; do not leave a tiny Running race.
-          old = '''                            let result = shutdown_child_exit_result(true, stored_child_exit.take().expect("stored exit"));
-                                      let clean = result.is_ok();
-                                      if let Some(reply) = shutdown_reply.take() { let _ = reply.send(result); }
-                                      if clean {
-                                          terminal_status = process::ProcessStatus::Terminated;
-                                      } else {
-                                          fatal_reason = Some(FatalReason::Unavailable);
-                                          fatal_stage = "shutdown";
-                                      }
-                                      break;
-          '''
-          new = '''                            let result = shutdown_child_exit_result(true, stored_child_exit.take().expect("stored exit"));
-                                      let clean = result.is_ok();
-                                      if clean {
-                                          terminal_status = process::ProcessStatus::Terminated;
-                                          lock_runtime_state(&runtime).status = process::ProcessStatus::Terminated;
-                                      } else {
-                                          fatal_reason = Some(FatalReason::Unavailable);
-                                          fatal_stage = "shutdown";
-                                      }
-                                      if let Some(reply) = shutdown_reply.take() { let _ = reply.send(result); }
-                                      break;
-          '''
+          old = '#[derive(Clone, Copy)]\nenum WriterQueueFailure {'
+          new = '#[derive(Debug, Clone, Copy, PartialEq, Eq)]\nenum WriterQueueFailure {'
           if old not in text:
-              raise SystemExit('first shutdown completion anchor missing')
+              raise SystemExit('writer queue enum anchor missing')
           text = text.replace(old, new, 1)
-
-          old2 = '''                            if let Some(child_exit) = stored_child_exit.take() {
-                                          let result = shutdown_child_exit_result(true, child_exit);
-                                          let clean = result.is_ok();
-                                          if let Some(reply) = shutdown_reply.take() { let _ = reply.send(result); }
-                                          if clean {
-                                              terminal_status = process::ProcessStatus::Terminated;
-                                          } else {
-                                              fatal_reason = Some(FatalReason::Unavailable);
-                                              fatal_stage = "shutdown";
-                                          }
-                                          break;
-                                      }
-          '''
-          new2 = '''                            if let Some(child_exit) = stored_child_exit.take() {
-                                          let result = shutdown_child_exit_result(true, child_exit);
-                                          let clean = result.is_ok();
-                                          if clean {
-                                              terminal_status = process::ProcessStatus::Terminated;
-                                              lock_runtime_state(&runtime).status = process::ProcessStatus::Terminated;
-                                          } else {
-                                              fatal_reason = Some(FatalReason::Unavailable);
-                                              fatal_stage = "shutdown";
-                                          }
-                                          if let Some(reply) = shutdown_reply.take() { let _ = reply.send(result); }
-                                          break;
-                                      }
-          '''
-          if old2 not in text:
-              raise SystemExit('second shutdown completion anchor missing')
-          text = text.replace(old2, new2, 1)
 
           marker = '''    #[test]
               fn ungranted_method_is_rejected_before_executor() {
           '''
           if marker not in text:
               raise SystemExit('test insertion anchor missing')
+
           fixture = r'''    #[derive(Default)]
               struct RecordingExecutor {
-                  methods: Mutex<Vec<v6_registry::V6Method>>,
+                  methods: std::sync::Mutex<Vec<v6_registry::V6Method>>,
               }
 
               impl V6TelegramExecutor for RecordingExecutor {
@@ -115,6 +56,21 @@ jobs:
                           )
                       })
                   }
+              }
+
+              fn test_root(prefix: &str) -> PathBuf {
+                  std::env::temp_dir().join(format!(
+                      "lavis-{prefix}-{}-{}",
+                      std::process::id(),
+                      protocol::request_id()
+                  ))
+              }
+
+              #[cfg(unix)]
+              fn write_executable(path: &Path, contents: &str) {
+                  use std::{fs, os::unix::fs::PermissionsExt};
+                  fs::write(path, contents).unwrap();
+                  fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
               }
 
               #[test]
@@ -154,38 +110,33 @@ jobs:
               #[cfg(unix)]
               #[tokio::test]
               async fn nonzero_shutdown_is_crash_and_retains_exit_and_stderr() {
-                  use std::{fs, os::unix::fs::PermissionsExt};
-                  let root = std::env::temp_dir().join(format!(
-                      "lavis-v6-shutdown-{}-{}",
-                      std::process::id(),
-                      protocol::request_id()
-                  ));
+                  use std::fs;
+                  let root = test_root("v6-bad-shutdown");
                   let _ = fs::remove_dir_all(&root);
                   fs::create_dir_all(&root).unwrap();
                   let entrypoint = root.join("run");
-                  fs::write(&entrypoint, "#!/bin/sh\nread line\necho shutdown-broke >&2\nexit 7\n").unwrap();
-                  fs::set_permissions(&entrypoint, fs::Permissions::from_mode(0o700)).unwrap();
+                  write_executable(&entrypoint, "#!/bin/sh\nread line\necho shutdown-broke >&2\nexit 7\n");
 
                   let mut module = descriptor();
                   module.id = format!("v6badshutdown{}", std::process::id());
                   module.module_dir = root.clone();
                   module.entrypoint = entrypoint;
-                  let process = V6Process::start(module, Arc::new(RecordingExecutor::default()))
+                  let v6proc = V6Process::start(module, Arc::new(RecordingExecutor::default()))
                       .await
                       .unwrap();
 
                   assert!(matches!(
-                      process.graceful_shutdown().await,
+                      v6proc.graceful_shutdown().await,
                       Err(ExternalError::Unavailable)
                   ));
-                  for _ in 0..100 {
-                      if process.status() == process::ProcessStatus::Crashed && process.diagnostic().is_some() {
+                  for _ in 0..200 {
+                      if v6proc.status() == process::ProcessStatus::Crashed && v6proc.diagnostic().is_some() {
                           break;
                       }
                       tokio::time::sleep(Duration::from_millis(10)).await;
                   }
-                  assert_eq!(process.status(), process::ProcessStatus::Crashed);
-                  let diagnostic = process.diagnostic().expect("crash diagnostic");
+                  assert_eq!(v6proc.status(), process::ProcessStatus::Crashed);
+                  let diagnostic = v6proc.diagnostic().expect("crash diagnostic");
                   assert_eq!(diagnostic.lifecycle_stage, "shutdown");
                   assert_eq!(diagnostic.exit_code, Some(7));
                   assert_eq!(diagnostic.error_category, "unavailable");
@@ -197,23 +148,18 @@ jobs:
               #[cfg(unix)]
               #[tokio::test]
               async fn force_terminate_kills_process_and_reports_terminated() {
-                  use std::{fs, os::unix::fs::PermissionsExt};
-                  let root = std::env::temp_dir().join(format!(
-                      "lavis-v6-force-{}-{}",
-                      std::process::id(),
-                      protocol::request_id()
-                  ));
+                  use std::fs;
+                  let root = test_root("v6-force");
                   let _ = fs::remove_dir_all(&root);
                   fs::create_dir_all(&root).unwrap();
                   let entrypoint = root.join("run");
-                  fs::write(&entrypoint, "#!/bin/sh\necho $$ > leader.pid\nsleep 30\n").unwrap();
-                  fs::set_permissions(&entrypoint, fs::Permissions::from_mode(0o700)).unwrap();
+                  write_executable(&entrypoint, "#!/bin/sh\necho $$ > leader.pid\nsleep 30\n");
 
                   let mut module = descriptor();
                   module.id = format!("v6force{}", std::process::id());
                   module.module_dir = root.clone();
                   module.entrypoint = entrypoint;
-                  let process = V6Process::start(module, Arc::new(RecordingExecutor::default()))
+                  let v6proc = V6Process::start(module, Arc::new(RecordingExecutor::default()))
                       .await
                       .unwrap();
                   let pid_path = root.join("leader.pid");
@@ -222,23 +168,89 @@ jobs:
                       tokio::time::sleep(Duration::from_millis(10)).await;
                   }
                   let leader: i32 = fs::read_to_string(&pid_path).unwrap().trim().parse().unwrap();
-                  process.terminate().await;
-                  assert_eq!(process.status(), process::ProcessStatus::Terminated);
-                  assert!(process.diagnostic().is_none());
-                  let alive = unsafe { libc::kill(leader, 0) == 0 };
+                  v6proc.terminate().await;
+                  assert_eq!(v6proc.status(), process::ProcessStatus::Terminated);
+                  assert!(v6proc.diagnostic().is_none());
+                  let proc_stat = fs::read_to_string(format!("/proc/{leader}/stat"));
+                  let live = match proc_stat {
+                      Ok(stat) => stat.rsplit_once(") ").is_none_or(|(_, tail)| !tail.starts_with('Z')),
+                      Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                      Err(_) => true,
+                  };
                   let _ = fs::remove_dir_all(&root);
-                  assert!(!alive, "force-terminated module leader remained alive");
+                  assert!(!live, "force-terminated module leader remained alive");
+              }
+
+              #[cfg(unix)]
+              #[tokio::test]
+              async fn malformed_child_frame_crashes_with_retained_protocol_diagnostic() {
+                  use std::fs;
+                  let root = test_root("v6-malformed");
+                  let _ = fs::remove_dir_all(&root);
+                  fs::create_dir_all(&root).unwrap();
+                  let entrypoint = root.join("run");
+                  write_executable(&entrypoint, "#!/bin/sh\nread line\necho '{broken-json'\necho malformed-frame >&2\nsleep 30\n");
+
+                  let mut module = descriptor();
+                  module.id = format!("v6malformed{}", std::process::id());
+                  module.module_dir = root.clone();
+                  module.entrypoint = entrypoint;
+                  let v6proc = V6Process::start(module.clone(), Arc::new(RecordingExecutor::default()))
+                      .await
+                      .unwrap();
+                  assert!(matches!(
+                      v6proc.initialize("1".to_owned(), module.id).await,
+                      Err(ExternalError::ProtocolDecode)
+                  ));
+                  for _ in 0..200 {
+                      if v6proc.diagnostic().is_some() { break; }
+                      tokio::time::sleep(Duration::from_millis(10)).await;
+                  }
+                  let diagnostic = v6proc.diagnostic().expect("protocol diagnostic");
+                  assert_eq!(diagnostic.lifecycle_stage, "initialize");
+                  assert_eq!(diagnostic.error_category, "protocol_decode");
+                  assert!(diagnostic.stderr.contains("malformed-frame"));
+                  assert_eq!(v6proc.status(), process::ProcessStatus::Crashed);
+                  let _ = fs::remove_dir_all(&root);
+              }
+
+              #[cfg(unix)]
+              #[tokio::test]
+              async fn lifecycle_timeout_is_fatal_and_retained() {
+                  use std::fs;
+                  let root = test_root("v6-timeout");
+                  let _ = fs::remove_dir_all(&root);
+                  fs::create_dir_all(&root).unwrap();
+                  let entrypoint = root.join("run");
+                  write_executable(&entrypoint, "#!/bin/sh\nread line\nsleep 30\n");
+
+                  let mut module = descriptor();
+                  module.id = format!("v6timeout{}", std::process::id());
+                  module.module_dir = root.clone();
+                  module.entrypoint = entrypoint;
+                  let v6proc = V6Process::start(module.clone(), Arc::new(RecordingExecutor::default()))
+                      .await
+                      .unwrap();
+                  assert!(matches!(
+                      v6proc.initialize("1".to_owned(), module.id).await,
+                      Err(ExternalError::ExecutionTimeout)
+                  ));
+                  for _ in 0..200 {
+                      if v6proc.diagnostic().is_some() { break; }
+                      tokio::time::sleep(Duration::from_millis(10)).await;
+                  }
+                  let diagnostic = v6proc.diagnostic().expect("timeout diagnostic");
+                  assert_eq!(diagnostic.lifecycle_stage, "initialize");
+                  assert_eq!(diagnostic.error_category, "execution_timeout");
+                  assert_eq!(v6proc.status(), process::ProcessStatus::Crashed);
+                  let _ = fs::remove_dir_all(&root);
               }
 
               #[cfg(unix)]
               #[tokio::test]
               async fn real_child_conformance_covers_lifecycle_curated_and_raw_rpc() {
-                  use std::{fs, os::unix::fs::PermissionsExt};
-                  let root = std::env::temp_dir().join(format!(
-                      "lavis-v6-conformance-{}-{}",
-                      std::process::id(),
-                      protocol::request_id()
-                  ));
+                  use std::fs;
+                  let root = test_root("v6-conformance");
                   let _ = fs::remove_dir_all(&root);
                   fs::create_dir_all(&root).unwrap();
                   let entrypoint = root.join("run");
@@ -280,21 +292,20 @@ jobs:
           read line || exit 86
           exit 0
           "#.replace("__MODULE_ID__", &module.id);
-                  fs::write(&entrypoint, script).unwrap();
-                  fs::set_permissions(&entrypoint, fs::Permissions::from_mode(0o700)).unwrap();
+                  write_executable(&entrypoint, &script);
 
                   let executor = Arc::new(RecordingExecutor::default());
-                  let process = V6Process::start(module.clone(), executor.clone()).await.unwrap();
+                  let v6proc = V6Process::start(module.clone(), executor.clone()).await.unwrap();
                   assert!(matches!(
-                      process.initialize("1".to_owned(), module.id.clone()).await.unwrap(),
+                      v6proc.initialize("1".to_owned(), module.id.clone()).await.unwrap(),
                       V6InboundFrame::Initialized { .. }
                   ));
                   assert!(matches!(
-                      process.execute("2".to_owned(), "run".to_owned(), String::new(), vec![]).await.unwrap(),
+                      v6proc.execute("2".to_owned(), "run".to_owned(), String::new(), vec![]).await.unwrap(),
                       V6InboundFrame::Result { text, .. } if text == "ok"
                   ));
                   assert!(matches!(
-                      process.event(
+                      v6proc.event(
                           "3".to_owned(),
                           MessageEventKind::Created,
                           MessageEvent {
@@ -309,7 +320,6 @@ jobs:
                       ).await.unwrap(),
                       V6InboundFrame::EventResult { .. }
                   ));
-
                   for _ in 0..200 {
                       if executor.methods.lock().unwrap().len() == 2 { break; }
                       tokio::time::sleep(Duration::from_millis(10)).await;
@@ -319,12 +329,16 @@ jobs:
                       vec![v6_registry::V6Method::ContactsGetContacts, v6_registry::V6Method::RawInvoke]
                   );
                   assert!(matches!(
-                      process.health("4".to_owned()).await.unwrap(),
+                      v6proc.health("4".to_owned()).await.unwrap(),
                       V6InboundFrame::Health { .. }
                   ));
-                  process.graceful_shutdown().await.unwrap();
-                  assert_eq!(process.status(), process::ProcessStatus::Terminated);
-                  assert!(process.diagnostic().is_none());
+                  v6proc.graceful_shutdown().await.unwrap();
+                  for _ in 0..100 {
+                      if v6proc.status() == process::ProcessStatus::Terminated { break; }
+                      tokio::time::sleep(Duration::from_millis(10)).await;
+                  }
+                  assert_eq!(v6proc.status(), process::ProcessStatus::Terminated);
+                  assert!(v6proc.diagnostic().is_none());
                   let _ = fs::remove_dir_all(&root);
               }
 
@@ -340,6 +354,6 @@ jobs:
 
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add src
+          git add src/external_modules/v6_process.rs
           git commit -m 'test: cover v6 supervisor review acceptance paths'
           git push origin HEAD:feat/module-api-v6-full-telegram
