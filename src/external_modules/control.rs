@@ -295,11 +295,13 @@ mod tests {
     };
 
     fn temp_dir() -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("lavis-control-{nonce}"));
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("lavis-control-{nonce}-{seq}"));
         fs::create_dir_all(&path).unwrap();
         set_mode(&path, 0o700);
         path

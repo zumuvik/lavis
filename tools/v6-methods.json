@@ -1,0 +1,9 @@
+{
+  "methods": [
+    {"name": "account.updateStatus", "input": "update_status_params", "result": "update_status_result", "capability": "telegram.account.status"},
+    {"name": "contacts.getContacts", "input": "contacts_hash_params", "result": "contacts_summary", "capability": null},
+    {"name": "messages.getHistory", "input": "history_self_params", "result": "history_summary", "capability": null},
+    {"name": "messages.getDialogs", "input": "dialogs_initial_params", "result": "dialogs_summary", "capability": null},
+    {"name": "raw.invoke", "input": "raw_tl_params", "result": "raw_tl_result", "capability": "telegram.raw"}
+  ]
+}

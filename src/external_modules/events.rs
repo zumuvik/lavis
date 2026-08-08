@@ -164,6 +164,7 @@ mod tests {
             } else {
                 vec![ExternalSubscription::MessageCreated]
             },
+            telegram_methods: vec![],
             actions: vec![ExternalAction::MessageReact],
             commands: vec![ExternalCommandDescriptor {
                 name: "manage".to_owned(),

@@ -55,6 +55,9 @@ jobs:
           )
           PY
 
+      - name: Check generated v6 registry
+        run: python3 tools/generate_v6_registry.py --check
+
       - name: Check formatting
         run: nix develop -c cargo fmt --check
 

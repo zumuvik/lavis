@@ -21,7 +21,10 @@
             && builtins.baseNameOf path != "target";
         };
         cargoLock.lockFile = ./Cargo.lock;
-        nativeBuildInputs = [ pkgs.makeWrapper ];
+        nativeBuildInputs = [
+          pkgs.makeWrapper
+          pkgs.python3 # JSON-line external-process fixtures (test-only)
+        ];
         postFixup = ''
           wrapProgram $out/bin/lavis \
             --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.fastfetch ]}
