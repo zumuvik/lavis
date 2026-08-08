@@ -1,6 +1,5 @@
 use super::{protocol, v6_registry::V6Method};
 use crate::client::ModuleRpcClient;
-use grammers_session::Session;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use std::{future::Future, pin::Pin, sync::Arc};
@@ -252,7 +251,11 @@ impl GrammersV6Executor {
         let dc_id = match params.dc_id {
             Some(dc_id) if (1..=100).contains(&dc_id) => dc_id,
             Some(_) => return Err(V6ExecutorError::InvalidParams("dc_id out of range")),
-            None => self.raw_handle.session.home_dc_id(),
+            None => self
+                .raw_handle
+                .session
+                .home_dc_id()
+                .map_err(|_| V6ExecutorError::Transport)?,
         };
         let response = self
             .raw_handle

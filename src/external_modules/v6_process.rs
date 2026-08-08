@@ -354,15 +354,15 @@ async fn supervise(
         writer_tx,
         mut rpc_rx,
         actor_tx,
-        mut reader,
-        mut writer,
-        mut stderr_drain,
+        reader,
+        writer,
+        stderr_drain,
     } = io;
     let mut pending = HashMap::new();
     let mut active_calls = HashSet::new();
     let mut workers = JoinSet::new();
     let mut closing = false;
-    let mut shutdown_reply = None;
+    let mut shutdown_reply: Option<oneshot::Sender<Result<(), ExternalError>>> = None;
     let mut shutdown_deadline = None;
     let mut shutdown_flushed = false;
     let mut stored_child_exit = None;
@@ -395,14 +395,14 @@ async fn supervise(
             control = control_rx.recv(), if control_open => match control {
                 Some(Control::Request { frame, expected, reply }) => {
                     if closing { let _ = reply.send(Err(ExternalError::Unavailable)); continue; }
-                    let Some(request_id) = request_id(&frame) else { let _ = reply.send(Err(ExternalError::ProtocolEncode)); continue; };
-                    if pending.contains_key(request_id) { let _ = reply.send(Err(ExternalError::WrongRequestId)); continue; }
+                    let Some(request_id) = request_id(&frame).map(str::to_owned) else { let _ = reply.send(Err(ExternalError::ProtocolEncode)); continue; };
+                    if pending.contains_key(&request_id) { let _ = reply.send(Err(ExternalError::WrongRequestId)); continue; }
                     if pending.len() == V6_MAX_PENDING { let _ = reply.send(Err(ExternalError::Unavailable)); continue; }
                     if queue_writer(&writer_tx, WriterCommand::Frame(frame, Flush::None)).is_err() {
                         let _ = reply.send(Err(ExternalError::Unavailable));
                         break;
                     }
-                    pending.insert(request_id.to_owned(), Pending { expected, deadline: Instant::now() + V6_LIFECYCLE_TIMEOUT, reply });
+                    pending.insert(request_id, Pending { expected, deadline: Instant::now() + V6_LIFECYCLE_TIMEOUT, reply });
                 }
                 Some(Control::Shutdown { request_id, reply }) => {
                     if closing { let _ = reply.send(Err(ExternalError::Unavailable)); }
@@ -464,6 +464,7 @@ async fn supervise(
                         } else { break; }
                     }
                     V6InboundFrame::Log { .. } => {}
+                    _ => break,
                 },
                 Some(ActorEvent::Inbound(Err(_))) => break,
                 Some(ActorEvent::ReaderEof) | None => {

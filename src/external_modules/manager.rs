@@ -553,10 +553,10 @@ mod tests {
     #[test]
     fn schemas_two_through_five_select_the_legacy_process() {
         for version in 2..=5 {
-            assert_eq!(
+            assert!(matches!(
                 process_start_kind(version, false),
                 Ok(ProcessStartKind::Legacy)
-            );
+            ));
         }
     }
 
@@ -566,7 +566,10 @@ mod tests {
             process_start_kind(6, false),
             Err(crate::error::ExternalError::Unavailable)
         ));
-        assert_eq!(process_start_kind(6, true), Ok(ProcessStartKind::V6));
+        assert!(matches!(
+            process_start_kind(6, true),
+            Ok(ProcessStartKind::V6)
+        ));
     }
 
     #[tokio::test]

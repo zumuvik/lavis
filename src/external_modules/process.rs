@@ -944,6 +944,7 @@ mod capture_tests {
             capabilities: Vec::new(),
             default_command: None,
             subscriptions: Vec::new(),
+            telegram_methods: Vec::new(),
             actions: Vec::new(),
             commands: vec![],
         }
