@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="assets/logo.png" alt="Lavis logo" width="240">
+
 # Lavis
 
 **Быстрый и расширяемый Telegram userbot на Rust**

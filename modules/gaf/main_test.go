@@ -9,15 +9,14 @@ import (
 	"unicode/utf16"
 )
 
-func TestContainsWord(t *testing.T) {
-	if !containsWord("поставь лайк!", "лайк") {
-		t.Fatal("word should match")
+func TestContainsWordPrefix(t *testing.T) {
+	for _, text := range []string{"фур", "фури", "фурре", "ФУРРИ", "про фурре!"} {
+		if !containsWord(text, "фур") {
+			t.Fatalf("word prefix should match %q", text)
+		}
 	}
-	if containsWord("лайкос", "лайк") {
-		t.Fatal("substring must not match")
-	}
-	if !containsWord("ЛАЙК", "лайк") {
-		t.Fatal("matching must ignore case")
+	if containsWord("антифур", "фур") {
+		t.Fatal("trigger must start at a word boundary")
 	}
 }
 
@@ -50,6 +49,27 @@ func testModule(t *testing.T) module {
 			}},
 			Active: map[string]activeEntry{},
 		},
+	}
+}
+
+func TestReactionsForMatchesTriggerPrefix(t *testing.T) {
+	m := module{
+		state: state{
+			Enabled: true,
+			Triggers: []trigger{{
+				ID: 1, Word: "фур", Enabled: true,
+				Reactions: []reaction{{Type: "emoji", Emoji: "🐈"}},
+			}},
+		},
+	}
+	for _, text := range []string{"фури", "фурре"} {
+		reactions := m.reactionsFor(text)
+		if len(reactions) != 1 || reactions[0].Emoji != "🐈" {
+			t.Fatalf("unexpected reactions for %q: %#v", text, reactions)
+		}
+	}
+	if reactions := m.reactionsFor("антифур"); len(reactions) != 0 {
+		t.Fatalf("embedded trigger must not match: %#v", reactions)
 	}
 }
 

@@ -12,6 +12,7 @@ use std::{
     ffi::OsString,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::{
@@ -33,6 +34,10 @@ pub const TELEGRAM_RESULT_WRITE_RESERVE: Duration = Duration::from_millis(250);
 pub const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 pub const MAX_STDERR_CAPTURE: usize = 16 * 1024;
+/// How long to wait for the stderr reader to drain bytes already buffered in
+/// the kernel pipe before aborting it. Bounded so cleanup never blocks on a
+/// descendant that retains the inherited stderr FD.
+pub const STDERR_DRAIN_GRACE: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessStatus {
@@ -47,18 +52,60 @@ pub struct ModuleProcess {
     process_group_id: Option<u32>,
     stdin: tokio::process::ChildStdin,
     stdout_reader: tokio::io::BufReader<tokio::process::ChildStdout>,
-    stderr_drain: Option<tokio::task::JoinHandle<StderrCapture>>,
+    stderr_drain: Option<tokio::task::JoinHandle<()>>,
+    stderr_capture: Arc<Mutex<StderrCapture>>,
     descriptor: ExternalModuleDescriptor,
     status: ProcessStatus,
     in_flight_request: Option<String>,
     gateway: Option<std::sync::Arc<dyn TelegramGateway>>,
     active_call_ids: HashSet<String>,
     telegram_invoke_parent: Option<String>,
+    /// Test-only counter of crash events emitted for this process. Lets tests
+    /// prove that normal shutdown never takes the crash path.
+    #[cfg(test)]
+    crash_events: std::sync::atomic::AtomicU32,
+    /// Test-only record of the diagnostics emitted for the most recent crash.
+    /// Per-process, so parallel tests never share state.
+    #[cfg(test)]
+    last_crash_diagnostics: std::sync::Mutex<Option<CrashDiagnostics>>,
 }
 
+#[derive(Debug, Clone, Default)]
 struct StderrCapture {
-    _bytes: Vec<u8>,
-    _truncated: bool,
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+impl StderrCapture {
+    /// Append a chunk, stopping once the capture limit is reached. Once the
+    /// limit is hit the flag is set and further bytes are dropped, but the
+    /// caller keeps draining the pipe so the module is never blocked.
+    fn push(&mut self, chunk: &[u8]) {
+        if self.truncated {
+            return;
+        }
+        let remaining = MAX_STDERR_CAPTURE.saturating_sub(self.bytes.len());
+        if chunk.len() <= remaining {
+            self.bytes.extend_from_slice(chunk);
+        } else {
+            self.bytes.extend_from_slice(&chunk[..remaining]);
+            self.truncated = true;
+        }
+    }
+
+    /// Lossy UTF-8 view of the captured bytes. Never panics on malformed input.
+    fn lossy_text(&self) -> String {
+        String::from_utf8_lossy(&self.bytes).into_owned()
+    }
+}
+
+/// Lock the shared capture, recovering from a poisoned mutex instead of
+/// panicking. The guard is never held across an `.await`.
+fn lock_capture(shared: &Mutex<StderrCapture>) -> std::sync::MutexGuard<'_, StderrCapture> {
+    match shared.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 impl ModuleProcess {
@@ -149,7 +196,8 @@ impl ModuleProcess {
         };
         let stdout_reader = BufReader::new(stdout);
 
-        let stderr_drain = tokio::spawn(drain_stderr(stderr));
+        let stderr_capture = Arc::new(Mutex::new(StderrCapture::default()));
+        let stderr_drain = tokio::spawn(drain_stderr(stderr, stderr_capture.clone()));
 
         let mut process = Self {
             child: Some(child),
@@ -157,20 +205,23 @@ impl ModuleProcess {
             stdin,
             stdout_reader,
             stderr_drain: Some(stderr_drain),
+            stderr_capture,
             descriptor,
             status: ProcessStatus::Running,
             in_flight_request: None,
             gateway,
             active_call_ids: HashSet::new(),
             telegram_invoke_parent: None,
+            #[cfg(test)]
+            crash_events: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            last_crash_diagnostics: std::sync::Mutex::new(None),
         };
 
-        if let Err(e) = process.handshake().await {
-            process.terminate_process_group().await;
-            process.reap_child().await;
-            process.join_stderr_drain().await;
-            return Err(e);
-        }
+        // Every error path of `handshake()` already runs `fail_and_terminate`,
+        // which stops the process group, reaps the child and joins the stderr
+        // reader. Doing that again here would be redundant cleanup.
+        process.handshake().await?;
 
         Ok(process)
     }
@@ -181,39 +232,60 @@ impl ModuleProcess {
             request_id: req_id.clone(),
             module_id: self.descriptor.id.clone(),
         };
+        self.in_flight_request = Some(req_id.clone());
         if let Err(e) = self.send(&msg).await {
             return Err(self.fail_and_terminate(e).await);
         }
 
-        let response = match timeout(INIT_TIMEOUT, self.read_message()).await {
-            Ok(inner) => match inner {
-                Ok(msg) => msg,
-                Err(e) => return Err(self.fail_and_terminate(e).await),
-            },
-            Err(_) => {
-                return Err(self
-                    .fail_and_terminate(ExternalError::HandshakeTimeout)
-                    .await);
-            }
-        };
+        // A single absolute deadline for the whole handshake. Log messages do
+        // not extend it, so a module that only logs can never stall startup.
+        let deadline = Instant::now() + INIT_TIMEOUT;
+        loop {
+            let response = match timeout_at(deadline, self.read_message()).await {
+                Ok(inner) => match inner {
+                    Ok(msg) => msg,
+                    Err(e) => return Err(self.fail_and_terminate(e).await),
+                },
+                Err(_) => {
+                    return Err(self
+                        .fail_and_terminate(ExternalError::HandshakeTimeout)
+                        .await);
+                }
+            };
 
-        match response {
-            ModuleMessage::Initialized {
-                request_id,
-                module_id,
-            } => {
-                if request_id != req_id {
-                    return Err(self.fail_and_terminate(ExternalError::WrongRequestId).await);
+            match response {
+                ModuleMessage::Log {
+                    request_id: log_id,
+                    level,
+                    message,
+                } => {
+                    if log_id != req_id {
+                        return Err(self.fail_and_terminate(ExternalError::WrongRequestId).await);
+                    }
+                    log_module_message(&self.descriptor.id, &log_id, &level, &message);
+                    // Keep waiting against the original deadline.
                 }
-                if module_id != self.descriptor.id {
-                    return Err(self.fail_and_terminate(ExternalError::WrongModuleId).await);
+                ModuleMessage::Initialized {
+                    request_id,
+                    module_id,
+                } => {
+                    if request_id != req_id {
+                        return Err(self.fail_and_terminate(ExternalError::WrongRequestId).await);
+                    }
+                    if module_id != self.descriptor.id {
+                        return Err(self.fail_and_terminate(ExternalError::WrongModuleId).await);
+                    }
+                    self.clear_request_state();
+                    return Ok(());
                 }
-                Ok(())
+                ModuleMessage::Error { request_id, .. } => {
+                    if request_id != req_id {
+                        return Err(self.fail_and_terminate(ExternalError::WrongRequestId).await);
+                    }
+                    return Err(self.fail_and_terminate(ExternalError::ModuleError).await);
+                }
+                _ => return Err(self.fail_and_terminate(ExternalError::ProtocolDecode).await),
             }
-            ModuleMessage::Error { .. } => {
-                Err(self.fail_and_terminate(ExternalError::ModuleError).await)
-            }
-            _ => Err(self.fail_and_terminate(ExternalError::ProtocolDecode).await),
         }
     }
 
@@ -251,13 +323,12 @@ impl ModuleProcess {
             Err(error) => return Err(self.fail_and_terminate(error).await),
         };
 
-        self.clear_request_state();
-
         match result {
             ModuleMessage::Result { request_id, text } => {
                 if request_id != req_id {
                     return Err(self.fail_and_terminate(ExternalError::WrongRequestId).await);
                 }
+                self.clear_request_state();
                 Ok(truncate_result(&text))
             }
             ModuleMessage::Error {
@@ -268,7 +339,12 @@ impl ModuleProcess {
                 if request_id != req_id {
                     return Err(self.fail_and_terminate(ExternalError::WrongRequestId).await);
                 }
-                Err(self.fail_and_terminate(ExternalError::ModuleError).await)
+                // A protocol-valid correlated application error is not a crash
+                // and does not terminate the module: clear the request-scoped
+                // state and leave the process Running so it can serve the next
+                // request. No `external_module_crashed` is emitted.
+                self.clear_request_state();
+                Err(ExternalError::ModuleError)
             }
             _ => Err(self.fail_and_terminate(ExternalError::ProtocolDecode).await),
         }
@@ -304,12 +380,14 @@ impl ModuleProcess {
             Ok(reply) => reply,
             Err(error) => return Err(self.fail_and_terminate(error).await),
         };
-        self.clear_request_state();
         match reply {
             ModuleMessage::EventResult {
                 request_id: actual,
                 actions,
-            } if actual == request_id => Ok((request_id, actions)),
+            } if actual == request_id => {
+                self.clear_request_state();
+                Ok((request_id, actions))
+            }
             ModuleMessage::EventResult { .. } => {
                 Err(self.fail_and_terminate(ExternalError::WrongRequestId).await)
             }
@@ -332,7 +410,17 @@ impl ModuleProcess {
                 return Err(ExternalError::Unavailable);
             };
             match msg {
-                ModuleMessage::Log { .. } => continue,
+                ModuleMessage::Log {
+                    request_id,
+                    level,
+                    message,
+                } => {
+                    if request_id != expected_id {
+                        return Err(ExternalError::WrongRequestId);
+                    }
+                    log_module_message(&self.descriptor.id, &request_id, &level, &message);
+                    continue;
+                }
                 ModuleMessage::TelegramInvoke {
                     request_id,
                     call_id,
@@ -420,6 +508,7 @@ impl ModuleProcess {
         let msg = CoreMessage::Health {
             request_id: req_id.clone(),
         };
+        self.in_flight_request = Some(req_id.clone());
         if let Err(e) = self.send(&msg).await {
             return Err(self.fail_and_terminate(e).await);
         }
@@ -442,6 +531,7 @@ impl ModuleProcess {
                 if request_id != req_id {
                     return Err(self.fail_and_terminate(ExternalError::WrongRequestId).await);
                 }
+                self.clear_request_state();
                 Ok(())
             }
             _ => Err(self.fail_and_terminate(ExternalError::ProtocolDecode).await),
@@ -453,6 +543,7 @@ impl ModuleProcess {
         let msg = CoreMessage::Shutdown {
             request_id: req_id.clone(),
         };
+        self.in_flight_request = Some(req_id.clone());
         if let Err(error) = self.send(&msg).await {
             return Err(self.fail_and_terminate(error).await);
         }
@@ -482,12 +573,36 @@ impl ModuleProcess {
     }
 
     async fn fail_and_terminate(&mut self, error: ExternalError) -> ExternalError {
+        let request_id = self.in_flight_request.take();
         self.clear_request_state();
+        self.terminate_failed_process().await;
+        let capture = self.snapshot_stderr();
+        let diagnostics =
+            build_crash_diagnostics(&self.descriptor, request_id.as_deref(), &error, &capture);
+        #[cfg(test)]
+        {
+            *self.last_crash_diagnostics.lock().unwrap() = Some(diagnostics.clone());
+            self.crash_events
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        emit_crash_event(&diagnostics);
+        error
+    }
+
+    /// Stop and reap a fatally failed process without emitting diagnostics
+    /// itself. `fail_and_terminate` uses this before snapshotting stderr and
+    /// emitting the single `external_module_crashed` event.
+    async fn terminate_failed_process(&mut self) {
         self.status = ProcessStatus::Crashed;
         self.terminate_process_group().await;
         self.reap_child().await;
         self.join_stderr_drain().await;
-        error
+    }
+
+    /// Snapshot the stderr accumulated so far. Safe to call after the reader
+    /// task has been aborted: the shared buffer retains everything already read.
+    fn snapshot_stderr(&self) -> StderrCapture {
+        lock_capture(&self.stderr_capture).clone()
     }
 
     pub async fn terminate(&mut self) {
@@ -528,10 +643,7 @@ impl ModuleProcess {
 
     async fn join_stderr_drain(&mut self) {
         if let Some(handle) = self.stderr_drain.take() {
-            // Descendants can retain stderr after the managed child exits; do
-            // not let their inherited FD block module cleanup forever.
-            handle.abort();
-            let _ = handle.await;
+            finish_stderr_drain(handle).await;
         }
     }
 
@@ -595,10 +707,11 @@ impl ModuleProcess {
     }
 }
 
-async fn drain_stderr(mut stderr: tokio::process::ChildStderr) -> StderrCapture {
+async fn drain_stderr<R>(mut stderr: R, capture: Arc<Mutex<StderrCapture>>)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     use tokio::io::AsyncReadExt;
-    let mut buf = Vec::with_capacity(MAX_STDERR_CAPTURE);
-    let mut truncated = false;
     let mut tmp = [0u8; 1024];
     loop {
         let n = match stderr.read(&mut tmp).await {
@@ -606,20 +719,101 @@ async fn drain_stderr(mut stderr: tokio::process::ChildStderr) -> StderrCapture 
             Ok(n) => n,
             Err(_) => break,
         };
-        if truncated {
-            continue;
-        }
-        let remaining = MAX_STDERR_CAPTURE.saturating_sub(buf.len());
-        if n <= remaining {
-            buf.extend_from_slice(&tmp[..n]);
-        } else {
-            buf.extend_from_slice(&tmp[..remaining]);
-            truncated = true;
-        }
+        // The guard is dropped at the end of this statement, before the next
+        // read is awaited.
+        lock_capture(&capture).push(&tmp[..n]);
     }
-    StderrCapture {
-        _bytes: buf,
-        _truncated: truncated,
+}
+
+/// Give the stderr reader a bounded chance to consume bytes already buffered
+/// in the kernel pipe before aborting it. Descendants can retain stderr after
+/// the managed child exits; cleanup must never block on their inherited FD.
+async fn finish_stderr_drain(mut handle: tokio::task::JoinHandle<()>) {
+    if timeout(STDERR_DRAIN_GRACE, &mut handle).await.is_err() {
+        handle.abort();
+        let _ = handle.await;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CrashDiagnostics {
+    module_id: String,
+    protocol_version: u32,
+    request_id: String,
+    error: String,
+    stderr_truncated: bool,
+    stderr: String,
+}
+
+/// Collect the fields for the crash event without touching `tracing`, so the
+/// assembly is directly testable. Only data the module itself wrote to stderr
+/// is included; protocol frames, environment and credentials are never logged.
+fn build_crash_diagnostics(
+    descriptor: &ExternalModuleDescriptor,
+    request_id: Option<&str>,
+    error: &ExternalError,
+    capture: &StderrCapture,
+) -> CrashDiagnostics {
+    CrashDiagnostics {
+        module_id: descriptor.id.clone(),
+        protocol_version: descriptor.protocol_version,
+        request_id: request_id.unwrap_or("-").to_owned(),
+        error: error.to_string(),
+        stderr_truncated: capture.truncated,
+        stderr: capture.lossy_text().trim().to_owned(),
+    }
+}
+
+fn emit_crash_event(diagnostics: &CrashDiagnostics) {
+    tracing::error!(
+        event = "external_module_crashed",
+        module_id = %diagnostics.module_id,
+        protocol_version = diagnostics.protocol_version,
+        request_id = %diagnostics.request_id,
+        error = %diagnostics.error,
+        stderr_truncated = diagnostics.stderr_truncated,
+        stderr = %diagnostics.stderr,
+        "External module crashed"
+    );
+}
+
+fn log_module_message(module_id: &str, request_id: &str, level: &str, message: &str) {
+    match level {
+        "error" => tracing::error!(
+            event = "external_module_log",
+            module_id = %module_id,
+            request_id = %request_id,
+            message = %message,
+            "External module log"
+        ),
+        "warn" | "warning" => tracing::warn!(
+            event = "external_module_log",
+            module_id = %module_id,
+            request_id = %request_id,
+            message = %message,
+            "External module log"
+        ),
+        "debug" => tracing::debug!(
+            event = "external_module_log",
+            module_id = %module_id,
+            request_id = %request_id,
+            message = %message,
+            "External module log"
+        ),
+        "trace" => tracing::trace!(
+            event = "external_module_log",
+            module_id = %module_id,
+            request_id = %request_id,
+            message = %message,
+            "External module log"
+        ),
+        _ => tracing::info!(
+            event = "external_module_log",
+            module_id = %module_id,
+            request_id = %request_id,
+            message = %message,
+            "External module log"
+        ),
     }
 }
 
@@ -729,6 +923,155 @@ mod deadline_tests {
         assert!(!allows_telegram_invoke(5, Some("10"), None, "10", "11"));
         assert!(!allows_telegram_invoke(4, Some("10"), None, "10", "10"));
         assert!(!allows_telegram_invoke(5, None, None, "10", "10"));
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use tokio::io::AsyncWriteExt;
+
+    fn descriptor(id: &str) -> ExternalModuleDescriptor {
+        ExternalModuleDescriptor {
+            protocol_version: 2,
+            id: id.to_owned(),
+            display_name: id.to_owned(),
+            version: "0.1.0".to_owned(),
+            author: "Test".to_owned(),
+            entrypoint: PathBuf::from("/tmp/never-executed"),
+            module_dir: PathBuf::from("/tmp/never-executed"),
+            capabilities: Vec::new(),
+            default_command: None,
+            subscriptions: Vec::new(),
+            actions: Vec::new(),
+            commands: vec![],
+        }
+    }
+
+    #[test]
+    fn push_keeps_all_bytes_below_the_limit() {
+        let mut capture = StderrCapture::default();
+        capture.push(&[b'a'; 1024]);
+        capture.push(&[b'b'; 1024]);
+        assert_eq!(capture.bytes.len(), 2048);
+        assert!(!capture.truncated);
+    }
+
+    #[test]
+    fn push_truncates_at_the_limit_and_drops_further_bytes() {
+        let mut capture = StderrCapture::default();
+        capture.push(&[b'x'; MAX_STDERR_CAPTURE + 512]);
+        assert_eq!(capture.bytes.len(), MAX_STDERR_CAPTURE);
+        assert!(capture.truncated);
+        // Bytes after the limit are dropped entirely.
+        capture.push(&[b'y'; 64]);
+        assert_eq!(capture.bytes.len(), MAX_STDERR_CAPTURE);
+        assert!(capture.truncated);
+    }
+
+    #[test]
+    fn invalid_utf8_is_replaced_without_panicking() {
+        let mut capture = StderrCapture::default();
+        capture.push(&[0xff, 0xfe, b'a']);
+        let text = capture.lossy_text();
+        assert!(text.contains('\u{FFFD}'));
+        assert!(text.contains('a'));
+    }
+
+    #[test]
+    fn poisoned_capture_mutex_recovers_without_panicking() {
+        let capture = Arc::new(Mutex::new(StderrCapture::default()));
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = capture.lock().unwrap();
+            panic!("poison the mutex");
+        }));
+        assert!(result.is_err());
+        let snapshot = lock_capture(&capture).clone();
+        assert!(snapshot.bytes.is_empty());
+        assert!(!snapshot.truncated);
+    }
+
+    #[tokio::test]
+    async fn drain_stderr_captures_everything_below_the_limit() {
+        let (mut writer, reader) = tokio::io::duplex(MAX_STDERR_CAPTURE);
+        let capture = Arc::new(Mutex::new(StderrCapture::default()));
+        let task = tokio::spawn(drain_stderr(reader, capture.clone()));
+        writer
+            .write_all(b"first line\nsecond line\n")
+            .await
+            .unwrap();
+        drop(writer);
+        task.await.unwrap();
+        let snapshot = lock_capture(&capture).clone();
+        assert_eq!(snapshot.bytes, b"first line\nsecond line\n");
+        assert!(!snapshot.truncated);
+    }
+
+    #[tokio::test]
+    async fn drain_stderr_truncates_above_the_limit() {
+        let (mut writer, reader) = tokio::io::duplex(MAX_STDERR_CAPTURE + 4096);
+        let capture = Arc::new(Mutex::new(StderrCapture::default()));
+        let task = tokio::spawn(drain_stderr(reader, capture.clone()));
+        let payload = vec![b'x'; MAX_STDERR_CAPTURE + 2048];
+        writer.write_all(&payload).await.unwrap();
+        drop(writer);
+        task.await.unwrap();
+        let snapshot = lock_capture(&capture).clone();
+        assert_eq!(snapshot.bytes.len(), MAX_STDERR_CAPTURE);
+        assert!(snapshot.truncated);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stderr_drain_gets_grace_to_consume_pending_bytes() {
+        let (mut writer, reader) = tokio::io::duplex(128);
+
+        writer.write_all(b"pending marker\n").await.unwrap();
+        drop(writer);
+
+        let capture = Arc::new(Mutex::new(StderrCapture::default()));
+        let handle = tokio::spawn(drain_stderr(reader, capture.clone()));
+
+        // Do not yield before this call. On the current-thread runtime the
+        // spawned reader has not had an opportunity to run yet; the grace
+        // helper itself must allow it to consume the buffered bytes before
+        // cleanup completes.
+        finish_stderr_drain(handle).await;
+
+        let snapshot = lock_capture(&capture).clone();
+        assert!(snapshot.lossy_text().contains("pending marker"));
+    }
+
+    #[test]
+    fn crash_diagnostics_include_request_id_and_stderr() {
+        let mut capture = StderrCapture::default();
+        capture.push(b"  boom: kernel panic\n");
+        let diagnostics = build_crash_diagnostics(
+            &descriptor("diag"),
+            Some("req-42"),
+            &ExternalError::ProtocolDecode,
+            &capture,
+        );
+        assert_eq!(diagnostics.module_id, "diag");
+        assert_eq!(diagnostics.protocol_version, 2);
+        assert_eq!(diagnostics.request_id, "req-42");
+        assert_eq!(diagnostics.error, "protocol decode error");
+        assert!(!diagnostics.stderr_truncated);
+        assert_eq!(diagnostics.stderr, "boom: kernel panic");
+    }
+
+    #[test]
+    fn crash_diagnostics_default_request_and_empty_stderr() {
+        let capture = StderrCapture::default();
+        let diagnostics = build_crash_diagnostics(
+            &descriptor("diag"),
+            None,
+            &ExternalError::Unavailable,
+            &capture,
+        );
+        assert_eq!(diagnostics.request_id, "-");
+        assert_eq!(diagnostics.stderr, "");
+        assert!(!diagnostics.stderr_truncated);
     }
 }
 
@@ -1033,6 +1376,8 @@ if child:
         let mut proc = ModuleProcess::start(desc).await.unwrap();
         proc.graceful_shutdown().await.unwrap();
         assert_eq!(proc.process_group_id, None);
+        // Graceful shutdown must not take the crash path.
+        assert_eq!(proc.crash_events.load(Ordering::Relaxed), 0);
         // Repeated cleanup after the child has exited must not retain a stale
         // PGID that could be reused by an unrelated process.
         proc.terminate().await;
@@ -1093,6 +1438,7 @@ for line in sys.stdin:
         let result = proc.execute("repeat", "test").await;
         assert!(matches!(result, Err(ExternalError::ExecutionTimeout)));
         assert_eq!(proc.status(), ProcessStatus::Crashed);
+        assert_eq!(proc.crash_events.load(Ordering::Relaxed), 1);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1368,9 +1714,523 @@ for line in sys.stdin:
             assert_eq!(process.status(), ProcessStatus::Crashed);
             assert_eq!(process.in_flight_request(), None);
             assert_eq!(process.process_group_id, None);
+            assert_eq!(process.crash_events.load(Ordering::Relaxed), 1);
             process.terminate().await;
             assert_eq!(process.process_group_id, None);
             fs::remove_dir_all(directory).unwrap();
         }
+    }
+
+    const V2_LOG_MODULE_PY: &str = r#"#!/usr/bin/env python3
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    val = json.loads(line)
+    req_id = val.get("request_id", "?")
+    msg_type = val.get("type", "")
+    if msg_type == "initialize":
+        resp = {"protocol_version": 2, "type": "initialized", "request_id": req_id, "module_id": val.get("module_id", "")}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif msg_type == "execute":
+        log = {"protocol_version": 2, "type": "log", "request_id": req_id, "level": "info", "message": "working"}
+        sys.stdout.write(json.dumps(log) + "\n")
+        sys.stdout.flush()
+        resp = {"protocol_version": 2, "type": "result", "request_id": req_id, "text": "done"}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+"#;
+
+    #[tokio::test]
+    async fn module_log_with_matching_request_id_does_not_fail_the_request() {
+        let (desc, dir) = create_fixture_module(V2_LOG_MODULE_PY, "v2-log");
+        let mut proc = ModuleProcess::start(desc).await.unwrap();
+        let result = proc.execute("run", "").await.unwrap();
+        assert_eq!(result, "done");
+        proc.terminate().await;
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    const V2_WRONG_LOG_ID_PY: &str = r#"#!/usr/bin/env python3
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    val = json.loads(line)
+    req_id = val.get("request_id", "?")
+    msg_type = val.get("type", "")
+    if msg_type == "initialize":
+        resp = {"protocol_version": 2, "type": "initialized", "request_id": req_id, "module_id": val.get("module_id", "")}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif msg_type == "execute":
+        log = {"protocol_version": 2, "type": "log", "request_id": "999", "level": "warn", "message": "stale"}
+        sys.stdout.write(json.dumps(log) + "\n")
+        sys.stdout.flush()
+"#;
+
+    #[tokio::test]
+    async fn module_log_with_foreign_request_id_is_rejected() {
+        let (desc, dir) = create_fixture_module(V2_WRONG_LOG_ID_PY, "v2-log-wrong-id");
+        let mut proc = ModuleProcess::start(desc).await.unwrap();
+        let result = proc.execute("run", "").await;
+        assert!(matches!(result, Err(ExternalError::WrongRequestId)));
+        assert_eq!(proc.status(), ProcessStatus::Crashed);
+        assert_eq!(proc.crash_events.load(Ordering::Relaxed), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    const V2_HANDSHAKE_LOG_MODULE_PY: &str = r#"#!/usr/bin/env python3
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    val = json.loads(line)
+    req_id = val.get("request_id", "?")
+    msg_type = val.get("type", "")
+    if msg_type == "initialize":
+        log = {"protocol_version": 2, "type": "log", "request_id": req_id, "level": "info", "message": "starting up"}
+        sys.stdout.write(json.dumps(log) + "\n")
+        sys.stdout.flush()
+        resp = {"protocol_version": 2, "type": "initialized", "request_id": req_id, "module_id": val.get("module_id", "")}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+"#;
+
+    #[tokio::test]
+    async fn handshake_forwards_log_before_initialized() {
+        let (desc, dir) = create_fixture_module(V2_HANDSHAKE_LOG_MODULE_PY, "v2-handshake-log");
+        let mut proc = ModuleProcess::start(desc).await.unwrap();
+        assert_eq!(proc.status(), ProcessStatus::Running);
+        proc.terminate().await;
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    const V2_HANDSHAKE_WRONG_LOG_PY: &str = r#"#!/usr/bin/env python3
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    val = json.loads(line)
+    req_id = val.get("request_id", "?")
+    msg_type = val.get("type", "")
+    if msg_type == "initialize":
+        log = {"protocol_version": 2, "type": "log", "request_id": "999", "level": "warn", "message": "stale"}
+        sys.stdout.write(json.dumps(log) + "\n")
+        sys.stdout.flush()
+"#;
+
+    #[tokio::test]
+    async fn handshake_rejects_log_with_foreign_request_id() {
+        let (desc, dir) =
+            create_fixture_module(V2_HANDSHAKE_WRONG_LOG_PY, "v2-handshake-log-wrong");
+        let result = ModuleProcess::start(desc).await;
+        assert!(matches!(result, Err(ExternalError::WrongRequestId)));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// initialize OK, then execute replies with a terminal message of the wrong
+    /// type (a `health` frame) carrying the matching request ID. The correlation
+    /// state must survive until terminal validation, so the crash diagnostics
+    /// carry the real execute request id.
+    const V2_EXECUTE_WRONG_TERMINAL_PY: &str = r#"#!/usr/bin/env python3
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    val = json.loads(line)
+    req_id = val.get("request_id", "?")
+    msg_type = val.get("type", "")
+    if msg_type == "initialize":
+        resp = {"protocol_version": 2, "type": "initialized", "request_id": req_id, "module_id": val.get("module_id", "")}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif msg_type == "execute":
+        sys.stderr.write("exec-id " + req_id + "\n")
+        sys.stderr.flush()
+        resp = {"protocol_version": 2, "type": "health", "request_id": req_id}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+"#;
+
+    #[tokio::test]
+    async fn execute_wrong_terminal_type_preserves_request_id_in_crash_diagnostics() {
+        let (desc, dir) = create_fixture_module(V2_EXECUTE_WRONG_TERMINAL_PY, "v2-exec-wrong-term");
+        let mut proc = ModuleProcess::start(desc).await.unwrap();
+        let result = proc.execute("run", "").await;
+        assert!(matches!(result, Err(ExternalError::ProtocolDecode)));
+        assert_eq!(proc.crash_events.load(Ordering::Relaxed), 1);
+        let diagnostics = proc.last_crash_diagnostics.lock().unwrap().clone().unwrap();
+        let echoed = last_echoed_id(&proc.snapshot_stderr(), "exec-id ");
+        assert!(!echoed.is_empty());
+        assert_eq!(diagnostics.request_id, echoed);
+        assert_ne!(diagnostics.request_id, "-");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A protocol-valid application `error` frame with the matching request id
+    /// is not a crash: it must not emit `external_module_crashed`.
+    const V2_EXECUTE_ERROR_MODULE_PY: &str = r#"#!/usr/bin/env python3
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    val = json.loads(line)
+    req_id = val.get("request_id", "?")
+    msg_type = val.get("type", "")
+    if msg_type == "initialize":
+        resp = {"protocol_version": 2, "type": "initialized", "request_id": req_id, "module_id": val.get("module_id", "")}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif msg_type == "execute":
+        resp = {"protocol_version": 2, "type": "error", "request_id": req_id, "code": "invalid_input", "message": "Name is required"}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+"#;
+
+    #[tokio::test]
+    async fn execute_application_error_is_not_a_crash() {
+        let (desc, dir) = create_fixture_module(V2_EXECUTE_ERROR_MODULE_PY, "v2-exec-error");
+        let mut proc = ModuleProcess::start(desc).await.unwrap();
+        let result = proc.execute("run", "").await;
+        assert!(matches!(result, Err(ExternalError::ModuleError)));
+        assert_eq!(proc.status(), ProcessStatus::Running);
+        assert_eq!(proc.crash_events.load(Ordering::Relaxed), 0);
+        assert!(proc.last_crash_diagnostics.lock().unwrap().is_none());
+        assert_eq!(proc.in_flight_request(), None);
+        // The process is still Running; stop it explicitly instead of relying
+        // on `kill_on_drop` for cleanup of a live module.
+        proc.terminate().await;
+        assert_eq!(proc.status(), ProcessStatus::Terminated);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The module replies with a correlated application error on the first
+    /// execute and a normal result on every later execute. Proves the lifecycle
+    /// contract: after an application error the same process must stay Running
+    /// and serve the next request without a restart.
+    const V2_EXECUTE_ERROR_THEN_RESULT_PY: &str = r#"#!/usr/bin/env python3
+import sys, json
+executions = 0
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    val = json.loads(line)
+    req_id = val.get("request_id", "?")
+    msg_type = val.get("type", "")
+    if msg_type == "initialize":
+        resp = {"protocol_version": 2, "type": "initialized", "request_id": req_id, "module_id": val.get("module_id", "")}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif msg_type == "execute":
+        executions += 1
+        if executions == 1:
+            resp = {"protocol_version": 2, "type": "error", "request_id": req_id, "code": "invalid_input", "message": "Name is required"}
+        else:
+            resp = {"protocol_version": 2, "type": "result", "request_id": req_id, "text": "ok"}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+"#;
+
+    #[tokio::test]
+    async fn process_survives_application_error_and_serves_the_next_execute() {
+        let (desc, dir) =
+            create_fixture_module(V2_EXECUTE_ERROR_THEN_RESULT_PY, "v2-exec-error-then-result");
+        let mut proc = ModuleProcess::start(desc).await.unwrap();
+
+        let first = proc.execute("run", "").await;
+        assert!(matches!(first, Err(ExternalError::ModuleError)));
+        assert_eq!(proc.status(), ProcessStatus::Running);
+        assert_eq!(proc.crash_events.load(Ordering::Relaxed), 0);
+        assert!(proc.last_crash_diagnostics.lock().unwrap().is_none());
+        assert_eq!(proc.in_flight_request(), None);
+
+        // Same ModuleProcess, no restart: the module must still be usable.
+        let second = proc.execute("run", "").await;
+        assert!(matches!(second, Ok(ref text) if text == "ok"));
+        assert_eq!(proc.status(), ProcessStatus::Running);
+        assert_eq!(proc.crash_events.load(Ordering::Relaxed), 0);
+
+        proc.terminate().await;
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An application error frame with a foreign request id is a protocol
+    /// failure: it must emit a crash event carrying the real execute request id.
+    const V2_EXECUTE_FOREIGN_ERROR_PY: &str = r#"#!/usr/bin/env python3
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    val = json.loads(line)
+    req_id = val.get("request_id", "?")
+    msg_type = val.get("type", "")
+    if msg_type == "initialize":
+        resp = {"protocol_version": 2, "type": "initialized", "request_id": req_id, "module_id": val.get("module_id", "")}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif msg_type == "execute":
+        sys.stderr.write("exec-id " + req_id + "\n")
+        sys.stderr.flush()
+        resp = {"protocol_version": 2, "type": "error", "request_id": "999", "code": "x", "message": "stale"}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+"#;
+
+    #[tokio::test]
+    async fn execute_foreign_error_id_is_a_crash_with_real_request_id() {
+        let (desc, dir) =
+            create_fixture_module(V2_EXECUTE_FOREIGN_ERROR_PY, "v2-exec-foreign-error");
+        let mut proc = ModuleProcess::start(desc).await.unwrap();
+        let result = proc.execute("run", "").await;
+        assert!(matches!(result, Err(ExternalError::WrongRequestId)));
+        assert_eq!(proc.crash_events.load(Ordering::Relaxed), 1);
+        let diagnostics = proc.last_crash_diagnostics.lock().unwrap().clone().unwrap();
+        let echoed = last_echoed_id(&proc.snapshot_stderr(), "exec-id ");
+        assert!(!echoed.is_empty());
+        assert_eq!(diagnostics.request_id, echoed);
+        assert_ne!(diagnostics.request_id, "-");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A v3 event whose terminal reply is the wrong type (a `health` frame)
+    /// with the matching request id must preserve the event request id in the
+    /// crash diagnostics.
+    const V3_EVENT_WRONG_TERMINAL_PY: &str = r#"#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    request_id = message["request_id"]
+    if message["type"] == "initialize":
+        response = {"protocol_version": 3, "type": "initialized", "request_id": request_id, "module_id": message["module_id"]}
+        print(json.dumps(response), flush=True)
+    elif message["type"] == "event":
+        sys.stderr.write("event-id " + request_id + "\n")
+        sys.stderr.flush()
+        response = {"protocol_version": 3, "type": "health", "request_id": request_id}
+        print(json.dumps(response), flush=True)
+"#;
+
+    #[tokio::test]
+    async fn event_wrong_terminal_type_preserves_request_id_in_crash_diagnostics() {
+        let (mut descriptor, directory) =
+            create_fixture_module(V3_EVENT_WRONG_TERMINAL_PY, "v3-event-wrong-term");
+        descriptor.protocol_version = 3;
+        let mut proc = ModuleProcess::start(descriptor).await.unwrap();
+        let result = proc
+            .dispatch_event(MessageEventKind::Created, created_event())
+            .await;
+        assert!(matches!(result, Err(ExternalError::ProtocolDecode)));
+        assert_eq!(proc.crash_events.load(Ordering::Relaxed), 1);
+        let diagnostics = proc.last_crash_diagnostics.lock().unwrap().clone().unwrap();
+        let echoed = last_echoed_id(&proc.snapshot_stderr(), "event-id ");
+        assert!(!echoed.is_empty());
+        assert_eq!(diagnostics.request_id, echoed);
+        assert_ne!(diagnostics.request_id, "-");
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A handshake error frame with a foreign request id must be rejected as a
+    /// correlation failure, not attributed to the wrong request.
+    const V2_HANDSHAKE_FOREIGN_ERROR_PY: &str = r#"#!/usr/bin/env python3
+import sys, json
+initialized = False
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    val = json.loads(line)
+    req_id = val.get("request_id", "?")
+    msg_type = val.get("type", "")
+    if msg_type == "initialize":
+        if not initialized:
+            initialized = True
+            resp = {"protocol_version": 2, "type": "initialized", "request_id": req_id, "module_id": val.get("module_id", "")}
+            sys.stdout.write(json.dumps(resp) + "\n")
+            sys.stdout.flush()
+        else:
+            sys.stderr.write("handshake-id " + req_id + "\n")
+            sys.stderr.flush()
+            resp = {"protocol_version": 2, "type": "error", "request_id": "999", "code": "x", "message": "stale"}
+            sys.stdout.write(json.dumps(resp) + "\n")
+            sys.stdout.flush()
+"#;
+
+    #[tokio::test]
+    async fn handshake_foreign_error_id_is_rejected_with_real_request_id() {
+        let (desc, dir) =
+            create_fixture_module(V2_HANDSHAKE_FOREIGN_ERROR_PY, "handshake-foreign-error");
+        let mut proc = ModuleProcess::start(desc).await.unwrap();
+        let result = proc.handshake().await;
+        assert!(matches!(result, Err(ExternalError::WrongRequestId)));
+        assert_eq!(proc.crash_events.load(Ordering::Relaxed), 1);
+        let diagnostics = proc.last_crash_diagnostics.lock().unwrap().clone().unwrap();
+        let echoed = last_echoed_id(&proc.snapshot_stderr(), "handshake-id ");
+        assert!(!echoed.is_empty());
+        assert_eq!(diagnostics.request_id, echoed);
+        assert_ne!(diagnostics.request_id, "-");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    const STDERR_FAIL_MODULE_PY: &str = r#"#!/usr/bin/env python3
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    val = json.loads(line)
+    req_id = val.get("request_id", "?")
+    msg_type = val.get("type", "")
+    if msg_type == "initialize":
+        resp = {"protocol_version": 2, "type": "initialized", "request_id": req_id, "module_id": val.get("module_id", "")}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif msg_type == "execute":
+        sys.stderr.write("diag: failing module marker\n")
+        sys.stderr.flush()
+        sys.stdout.write("this is not json\n")
+        sys.stdout.flush()
+        sys.exit(2)
+"#;
+
+    /// The module writes a marker to stderr, flushes it, then immediately sends
+    /// a malformed stdout line and exits. The marker is already buffered in the
+    /// kernel pipe when the crash path runs; `join_stderr_drain` must give the
+    /// reader a bounded chance to consume it before aborting. This exercises the
+    /// cleanup contract directly, without any test-only rendezvous.
+    #[tokio::test]
+    async fn stderr_pending_at_crash_is_drained_and_reported() {
+        const MARKER: &str = "diag: failing module marker";
+        let (desc, dir) = create_fixture_module(STDERR_FAIL_MODULE_PY, "stderr-fail");
+        let mut proc = ModuleProcess::start(desc).await.unwrap();
+        let result = proc.execute("run", "").await;
+        assert!(matches!(result, Err(ExternalError::ProtocolDecode)));
+        assert_eq!(proc.status(), ProcessStatus::Crashed);
+        assert_eq!(proc.crash_events.load(Ordering::Relaxed), 1);
+        let snapshot = proc.snapshot_stderr();
+        assert!(snapshot.lossy_text().contains(MARKER));
+        assert!(!snapshot.truncated);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn normal_termination_is_not_a_crash() {
+        let (desc, dir) = create_echo_module();
+        let mut proc = ModuleProcess::start(desc).await.unwrap();
+        proc.terminate().await;
+        assert_eq!(proc.status(), ProcessStatus::Terminated);
+        assert_eq!(proc.process_group_id, None);
+        // Normal shutdown must never take the crash path.
+        assert_eq!(proc.crash_events.load(Ordering::Relaxed), 0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Fails each lifecycle flow after echoing the request ID it received to
+    /// stderr. The echo is the ground truth: the crash diagnostics must carry
+    /// the same request ID that was actually sent for the failing request.
+    const LIFECYCLE_FAILURE_MODULE_PY: &str = r#"#!/usr/bin/env python3
+import sys, json, time
+initialized = False
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    val = json.loads(line)
+    req_id = val.get("request_id", "?")
+    msg_type = val.get("type", "")
+    if msg_type == "initialize":
+        if not initialized:
+            initialized = True
+            resp = {"protocol_version": 2, "type": "initialized", "request_id": req_id, "module_id": val.get("module_id", "")}
+            sys.stdout.write(json.dumps(resp) + "\n")
+            sys.stdout.flush()
+        else:
+            sys.stderr.write("lifecycle handshake " + req_id + "\n")
+            sys.stderr.flush()
+            resp = {"protocol_version": 2, "type": "error", "request_id": req_id, "code": "0", "message": "boom"}
+            sys.stdout.write(json.dumps(resp) + "\n")
+            sys.stdout.flush()
+    elif msg_type == "health":
+        sys.stderr.write("lifecycle health " + req_id + "\n")
+        sys.stderr.flush()
+        resp = {"protocol_version": 2, "type": "error", "request_id": req_id, "code": "0", "message": "boom"}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif msg_type == "shutdown":
+        sys.stderr.write("lifecycle shutdown " + req_id + "\n")
+        sys.stderr.flush()
+        time.sleep(10)
+"#;
+
+    fn last_echoed_id(snapshot: &StderrCapture, prefix: &str) -> String {
+        snapshot
+            .lossy_text()
+            .lines()
+            .filter_map(|line| line.strip_prefix(prefix))
+            .next_back()
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    }
+
+    fn lifecycle_failure_diagnostics(
+        proc: &mut ModuleProcess,
+        prefix: &str,
+    ) -> (CrashDiagnostics, String) {
+        let diagnostics = proc
+            .last_crash_diagnostics
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("crash path must record diagnostics");
+        let echoed = last_echoed_id(&proc.snapshot_stderr(), prefix);
+        assert!(!echoed.is_empty(), "module must have echoed its request id");
+        (diagnostics, echoed)
+    }
+
+    #[tokio::test]
+    async fn handshake_failure_diagnostics_carry_the_real_request_id() {
+        let (desc, dir) = create_fixture_module(LIFECYCLE_FAILURE_MODULE_PY, "lifecycle");
+        let mut proc = ModuleProcess::start(desc).await.unwrap();
+        let result = proc.handshake().await;
+        assert!(matches!(result, Err(ExternalError::ModuleError)));
+        let (diagnostics, echoed) =
+            lifecycle_failure_diagnostics(&mut proc, "lifecycle handshake ");
+        assert_eq!(diagnostics.request_id, echoed);
+        assert_ne!(diagnostics.request_id, "-");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn health_failure_diagnostics_carry_the_real_request_id() {
+        let (desc, dir) = create_fixture_module(LIFECYCLE_FAILURE_MODULE_PY, "lifecycle");
+        let mut proc = ModuleProcess::start(desc).await.unwrap();
+        let result = proc.health_check().await;
+        assert!(matches!(result, Err(ExternalError::ProtocolDecode)));
+        let (diagnostics, echoed) = lifecycle_failure_diagnostics(&mut proc, "lifecycle health ");
+        assert_eq!(diagnostics.request_id, echoed);
+        assert_ne!(diagnostics.request_id, "-");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_failure_diagnostics_carry_the_real_request_id() {
+        let (desc, dir) = create_fixture_module(LIFECYCLE_FAILURE_MODULE_PY, "lifecycle");
+        let mut proc = ModuleProcess::start(desc).await.unwrap();
+        let result = proc.graceful_shutdown().await;
+        assert!(matches!(result, Err(ExternalError::ShutdownTimeout)));
+        let (diagnostics, echoed) = lifecycle_failure_diagnostics(&mut proc, "lifecycle shutdown ");
+        assert_eq!(diagnostics.request_id, echoed);
+        assert_ne!(diagnostics.request_id, "-");
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -395,4 +395,4 @@ Confirm the entrypoint has a valid shebang or is a native executable, is executa
 RUST_LOG=lavis=debug lavis
 ```
 
-Raw module stderr is intentionally not logged by default.
+Module stderr is drained continuously while the module runs and the first 16 KiB are kept. When a module crashes, fails the protocol, times out or fails handshake, the captured stderr is included in the structured `external_module_crashed` event at error level; invalid UTF-8 is converted lossy. A normal shutdown does not create a crash event, and a protocol-valid application `error` reply during execute is not a crash either: it does not emit `external_module_crashed`, does not terminate the module process, and the module stays ready for subsequent requests. Never write secrets to stderr.

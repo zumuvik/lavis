@@ -256,7 +256,7 @@ func (m *module) menu() string {
 	if !m.state.Enabled {
 		status = "выключен"
 	}
-	return fmt.Sprintf("⚙️ GAF — %s\nТриггеров: %d\n\nКоманды:\n• gaf listt\n• gaf setr <триггер> | <1–3 реакции>\n• gaf remt <номер|слово>\n• gaf toggle [on|off|номер|слово]\n\nPremium-эмодзи можно вставить справа от `|` прямо в setr.", status, len(m.state.Triggers))
+	return fmt.Sprintf("⚙️ GAF — %s\nТриггеров: %d\n\nКоманды:\n• gaf listt\n• gaf setr <триггер> | <1–3 реакции>\n• gaf remt <номер|слово>\n• gaf toggle [on|off|номер|слово]\n\nТриггер совпадает с началом слова: `фур` сработает на `фур`, `фури` и `фурре`.\nPremium-эмодзи можно вставить справа от `|` прямо в setr.", status, len(m.state.Triggers))
 }
 
 func (m *module) list() string {
@@ -631,10 +631,7 @@ func containsWord(text, word string) bool {
 		if !match {
 			continue
 		}
-		beforeOK := start == 0 || !isWordRune(textRunes[start-1])
-		end := start + len(wordRunes)
-		afterOK := end == len(textRunes) || !isWordRune(textRunes[end])
-		if beforeOK && afterOK {
+		if start == 0 || !isWordRune(textRunes[start-1]) {
 			return true
 		}
 	}
