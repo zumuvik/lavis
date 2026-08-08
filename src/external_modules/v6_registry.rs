@@ -15,6 +15,7 @@ pub struct MethodSpec {
     pub name: &'static str,
     pub input: InputShape,
     pub result: ResultShape,
+    pub required_capability: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,26 +43,31 @@ impl V6Method {
                 name: "account.updateStatus",
                 input: InputShape::UpdateStatusParams,
                 result: ResultShape::UpdateStatusResult,
+                required_capability: Some("telegram.account.status"),
             },
             Self::ContactsGetContacts => MethodSpec {
                 name: "contacts.getContacts",
                 input: InputShape::ContactsHashParams,
                 result: ResultShape::ContactsSummary,
+                required_capability: None,
             },
             Self::MessagesGetHistory => MethodSpec {
                 name: "messages.getHistory",
                 input: InputShape::HistorySelfParams,
                 result: ResultShape::HistorySummary,
+                required_capability: None,
             },
             Self::MessagesGetDialogs => MethodSpec {
                 name: "messages.getDialogs",
                 input: InputShape::DialogsInitialParams,
                 result: ResultShape::DialogsSummary,
+                required_capability: None,
             },
             Self::RawInvoke => MethodSpec {
                 name: "raw.invoke",
                 input: InputShape::RawTlParams,
                 result: ResultShape::RawTlResult,
+                required_capability: Some("telegram.raw"),
             },
         }
     }

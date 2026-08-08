@@ -33,8 +33,12 @@ to 64 bytes.
 
 ### Lifecycle
 
-Lavis drives the module strictly in order. Each request below must be answered
-with the matching response before Lavis sends the next one.
+Lavis drives lifecycle requests strictly in order. At most one lifecycle request
+is sent and awaiting a response at a time. Additional lifecycle requests wait
+in a bounded queue (`V6_MAX_PENDING`); their timeout starts when Lavis dispatches
+the request to the module, not while it is queued. Parentless `telegram.invoke`
+calls remain independent and may be processed while a lifecycle response is
+pending.
 
 | Direction | Frame | Response |
 | --- | --- | --- |
@@ -287,9 +291,10 @@ Stable error categories include:
 | `writer_unavailable` | module stdin closed while a frame was pending |
 
 Diagnostics are retained by the runtime even after the process leaves the
-running index (startup failure, crash cleanup), are surfaced through
-`lm logs <id>` and `lm doctor`, and never include credentials, session data,
-raw TL bodies, or unrestricted payloads.
+running index (startup failure, crash cleanup), and are surfaced through
+`lm logs <id>` and `lm doctor`. Lavis does not intentionally add credentials,
+session data, or raw TL bodies to diagnostics; module-controlled stderr is
+untrusted and may contain sensitive content.
 
 ## Capability and typed-helper grant rules
 

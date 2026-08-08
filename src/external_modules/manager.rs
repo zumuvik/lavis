@@ -501,7 +501,13 @@ impl ExternalManagerHandle {
                                         }
                                     }
                                 }
-                                Err(error) => Err(error),
+                                Err(failure) => {
+                                    let mut manager = self.inner.lock().await;
+                                    manager
+                                        .latest_diagnostics
+                                        .insert(id.clone(), failure.diagnostics);
+                                    Err(failure.error)
+                                }
                             }
                         }
                         None => Err(ExternalError::Unavailable),
@@ -694,6 +700,52 @@ mod tests {
             .await;
 
         assert!(!handle.lock().await.has_running_process("sample"));
+    }
+
+    #[tokio::test]
+    async fn startup_failure_is_retained_as_spawn_diagnostic_and_status_error() {
+        struct NoopExecutor;
+        impl super::super::v6_executor::V6TelegramExecutor for NoopExecutor {
+            fn execute<'a>(
+                &'a self,
+                _context: super::super::v6_executor::V6ExecutionContext,
+                _method: super::super::v6_registry::V6Method,
+                _params: Box<serde_json::value::RawValue>,
+            ) -> super::super::v6_executor::V6ExecutorFuture<'a> {
+                Box::pin(async { Err(super::super::v6_executor::V6ExecutorError::Transport) })
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "lavis-manager-start-failure-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        crate::external_modules::v6_process::set_test_state_base(root.join("state"));
+        let mut module = descriptor("sample", "1.0");
+        module.protocol_version = 6;
+        module.module_dir = root.clone();
+        module.entrypoint = root.join("missing");
+        let handle = super::ExternalManagerHandle::new(ExternalManager::new());
+        {
+            let mut manager = handle.lock().await;
+            manager.set_descriptors(vec![module]);
+            manager.set_v6_executor(std::sync::Arc::new(NoopExecutor));
+        }
+        handle
+            .startup_enabled(&std::collections::BTreeSet::from(["sample".to_owned()]))
+            .await;
+        let manager = handle.lock().await;
+        assert_eq!(manager.statuses()[0].status, "ошибка");
+        let diagnostic = manager
+            .latest_diagnostics
+            .get("sample")
+            .expect("retained diagnostic");
+        assert_eq!(diagnostic.lifecycle_stage, "spawn");
+        assert_eq!(diagnostic.restart_generation, 1);
+        drop(manager);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

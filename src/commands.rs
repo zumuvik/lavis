@@ -122,7 +122,7 @@ const COMMAND_SPECS: [CommandDefinition; 10] = [
     CommandDefinition {
         kind: CommandKind::Lm,
         name: "lm",
-        usage: "lm [list|info <id>|logs <id>|install|confirm <approval-id>|cancel <approval-id>|enable <id>|disable <id>]",
+        usage: "lm [list|info <id>|logs <id>|doctor [id]|install|confirm <approval-id>|cancel <approval-id>|enable <id>|disable <id>]",
         summary_ru: "Проверить и установить внешний модуль",
         description_ru: "Показывает внешние модули или запускает проверяемую установку с отдельным подтверждением.",
         examples: &[
@@ -130,6 +130,7 @@ const COMMAND_SPECS: [CommandDefinition; 10] = [
             "lm list",
             "lm info <id>",
             "lm logs <id>",
+            "lm doctor [id]",
             "lm install",
             "lm confirm <approval-id>",
             "lm cancel <approval-id>",

@@ -848,8 +848,12 @@ impl RuntimeState {
                 );
             }
         };
+        let fresh_snapshot = match &self.external_manager {
+            Some(handle) => handle.snapshot().await,
+            None => self.external_snapshot.clone(),
+        };
         let mut statuses = list.modules.iter().map(|entry| match &entry.module {
-            Some(module) => format!("• {}\n  ID: {}\n  Версия: {}\n  Состояние: {}\n  Источник: {}\n  Runtime: {}\n  Автор: {}\n  Команд: {}", module.display_name, module.id, module.version, enabled_label(module.enabled), management_label(module.management), runtime_status(self, &module.id), module.author, module.commands.len()),
+            Some(module) => format!("• {}\n  ID: {}\n  Версия: {}\n  Состояние: {}\n  Источник: {}\n  Runtime: {}\n  Автор: {}\n  Команд: {}", module.display_name, module.id, module.version, enabled_label(module.enabled), management_label(module.management), runtime_status_from_snapshot(&fresh_snapshot, &module.id), module.author, module.commands.len()),
             None => format!("• {}\n  Диагностика: {}\n  Состояние: {}\n  Источник: {}", entry.id.as_deref().unwrap_or("некорректный ID"), diagnostic_label(entry.diagnostic.as_ref()), enabled_label(entry.enabled), management_label(entry.management)),
         }).collect::<Vec<_>>();
         for id in state.enabled_ids() {
@@ -928,7 +932,12 @@ impl RuntimeState {
                 {
                     continue;
                 }
-                let runtime = runtime_status(self, &module.id);
+                let runtime = fresh_runtime_status(
+                    self.external_manager.as_ref(),
+                    &self.external_snapshot,
+                    &module.id,
+                )
+                .await;
                 let diagnostic = if let Some(handle) = &self.external_manager {
                     handle
                         .diagnostic_summary(&module.id)
@@ -1010,7 +1019,12 @@ impl RuntimeState {
                 module.protocol_version,
                 capabilities_label(&module.capabilities),
                 commands_label(&module.commands),
-                runtime_status(self, &module.id),
+                fresh_runtime_status(
+                    self.external_manager.as_ref(),
+                    &self.external_snapshot,
+                    &module.id
+                )
+                .await,
                 diagnostic.as_deref().unwrap_or("нет")
             )),
             Err(control::ModuleControlError::InvalidInstalledModule) => {
@@ -1437,14 +1451,24 @@ fn diagnostic_label(diagnostic: Option<&control::ModuleDiagnostic>) -> &'static 
     }
 }
 
-fn runtime_status<'a>(runtime: &'a RuntimeState, id: &str) -> &'a str {
-    runtime
-        .external_snapshot
+fn runtime_status_from_snapshot<'a>(snapshot: &'a ExternalRuntimeSnapshot, id: &str) -> &'a str {
+    snapshot
         .module_statuses
         .iter()
         .find(|status| status.id == id)
         .map(|status| status.status)
         .unwrap_or("не запущен")
+}
+
+async fn fresh_runtime_status(
+    handle: Option<&ExternalManagerHandle>,
+    cached: &ExternalRuntimeSnapshot,
+    id: &str,
+) -> String {
+    match handle {
+        Some(handle) => runtime_status_from_snapshot(&handle.snapshot().await, id).to_owned(),
+        None => runtime_status_from_snapshot(cached, id).to_owned(),
+    }
 }
 
 fn capabilities_label(capabilities: &[ExternalCapability]) -> String {

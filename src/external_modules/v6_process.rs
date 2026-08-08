@@ -1,5 +1,5 @@
 use super::{
-    manifest::{ExternalCapability, ExternalModuleDescriptor},
+    manifest::ExternalModuleDescriptor,
     process::{self, StderrCapture},
     protocol::{
         self, MessageEvent, MessageEventKind, V6CallError, V6InboundFrame, V6ModuleFrame,
@@ -10,7 +10,7 @@ use super::{
 };
 use crate::error::ExternalError;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashSet, VecDeque},
     ffi::OsString,
     future,
     path::{Path, PathBuf},
@@ -36,12 +36,50 @@ const V6_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 const V6_MAX_ACTIVE_RPCS: usize = V6_RPC_QUEUE;
 const V6_MAX_PENDING: usize = 8;
 
+/// Lifecycle response deadline. Queued requests do not receive this deadline
+/// until they are dispatched to the module.
+fn lifecycle_timeout() -> Duration {
+    V6_LIFECYCLE_TIMEOUT
+}
+
 /// Cloneable front end to the single-owner V6 child-process actor.
 #[derive(Clone)]
 pub(crate) struct V6Process {
     control: mpsc::Sender<Control>,
     descriptor: Arc<ExternalModuleDescriptor>,
     runtime: Arc<Mutex<V6RuntimeState>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct V6StartFailure {
+    pub(crate) error: ExternalError,
+    pub(crate) diagnostics: process::CrashDiagnostics,
+}
+
+fn start_failure(
+    descriptor: &ExternalModuleDescriptor,
+    error: ExternalError,
+    restart_generation: u64,
+) -> V6StartFailure {
+    let category = match error {
+        ExternalError::StateRead | ExternalError::StateWrite => "state",
+        ExternalError::InvalidArgument => "invalid_argument",
+        _ => "unavailable",
+    };
+    let diagnostics = process::build_crash_diagnostics_with_context(
+        descriptor,
+        None,
+        &error,
+        &StderrCapture::default(),
+        process::CrashDiagnosticContext {
+            lifecycle_stage: "spawn",
+            error_category: category,
+            exit_code: None,
+            signal: None,
+            restart_generation,
+        },
+    );
+    V6StartFailure { error, diagnostics }
 }
 
 #[derive(Debug, Clone)]
@@ -62,21 +100,26 @@ impl V6Process {
         descriptor: ExternalModuleDescriptor,
         executor: Arc<dyn V6TelegramExecutor>,
         restart_generation: u64,
-    ) -> Result<Self, ExternalError> {
+    ) -> Result<Self, V6StartFailure> {
         if descriptor.protocol_version != 6
             || !descriptor.entrypoint.starts_with(&descriptor.module_dir)
         {
-            return Err(ExternalError::InvalidArgument);
+            return Err(start_failure(
+                &descriptor,
+                ExternalError::InvalidArgument,
+                restart_generation,
+            ));
         }
 
-        let state_dir =
-            resolve_v6_module_state_dir(&descriptor.id).ok_or(ExternalError::StateRead)?;
-        tokio::fs::create_dir_all(&state_dir)
-            .await
-            .map_err(|_| ExternalError::StateWrite)?;
-        secure_directory(&state_dir)
-            .await
-            .map_err(|_| ExternalError::StateWrite)?;
+        let state_dir = resolve_v6_module_state_dir(&descriptor.id).ok_or_else(|| {
+            start_failure(&descriptor, ExternalError::StateRead, restart_generation)
+        })?;
+        tokio::fs::create_dir_all(&state_dir).await.map_err(|_| {
+            start_failure(&descriptor, ExternalError::StateWrite, restart_generation)
+        })?;
+        secure_directory(&state_dir).await.map_err(|_| {
+            start_failure(&descriptor, ExternalError::StateWrite, restart_generation)
+        })?;
         let mut command = Command::new(&descriptor.entrypoint);
         command
             .current_dir(&descriptor.module_dir)
@@ -102,22 +145,40 @@ impl V6Process {
                 });
             }
         }
-        let mut child = command.spawn().map_err(|_| ExternalError::Unavailable)?;
+        let mut child = command.spawn().map_err(|_| {
+            start_failure(&descriptor, ExternalError::Unavailable, restart_generation)
+        })?;
         let Some(process_group) = child.id() else {
             cleanup_spawned_child(&mut child, None).await;
-            return Err(ExternalError::Unavailable);
+            return Err(start_failure(
+                &descriptor,
+                ExternalError::Unavailable,
+                restart_generation,
+            ));
         };
         let Some(stdin) = child.stdin.take() else {
             cleanup_spawned_child(&mut child, Some(process_group)).await;
-            return Err(ExternalError::Unavailable);
+            return Err(start_failure(
+                &descriptor,
+                ExternalError::Unavailable,
+                restart_generation,
+            ));
         };
         let Some(stdout) = child.stdout.take() else {
             cleanup_spawned_child(&mut child, Some(process_group)).await;
-            return Err(ExternalError::Unavailable);
+            return Err(start_failure(
+                &descriptor,
+                ExternalError::Unavailable,
+                restart_generation,
+            ));
         };
         let Some(stderr) = child.stderr.take() else {
             cleanup_spawned_child(&mut child, Some(process_group)).await;
-            return Err(ExternalError::Unavailable);
+            return Err(start_failure(
+                &descriptor,
+                ExternalError::Unavailable,
+                restart_generation,
+            ));
         };
 
         let (control_tx, control_rx) = mpsc::channel(V6_CONTROL_QUEUE);
@@ -199,22 +260,7 @@ impl V6Process {
         let request_id = protocol::request_id();
         let frame = self.event(request_id.clone(), event, payload).await?;
         match frame {
-            V6InboundFrame::EventResult { actions, .. } => {
-                let line = serde_json::json!({
-                    "protocol_version": 6,
-                    "type": "event_result",
-                    "request_id": request_id,
-                    "actions": actions,
-                })
-                .to_string();
-                match protocol::parse_module_line_for(&line, 6)? {
-                    Some(protocol::ModuleMessage::EventResult {
-                        request_id,
-                        actions,
-                    }) => Ok((request_id, actions)),
-                    _ => Err(ExternalError::ProtocolDecode),
-                }
-            }
+            V6InboundFrame::EventResult { actions, .. } => Ok((request_id, actions)),
             V6InboundFrame::Error { .. } => Err(ExternalError::ModuleError),
             _ => Err(ExternalError::ProtocolDecode),
         }
@@ -400,8 +446,21 @@ impl FatalReason {
 }
 
 struct Pending {
+    request_id: String,
     expected: Expected,
+    /// Deadline set only when the request is actually dispatched to the module
+    /// (written to stdin), never when it merely enters the waiting queue.
     deadline: Instant,
+    reply: oneshot::Sender<Result<V6InboundFrame, ExternalError>>,
+}
+
+/// A lifecycle request accepted by the supervisor but not yet sent to the
+/// module, because the documented sequential contract allows at most one
+/// in-flight lifecycle request at a time. Queued requests have no deadline;
+/// their `V6_LIFECYCLE_TIMEOUT` begins at dispatch.
+struct QueuedRequest {
+    frame: V6OutboundCoreFrame,
+    expected: Expected,
     reply: oneshot::Sender<Result<V6InboundFrame, ExternalError>>,
 }
 
@@ -461,7 +520,8 @@ async fn supervise(
         stderr_drain,
         stderr_capture,
     } = io;
-    let mut pending = HashMap::new();
+    let mut in_flight: Option<Pending> = None;
+    let mut waiting: VecDeque<QueuedRequest> = VecDeque::new();
     let mut active_calls = HashSet::new();
     let mut workers = JoinSet::new();
     let mut closing = false;
@@ -501,7 +561,7 @@ async fn supervise(
                     }
                 } else {
                     fatal_reason = Some(FatalReason::Unavailable);
-                    fatal_stage = pending_stage(&pending);
+                    fatal_stage = in_flight_stage(&in_flight);
                     break;
                 }
             }
@@ -510,28 +570,36 @@ async fn supervise(
                     if closing { let _ = reply.send(Err(ExternalError::Unavailable)); continue; }
                     let request_stage = outbound_stage(&frame);
                     let Some(request_id) = request_id(&frame).map(str::to_owned) else { let _ = reply.send(Err(ExternalError::ProtocolEncode)); continue; };
-                    if pending.contains_key(&request_id) { let _ = reply.send(Err(ExternalError::WrongRequestId)); continue; }
-                    if pending.len() == V6_MAX_PENDING { let _ = reply.send(Err(ExternalError::Backpressure)); continue; }
-                    if let Err(error) = queue_writer(&writer_tx, WriterCommand::Frame(frame, Flush::None)) {
-                        let reason = FatalReason::from_writer(error);
-                        let _ = reply.send(Err(reason.error()));
+                    if lifecycle_request_id_present(&in_flight, &waiting, &request_id) {
+                        let _ = reply.send(Err(ExternalError::WrongRequestId)); continue;
+                    }
+                    // Sequential contract: at most one lifecycle request is
+                    // written to the module at a time. The rest wait in a
+                    // bounded queue; their deadlines start only at dispatch.
+                    if in_flight.is_some() {
+                        if waiting.len() == V6_MAX_PENDING {
+                            let _ = reply.send(Err(ExternalError::Backpressure)); continue;
+                        }
+                        waiting.push_back(QueuedRequest { frame, expected, reply });
+                        continue;
+                    }
+                    if let Err(reason) = dispatch_lifecycle(&mut in_flight, &writer_tx, frame, expected, reply) {
                         fatal_reason = Some(reason);
                         fatal_request_id = Some(request_id);
                         fatal_stage = request_stage;
                         break;
                     }
-                    pending.insert(request_id, Pending { expected, deadline: Instant::now() + V6_LIFECYCLE_TIMEOUT, reply });
                 }
                 Some(Control::Shutdown { request_id, reply }) => {
                     if closing { let _ = reply.send(Err(ExternalError::Unavailable)); }
-                    else if let Err(reason) = start_shutdown(&mut closing, &mut pending, &mut workers, &writer_tx, request_id, Some(reply), &mut shutdown_reply) {
+                    else if let Err(reason) = start_shutdown(&mut closing, &mut in_flight, &mut waiting, &mut workers, &writer_tx, request_id, Some(reply), &mut shutdown_reply) {
                         fatal_reason = Some(reason);
                         fatal_stage = "shutdown";
                         break;
                     }
                 }
                 Some(Control::ForceTerminate { reply }) => {
-                    fail_pending(&mut pending);
+                    fail_lifecycle(&mut in_flight, &mut waiting);
                     workers.abort_all();
                     force_reply = Some(reply);
                     terminal_status = process::ProcessStatus::Terminated;
@@ -540,7 +608,7 @@ async fn supervise(
                 None => {
                     control_open = false;
                     if !closing
-                        && let Err(reason) = start_shutdown(&mut closing, &mut pending, &mut workers, &writer_tx, "0".to_owned(), None, &mut shutdown_reply)
+                        && let Err(reason) = start_shutdown(&mut closing, &mut in_flight, &mut waiting, &mut workers, &writer_tx, "0".to_owned(), None, &mut shutdown_reply)
                     {
                         fatal_reason = Some(reason);
                         fatal_stage = "shutdown";
@@ -597,36 +665,50 @@ async fn supervise(
                         }
                     }
                     frame if terminal_request_id(&frame).is_some() => {
-                        let Some(request_id) = terminal_request_id(&frame).map(str::to_owned) else {
+                        let Some(terminal_id) = terminal_request_id(&frame).map(str::to_owned) else {
                             fatal_reason = Some(FatalReason::ProtocolDecode);
                             break;
                         };
-                        if let Some(pending_request) = pending.remove(&request_id) {
-                            let stage = expected_stage(pending_request.expected);
-                            if !initialized_module_matches(&descriptor, &frame) {
-                                let _ = pending_request.reply.send(Err(ExternalError::WrongModuleId));
-                                fatal_reason = Some(FatalReason::WrongModuleId);
-                                fatal_request_id = Some(request_id);
-                                fatal_stage = stage;
-                                break;
-                            } else if expected_matches(pending_request.expected, &frame) {
-                                let _ = pending_request.reply.send(Ok(frame));
-                            } else {
-                                let _ = pending_request.reply.send(Err(ExternalError::ProtocolDecode));
-                                fatal_reason = Some(FatalReason::ProtocolDecode);
-                                fatal_request_id = Some(request_id);
+                        let Some(pending_request) = take_in_flight(&mut in_flight, &terminal_id) else {
+                            fatal_reason = Some(FatalReason::WrongRequestId);
+                            fatal_request_id = Some(terminal_id);
+                            fatal_stage = "runtime";
+                            break;
+                        };
+                        let stage = expected_stage(pending_request.expected);
+                        if !initialized_module_matches(&descriptor, &frame) {
+                            let _ = pending_request.reply.send(Err(ExternalError::WrongModuleId));
+                            fatal_reason = Some(FatalReason::WrongModuleId);
+                            fatal_request_id = Some(terminal_id);
+                            fatal_stage = stage;
+                            break;
+                        } else if expected_matches(pending_request.expected, &frame) {
+                            let _ = pending_request.reply.send(Ok(frame));
+                        } else {
+                            let _ = pending_request.reply.send(Err(ExternalError::ProtocolDecode));
+                            fatal_reason = Some(FatalReason::ProtocolDecode);
+                            fatal_request_id = Some(terminal_id);
+                            fatal_stage = stage;
+                            break;
+                        }
+                        // The in-flight request completed; the next queued
+                        // lifecycle request (if any) may now be dispatched. Its
+                        // deadline begins here, at dispatch.
+                        if let Some(queued) = waiting.pop_front() {
+                            let queued_id = request_id(&queued.frame).map(str::to_owned);
+                            if let Err(reason) = dispatch_lifecycle(&mut in_flight, &writer_tx, queued.frame, queued.expected, queued.reply) {
+                                fatal_reason = Some(reason);
+                                fatal_request_id = queued_id;
                                 fatal_stage = stage;
                                 break;
                             }
-                        } else {
-                            fatal_reason = Some(FatalReason::WrongRequestId);
-                            fatal_request_id = Some(request_id);
-                            fatal_stage = "runtime";
-                            break;
                         }
                     }
                     V6InboundFrame::Log { request_id, level, message } => {
-                        if !pending.contains_key(&request_id) {
+                        if in_flight
+                            .as_ref()
+                            .is_none_or(|request| request.request_id != request_id)
+                        {
                             fatal_reason = Some(FatalReason::WrongRequestId);
                             fatal_request_id = Some(request_id);
                             fatal_stage = "runtime";
@@ -636,14 +718,14 @@ async fn supervise(
                     }
                     _ => {
                         fatal_reason = Some(FatalReason::ProtocolDecode);
-                        fatal_stage = pending_stage(&pending);
+                        fatal_stage = in_flight_stage(&in_flight);
                         break;
                     },
                 },
                 Some(ActorEvent::Inbound(Err(error))) => {
                     fatal_reason = Some(FatalReason::from_inbound(&error));
-                    fatal_request_id = single_pending_request_id(&pending);
-                    fatal_stage = pending_stage(&pending);
+                    fatal_request_id = in_flight_request_id(&in_flight);
+                    fatal_stage = in_flight_stage(&in_flight);
                     break;
                 },
                 Some(ActorEvent::ReaderEof) | None => {
@@ -651,8 +733,8 @@ async fn supervise(
                     if reader_eof_is_fatal(closing) {
                         if let Some(reply) = shutdown_reply.take() { let _ = reply.send(Err(ExternalError::Unavailable)); }
                         fatal_reason = Some(FatalReason::Unavailable);
-                        fatal_request_id = single_pending_request_id(&pending);
-                        fatal_stage = pending_stage(&pending);
+                        fatal_request_id = in_flight_request_id(&in_flight);
+                        fatal_stage = in_flight_stage(&in_flight);
                         break;
                     }
                 },
@@ -690,8 +772,8 @@ async fn supervise(
                 Some(ActorEvent::WriterFailed) | None => {
                     if let Some(reply) = shutdown_reply.take() { let _ = reply.send(Err(ExternalError::WriterUnavailable)); }
                     fatal_reason = Some(FatalReason::WriterUnavailable);
-                    fatal_request_id = single_pending_request_id(&pending);
-                    fatal_stage = if closing { "shutdown" } else { pending_stage(&pending) };
+                    fatal_request_id = in_flight_request_id(&in_flight);
+                    fatal_stage = if closing { "shutdown" } else { in_flight_stage(&in_flight) };
                     break;
                 },
                 _ => {}
@@ -702,9 +784,13 @@ async fn supervise(
                 fatal_stage = "shutdown";
                 break;
             },
-            _ = sleep_until_pending_deadline(&pending), if !pending.is_empty() => {
-                if let Some(request_id) = expired_request_id(&pending) {
-                    fatal_stage = pending.get(&request_id).map(|request| expected_stage(request.expected)).unwrap_or("runtime");
+            _ = sleep_until_in_flight_deadline(&in_flight), if in_flight.is_some() => {
+                if let Some(request) = in_flight.as_ref()
+                    && request.deadline <= Instant::now()
+                {
+                    let stage = expected_stage(request.expected);
+                    let request_id = request.request_id.clone();
+                    fatal_stage = stage;
                     fatal_reason = Some(FatalReason::ExecutionTimeout);
                     fatal_request_id = Some(request_id);
                     break;
@@ -715,13 +801,13 @@ async fn supervise(
     }
 
     if fatal_request_id.is_none() {
-        fatal_request_id = single_pending_request_id(&pending);
+        fatal_request_id = in_flight_request_id(&in_flight);
     }
     if let Some(reason) = fatal_reason {
         lock_runtime_state(&runtime).status = process::ProcessStatus::Crashed;
-        fail_pending_with(&mut pending, reason);
+        fail_lifecycle_with(&mut in_flight, &mut waiting, reason);
     } else {
-        fail_pending(&mut pending);
+        fail_lifecycle(&mut in_flight, &mut waiting);
     }
     workers.abort_all();
     while workers.join_next().await.is_some() {}
@@ -841,9 +927,11 @@ fn reserve_call_id(active_calls: &mut HashSet<String>, call_id: &str) -> bool {
     active_calls.insert(call_id.to_owned())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_shutdown(
     closing: &mut bool,
-    pending: &mut HashMap<String, Pending>,
+    in_flight: &mut Option<Pending>,
+    waiting: &mut VecDeque<QueuedRequest>,
     workers: &mut JoinSet<()>,
     writer: &mpsc::Sender<WriterCommand>,
     request_id: String,
@@ -854,7 +942,9 @@ fn start_shutdown(
         return Ok(());
     }
     *closing = true;
-    fail_pending(pending);
+    // Fail the in-flight request and every queued lifecycle request so no
+    // reply or write is leaked behind the shutdown frame.
+    fail_lifecycle(in_flight, waiting);
     workers.abort_all();
     if let Err(error) = queue_writer(
         writer,
@@ -893,15 +983,93 @@ fn outbound_stage(frame: &V6OutboundCoreFrame) -> &'static str {
     }
 }
 
-fn pending_stage(pending: &HashMap<String, Pending>) -> &'static str {
-    if pending.len() == 1 {
-        pending
-            .values()
-            .next()
-            .map(|request| expected_stage(request.expected))
-            .unwrap_or("runtime")
-    } else {
-        "runtime"
+/// Dispatch a lifecycle request to the module: write its frame to stdin and
+/// start its deadline now. Called only when no lifecycle request is in flight.
+fn dispatch_lifecycle(
+    in_flight: &mut Option<Pending>,
+    writer: &mpsc::Sender<WriterCommand>,
+    frame: V6OutboundCoreFrame,
+    expected: Expected,
+    reply: oneshot::Sender<Result<V6InboundFrame, ExternalError>>,
+) -> Result<(), FatalReason> {
+    let Some(request_id) = request_id(&frame).map(str::to_owned) else {
+        let _ = reply.send(Err(ExternalError::ProtocolEncode));
+        return Ok(());
+    };
+    queue_writer(writer, WriterCommand::Frame(frame, Flush::None))
+        .map_err(FatalReason::from_writer)?;
+    *in_flight = Some(Pending {
+        request_id,
+        expected,
+        deadline: Instant::now() + lifecycle_timeout(),
+        reply,
+    });
+    Ok(())
+}
+
+/// True when the request id is currently in flight or already waiting in the
+/// bounded lifecycle queue.
+fn lifecycle_request_id_present(
+    in_flight: &Option<Pending>,
+    waiting: &VecDeque<QueuedRequest>,
+    query_id: &str,
+) -> bool {
+    in_flight
+        .as_ref()
+        .is_some_and(|request| request.request_id == query_id)
+        || waiting
+            .iter()
+            .any(|queued| request_id(&queued.frame) == Some(query_id))
+}
+
+fn take_in_flight(in_flight: &mut Option<Pending>, request_id: &str) -> Option<Pending> {
+    match in_flight.take() {
+        Some(request) if request.request_id == request_id => Some(request),
+        other => {
+            *in_flight = other;
+            None
+        }
+    }
+}
+
+fn in_flight_request_id(in_flight: &Option<Pending>) -> Option<String> {
+    in_flight.as_ref().map(|request| request.request_id.clone())
+}
+
+fn in_flight_stage(in_flight: &Option<Pending>) -> &'static str {
+    in_flight
+        .as_ref()
+        .map(|request| expected_stage(request.expected))
+        .unwrap_or("runtime")
+}
+
+async fn sleep_until_in_flight_deadline(in_flight: &Option<Pending>) {
+    let deadline = in_flight
+        .as_ref()
+        .map(|request| request.deadline)
+        .unwrap_or_else(Instant::now);
+    tokio::time::sleep_until(deadline).await;
+}
+
+fn fail_lifecycle(in_flight: &mut Option<Pending>, waiting: &mut VecDeque<QueuedRequest>) {
+    if let Some(request) = in_flight.take() {
+        let _ = request.reply.send(Err(ExternalError::Unavailable));
+    }
+    for queued in waiting.drain(..) {
+        let _ = queued.reply.send(Err(ExternalError::Unavailable));
+    }
+}
+
+fn fail_lifecycle_with(
+    in_flight: &mut Option<Pending>,
+    waiting: &mut VecDeque<QueuedRequest>,
+    reason: FatalReason,
+) {
+    if let Some(request) = in_flight.take() {
+        let _ = request.reply.send(Err(reason.error()));
+    }
+    for queued in waiting.drain(..) {
+        let _ = queued.reply.send(Err(reason.error()));
     }
 }
 
@@ -1015,28 +1183,19 @@ fn validate_invoke(
             message: "method is not granted".to_owned(),
         });
     }
-    match method {
-        v6_registry::V6Method::RawInvoke
-            if !descriptor
-                .capabilities
-                .contains(&ExternalCapability::TelegramRaw) =>
-        {
-            return Err(V6CallError {
-                kind: "capability".to_owned(),
-                message: "telegram.raw capability is required".to_owned(),
-            });
-        }
-        v6_registry::V6Method::AccountUpdateStatus
-            if !descriptor
-                .capabilities
-                .contains(&ExternalCapability::TelegramAccountStatus) =>
-        {
-            return Err(V6CallError {
-                kind: "capability".to_owned(),
-                message: "telegram.account.status capability is required".to_owned(),
-            });
-        }
-        _ => {}
+    // Capability policy comes from the generated registry (`required_capability`)
+    // — the same source manifest validation uses — so install-time and
+    // runtime-time policy can never diverge for a future method.
+    if let Some(required) = method.spec().required_capability
+        && !descriptor
+            .capabilities
+            .iter()
+            .any(|cap| cap.as_str() == required)
+    {
+        return Err(V6CallError {
+            kind: "capability".to_owned(),
+            message: format!("{required} capability is required"),
+        });
     }
     Ok(method)
 }
@@ -1138,40 +1297,6 @@ fn shutdown_child_exit_result(
 
 fn reader_eof_is_fatal(closing: bool) -> bool {
     !closing
-}
-
-fn expired_request_id(pending: &HashMap<String, Pending>) -> Option<String> {
-    let now = Instant::now();
-    pending
-        .iter()
-        .find_map(|(request_id, request)| (request.deadline <= now).then(|| request_id.clone()))
-}
-
-fn single_pending_request_id(pending: &HashMap<String, Pending>) -> Option<String> {
-    (pending.len() == 1)
-        .then(|| pending.keys().next().cloned())
-        .flatten()
-}
-
-async fn sleep_until_pending_deadline(pending: &HashMap<String, Pending>) {
-    let deadline = pending
-        .values()
-        .map(|request| request.deadline)
-        .min()
-        .unwrap_or_else(Instant::now);
-    tokio::time::sleep_until(deadline).await;
-}
-
-fn fail_pending(pending: &mut HashMap<String, Pending>) {
-    for (_, request) in pending.drain() {
-        let _ = request.reply.send(Err(ExternalError::Unavailable));
-    }
-}
-
-fn fail_pending_with(pending: &mut HashMap<String, Pending>, reason: FatalReason) {
-    for (_, request) in pending.drain() {
-        let _ = request.reply.send(Err(reason.error()));
-    }
 }
 
 fn kill_group(process_group: u32) {
@@ -2100,6 +2225,89 @@ sys.exit(0)
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn invalid_event_result_is_fatal_at_the_v6_boundary() {
+        use std::fs;
+        let root = test_root("v6-bad-event");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let entrypoint = root.join("run");
+        ensure_test_state_base();
+        write_v6_fixture(
+            &entrypoint,
+            "#!/usr/bin/env python3\nimport sys, time, json\nline = sys.stdin.readline()\nrid = json.loads(line)[\"request_id\"]\nprint(json.dumps({\"protocol_version\": 6, \"type\": \"initialized\", \"request_id\": rid, \"module_id\": \"__MODULE_ID__\"}), flush=True)\nline = sys.stdin.readline()\nrid = json.loads(line)[\"request_id\"]\n# Malformed action object: the schema must be rejected at the v6 inbound\n# boundary, before any lifecycle request can be reported as completed.\nprint(json.dumps({\"protocol_version\": 6, \"type\": \"event_result\", \"request_id\": rid, \"actions\": [{\"type\": \"text.send\", \"message_ref\": \"r1\"}]}), flush=True)\ntime.sleep(30)\n",
+        );
+
+        let mut module = descriptor();
+        module.id = format!("v6badevent{}", std::process::id());
+        module.module_dir = root.clone();
+        module.entrypoint = entrypoint;
+        let script = "#!/usr/bin/env python3\nimport sys, time, json\nline = sys.stdin.readline()\nrid = json.loads(line)[\"request_id\"]\nprint(json.dumps({\"protocol_version\": 6, \"type\": \"initialized\", \"request_id\": rid, \"module_id\": \"__MODULE_ID__\"}), flush=True)\nline = sys.stdin.readline()\nrid = json.loads(line)[\"request_id\"]\n# Malformed action object: the schema must be rejected at the v6 inbound\n# boundary, before any lifecycle request can be reported as completed.\nprint(json.dumps({\"protocol_version\": 6, \"type\": \"event_result\", \"request_id\": rid, \"actions\": [{\"type\": \"text.send\", \"message_ref\": \"r1\"}]}), flush=True)\ntime.sleep(30)\n"
+            .replace("__MODULE_ID__", &module.id);
+        write_v6_fixture(&module.entrypoint, &script);
+        let v6proc = V6Process::start(module.clone(), Arc::new(RecordingExecutor::default()), 1)
+            .await
+            .unwrap();
+        v6proc
+            .initialize("1".to_owned(), module.id.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            v6proc
+                .event(
+                    "2".to_owned(),
+                    MessageEventKind::Created,
+                    MessageEvent {
+                        event_id: "e".to_owned(),
+                        message_ref: "r".to_owned(),
+                        message_key: "k".to_owned(),
+                        peer_id: None,
+                        text: "hello".to_owned(),
+                        outgoing: false,
+                        entities: vec![],
+                    },
+                )
+                .await,
+            Err(ExternalError::ProtocolDecode)
+        ));
+        for _ in 0..200 {
+            if v6proc.diagnostic().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let diagnostic = v6proc.diagnostic().expect("protocol diagnostic");
+        assert_eq!(diagnostic.lifecycle_stage, "event");
+        assert_eq!(diagnostic.error_category, "protocol_decode");
+        assert_eq!(v6proc.status(), process::ProcessStatus::Crashed);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn start_failure_carries_spawn_diagnostic() {
+        let root = test_root("v6-start-failure");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        ensure_test_state_base();
+        let mut module = descriptor();
+        module.id = format!("v6startfailure{}", std::process::id());
+        module.module_dir = root.clone();
+        module.entrypoint = root.join("missing-entrypoint");
+        let failure =
+            match V6Process::start(module, Arc::new(RecordingExecutor::default()), 7).await {
+                Ok(_) => panic!("missing entrypoint must fail before publishing a process"),
+                Err(failure) => failure,
+            };
+        assert_eq!(failure.diagnostics.lifecycle_stage, "spawn");
+        assert_eq!(failure.diagnostics.restart_generation, 7);
+        assert_eq!(failure.diagnostics.exit_code, None);
+        assert_eq!(failure.diagnostics.signal, None);
+        assert!(failure.diagnostics.stderr.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn malformed_child_frame_crashes_with_retained_protocol_diagnostic() {
         use std::fs;
         let root = test_root("v6-malformed");
@@ -2192,7 +2400,9 @@ sys.exit(0)
             v6_registry::V6Method::ContactsGetContacts,
             v6_registry::V6Method::RawInvoke,
         ];
-        module.capabilities.push(ExternalCapability::TelegramRaw);
+        module
+            .capabilities
+            .push(manifest::ExternalCapability::TelegramRaw);
 
         ensure_test_state_base();
         let script = r#"#!/usr/bin/env python3
@@ -2309,6 +2519,25 @@ sys.exit(0)
     }
 
     #[test]
+    fn registry_capability_policy_gates_runtime_invoke() {
+        // The runtime gate reads the same generated-registry policy the
+        // installer uses: granted-but-missing-capability is rejected, and the
+        // presence of the required capability is accepted.
+        let mut descriptor = descriptor();
+        descriptor.telegram_methods = vec![v6_registry::V6Method::AccountUpdateStatus];
+        assert!(
+            matches!(validate_invoke(&descriptor, "account.updateStatus", true), Err(V6CallError { kind, .. }) if kind == "capability")
+        );
+        descriptor
+            .capabilities
+            .push(manifest::ExternalCapability::TelegramAccountStatus);
+        assert_eq!(
+            validate_invoke(&descriptor, "account.updateStatus", true).unwrap(),
+            v6_registry::V6Method::AccountUpdateStatus
+        );
+    }
+
+    #[test]
     fn curated_methods_do_not_require_raw_but_raw_does() {
         let mut descriptor = descriptor();
         descriptor.telegram_methods = vec![v6_registry::V6Method::ContactsGetContacts];
@@ -2324,7 +2553,7 @@ sys.exit(0)
         ));
         descriptor
             .capabilities
-            .push(ExternalCapability::TelegramRaw);
+            .push(manifest::ExternalCapability::TelegramRaw);
         assert_eq!(
             validate_invoke(&descriptor, "raw.invoke", true).unwrap(),
             v6_registry::V6Method::RawInvoke
@@ -2400,41 +2629,87 @@ sys.exit(0)
     }
 
     #[test]
-    fn pending_expiry_drains_expired_requests() {
-        let mut pending = HashMap::new();
+    fn lifecycle_queue_failure_drains_in_flight_and_waiting_requests() {
         let (reply, mut receiver) = oneshot::channel();
-        pending.insert(
-            "1".to_owned(),
-            Pending {
-                expected: Expected::Health,
-                deadline: Instant::now() - Duration::from_secs(1),
-                reply,
+        let mut in_flight = Some(Pending {
+            request_id: "1".to_owned(),
+            expected: Expected::Health,
+            deadline: Instant::now() - Duration::from_secs(1),
+            reply,
+        });
+        let (queued_reply, mut queued_receiver) = oneshot::channel();
+        let mut waiting = VecDeque::from([QueuedRequest {
+            frame: V6OutboundCoreFrame::Health {
+                request_id: "2".to_owned(),
             },
-        );
-        assert_eq!(expired_request_id(&pending), Some("1".to_owned()));
-        fail_pending_with(&mut pending, FatalReason::ExecutionTimeout);
-        assert!(pending.is_empty());
+            expected: Expected::Health,
+            reply: queued_reply,
+        }]);
+        fail_lifecycle_with(&mut in_flight, &mut waiting, FatalReason::ExecutionTimeout);
+        assert!(in_flight.is_none());
+        assert!(waiting.is_empty());
         assert!(matches!(
             receiver.try_recv(),
             Ok(Err(ExternalError::ExecutionTimeout))
         ));
+        assert!(matches!(
+            queued_receiver.try_recv(),
+            Ok(Err(ExternalError::ExecutionTimeout))
+        ));
+    }
+
+    #[test]
+    fn queued_request_has_no_deadline_until_dispatch() {
+        // The sequential gate: a queued (not yet sent) lifecycle request must
+        // not carry a deadline. Its timeout begins only when dispatch_lifecycle
+        // actually writes it to the module stdin.
+        let (writer, mut writer_rx) = mpsc::channel(8);
+        let (reply, receiver) = oneshot::channel();
+        let mut in_flight = None;
+        let before = Instant::now();
+        dispatch_lifecycle(
+            &mut in_flight,
+            &writer,
+            V6OutboundCoreFrame::Health {
+                request_id: "7".to_owned(),
+            },
+            Expected::Health,
+            reply,
+        )
+        .expect("dispatch must write the frame");
+        let dispatched = in_flight.expect("in flight after dispatch");
+        assert_eq!(dispatched.request_id, "7");
+        // The deadline is anchored at dispatch time, not at enqueue time.
+        let expected = before + lifecycle_timeout();
+        let window = Duration::from_millis(50);
+        assert!(
+            dispatched.deadline >= expected - window && dispatched.deadline <= expected + window,
+            "deadline must start at dispatch"
+        );
+        // The frame reached the writer queue exactly once.
+        assert!(matches!(
+            writer_rx.try_recv(),
+            Ok(WriterCommand::Frame(
+                V6OutboundCoreFrame::Health { .. },
+                Flush::None
+            ))
+        ));
+        assert!(writer_rx.try_recv().is_err());
+        drop(receiver);
     }
 
     #[tokio::test]
-    async fn pending_deadline_is_absolute_under_event_activity() {
-        let mut pending = HashMap::new();
+    async fn in_flight_deadline_fires_without_event_activity() {
         let (reply, _receiver) = oneshot::channel();
-        pending.insert(
-            "1".to_owned(),
-            Pending {
-                expected: Expected::Health,
-                deadline: Instant::now(),
-                reply,
-            },
-        );
+        let in_flight = Some(Pending {
+            request_id: "1".to_owned(),
+            expected: Expected::Health,
+            deadline: Instant::now(),
+            reply,
+        });
         tokio::time::timeout(
             Duration::from_millis(20),
-            sleep_until_pending_deadline(&pending),
+            sleep_until_in_flight_deadline(&in_flight),
         )
         .await
         .unwrap();

@@ -290,7 +290,7 @@ pub enum V6InboundFrame {
     },
     EventResult {
         request_id: String,
-        actions: Vec<serde_json::Value>,
+        actions: Vec<EventAction>,
     },
     TelegramInvoke(V6ModuleFrame),
 }
@@ -419,11 +419,16 @@ pub fn parse_v6_inbound_frame(line: &str) -> Result<V6InboundFrame, ExternalErro
             request_id,
             code,
             message,
-        } if is_v6_request_id(&request_id) => Ok(V6InboundFrame::Error {
-            request_id,
-            code,
-            message,
-        }),
+        } if is_v6_request_id(&request_id)
+            && code.chars().count() <= MAX_ERROR_MESSAGE_CHARS
+            && message.chars().count() <= MAX_ERROR_MESSAGE_CHARS =>
+        {
+            Ok(V6InboundFrame::Error {
+                request_id,
+                code,
+                message,
+            })
+        }
         V6WireFrame::Health {
             protocol_version: 6,
             request_id,
@@ -433,19 +438,30 @@ pub fn parse_v6_inbound_frame(line: &str) -> Result<V6InboundFrame, ExternalErro
             request_id,
             level,
             message,
-        } if is_v6_request_id(&request_id) => Ok(V6InboundFrame::Log {
-            request_id,
-            level,
-            message,
-        }),
+        } if is_v6_request_id(&request_id)
+            && level.chars().count() <= MAX_LOG_MESSAGE_CHARS
+            && message.chars().count() <= MAX_LOG_MESSAGE_CHARS =>
+        {
+            Ok(V6InboundFrame::Log {
+                request_id,
+                level,
+                message,
+            })
+        }
         V6WireFrame::EventResult {
             protocol_version: 6,
             request_id,
             actions,
-        } if is_v6_request_id(&request_id) => Ok(V6InboundFrame::EventResult {
-            request_id,
-            actions,
-        }),
+        } if is_v6_request_id(&request_id) && actions.len() <= MAX_EVENT_ACTIONS => {
+            let actions = actions
+                .iter()
+                .map(|action| parse_event_action(action, 6))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(V6InboundFrame::EventResult {
+                request_id,
+                actions,
+            })
+        }
         _ => Err(ExternalError::ProtocolDecode),
     }
 }
@@ -1108,6 +1124,83 @@ mod tests {
             Ok(V6InboundFrame::EventResult { .. })
         ));
         assert!(parse_v6_inbound_frame(r#"{"protocol_version":6,"type":"health"}"#).is_err());
+    }
+
+    #[test]
+    fn v6_event_result_actions_are_validated_at_the_protocol_boundary() {
+        // A well-formed action parses into the typed shape.
+        assert!(matches!(
+            parse_v6_inbound_frame(
+                r#"{"protocol_version":6,"type":"event_result","request_id":"2","actions":[{"type":"message.react","message_ref":"r1","reactions":[{"type":"emoji","emoji":"👍"}]}]}"#
+            ),
+            Ok(V6InboundFrame::EventResult { actions, .. }) if actions.len() == 1
+        ));
+        // Too many actions must be rejected at the v6 boundary.
+        let too_many = format!(
+            r#"{{"protocol_version":6,"type":"event_result","request_id":"2","actions":[{}]}}"#,
+            [r#"{"type":"message.react","message_ref":"r1","reactions":[]}"#;
+                MAX_EVENT_ACTIONS + 1]
+                .join(",")
+        );
+        assert!(matches!(
+            parse_v6_inbound_frame(&too_many),
+            Err(ExternalError::ProtocolDecode)
+        ));
+        // Malformed action objects (unknown type) must be rejected.
+        assert!(matches!(
+            parse_v6_inbound_frame(
+                r#"{"protocol_version":6,"type":"event_result","request_id":"2","actions":[{"type":"text.send","message_ref":"r1"}]}"#
+            ),
+            Err(ExternalError::ProtocolDecode)
+        ));
+        // Too many reactions per action must be rejected.
+        let too_many_reactions = format!(
+            r#"{{"protocol_version":6,"type":"event_result","request_id":"2","actions":[{{"type":"message.react","message_ref":"r1","reactions":[{}]}}]}}"#,
+            [r#"{"type":"emoji","emoji":"a"}"#; MAX_REACTIONS_PER_ACTION + 1].join(",")
+        );
+        assert!(matches!(
+            parse_v6_inbound_frame(&too_many_reactions),
+            Err(ExternalError::ProtocolDecode)
+        ));
+    }
+
+    #[test]
+    fn v6_error_and_log_messages_enforce_the_documented_limits() {
+        let within = "x".repeat(MAX_ERROR_MESSAGE_CHARS);
+        assert!(matches!(
+            parse_v6_inbound_frame(&format!(
+                r#"{{"protocol_version":6,"type":"error","request_id":"2","code":"c","message":"{within}"}}"#
+            )),
+            Ok(V6InboundFrame::Error { .. })
+        ));
+        let over = "x".repeat(MAX_ERROR_MESSAGE_CHARS + 1);
+        assert!(matches!(
+            parse_v6_inbound_frame(&format!(
+                r#"{{"protocol_version":6,"type":"error","request_id":"2","code":"c","message":"{over}"}}"#
+            )),
+            Err(ExternalError::ProtocolDecode)
+        ));
+        let over_code = "x".repeat(MAX_ERROR_MESSAGE_CHARS + 1);
+        assert!(matches!(
+            parse_v6_inbound_frame(&format!(
+                r#"{{"protocol_version":6,"type":"error","request_id":"2","code":"{over_code}","message":"c"}}"#
+            )),
+            Err(ExternalError::ProtocolDecode)
+        ));
+        let within_log = "x".repeat(MAX_LOG_MESSAGE_CHARS);
+        assert!(matches!(
+            parse_v6_inbound_frame(&format!(
+                r#"{{"protocol_version":6,"type":"log","request_id":"2","level":"info","message":"{within_log}"}}"#
+            )),
+            Ok(V6InboundFrame::Log { .. })
+        ));
+        let over_log = "x".repeat(MAX_LOG_MESSAGE_CHARS + 1);
+        assert!(matches!(
+            parse_v6_inbound_frame(&format!(
+                r#"{{"protocol_version":6,"type":"log","request_id":"2","level":"info","message":"{over_log}"}}"#
+            )),
+            Err(ExternalError::ProtocolDecode)
+        ));
     }
 
     #[test]

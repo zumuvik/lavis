@@ -419,6 +419,18 @@ pub fn validate_manifest_at(
         .map(|name| v6_registry::lookup(name).ok_or(ExternalError::InvalidArgument))
         .collect::<Result<Vec<_>, _>>()?;
 
+    // Every granted method's capability requirement comes from the generated
+    // registry (`required_capability`), the same source the runtime
+    // `validate_invoke` gate uses. The installer must not fingerprint a grant
+    // configuration that is guaranteed to be rejected at runtime.
+    for method in &telegram_methods {
+        if let Some(required) = method.spec().required_capability
+            && !seen_capabilities.iter().any(|cap| cap.as_str() == required)
+        {
+            return Err(ExternalError::InvalidCapability);
+        }
+    }
+
     let mut subscriptions = Vec::new();
     let mut actions = Vec::new();
     if manifest.schema_version == 2
@@ -891,6 +903,59 @@ mod tests {
                 Err(ExternalError::MalformedManifest)
             ));
         }
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn v6_grants_follow_the_registry_capability_requirements() {
+        let base = temp_dir();
+        let dir = create_module_dir(&base, "echo");
+        let mut json = serde_json::from_slice::<serde_json::Value>(&valid_manifest_json()).unwrap();
+        json["schema_version"] = serde_json::json!(6);
+
+        // account.updateStatus requires telegram.account.status; an empty
+        // grant set must be rejected at install time, before fingerprinting.
+        json["capabilities"] = serde_json::json!([]);
+        json["telegram_methods"] = serde_json::json!(["account.updateStatus"]);
+        let path = write_manifest(&dir, &serde_json::to_vec(&json).unwrap());
+        assert!(matches!(
+            validate_manifest_at(&path, Some("echo")),
+            Err(ExternalError::InvalidCapability)
+        ));
+
+        // The required capability present: accepted.
+        json["capabilities"] = serde_json::json!(["telegram.account.status"]);
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        let descriptor = validate_manifest_at(&path, Some("echo")).unwrap();
+        assert_eq!(descriptor.telegram_methods.len(), 1);
+
+        // Curated helpers never require telegram.raw.
+        for method in [
+            "contacts.getContacts",
+            "messages.getHistory",
+            "messages.getDialogs",
+        ] {
+            json["capabilities"] = serde_json::json!([]);
+            json["telegram_methods"] = serde_json::json!([method]);
+            fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+            assert!(
+                validate_manifest_at(&path, Some("echo")).is_ok(),
+                "{method} must not require telegram.raw"
+            );
+        }
+
+        // raw.invoke without telegram.raw is rejected; with it, accepted.
+        json["capabilities"] = serde_json::json!([]);
+        json["telegram_methods"] = serde_json::json!(["raw.invoke"]);
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(matches!(
+            validate_manifest_at(&path, Some("echo")),
+            Err(ExternalError::InvalidCapability)
+        ));
+
+        json["capabilities"] = serde_json::json!(["telegram.raw"]);
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(validate_manifest_at(&path, Some("echo")).is_ok());
         fs::remove_dir_all(&base).unwrap();
     }
 
