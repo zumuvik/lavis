@@ -32,11 +32,7 @@ jobs:
                   raise SystemExit(f'{path}: expected {count} matches, found {actual}')
               p.write_text(text.replace(old, new, count))
 
-          replace(
-              'src/external_modules/v6_executor.rs',
-              'use grammers_session::Session;\n',
-              '',
-          )
+          replace('src/external_modules/v6_executor.rs', 'use grammers_session::Session;\n', '')
           replace(
               'src/external_modules/v6_executor.rs',
               '            None => self.raw_handle.session.home_dc_id(),\n',
@@ -44,8 +40,18 @@ jobs:
           )
           replace(
               'src/external_modules/v6_process.rs',
+              '''        actor_tx,\n        mut reader,\n        mut writer,\n        mut stderr_drain,\n''',
+              '''        actor_tx,\n        reader,\n        writer,\n        stderr_drain,\n''',
+          )
+          replace(
+              'src/external_modules/v6_process.rs',
               '    let mut shutdown_reply = None;\n',
               '    let mut shutdown_reply: Option<oneshot::Sender<Result<(), ExternalError>>> = None;\n',
+          )
+          replace(
+              'src/external_modules/v6_process.rs',
+              '''                    let Some(request_id) = request_id(&frame) else { let _ = reply.send(Err(ExternalError::ProtocolEncode)); continue; };\n                    if pending.contains_key(request_id) { let _ = reply.send(Err(ExternalError::WrongRequestId)); continue; }\n                    if pending.len() == V6_MAX_PENDING { let _ = reply.send(Err(ExternalError::Unavailable)); continue; }\n                    if queue_writer(&writer_tx, WriterCommand::Frame(frame, Flush::None)).is_err() {\n                        let _ = reply.send(Err(ExternalError::Unavailable));\n                        break;\n                    }\n                    pending.insert(request_id.to_owned(), Pending { expected, deadline: Instant::now() + V6_LIFECYCLE_TIMEOUT, reply });\n''',
+              '''                    let Some(request_id) = request_id(&frame).map(str::to_owned) else { let _ = reply.send(Err(ExternalError::ProtocolEncode)); continue; };\n                    if pending.contains_key(&request_id) { let _ = reply.send(Err(ExternalError::WrongRequestId)); continue; }\n                    if pending.len() == V6_MAX_PENDING { let _ = reply.send(Err(ExternalError::Unavailable)); continue; }\n                    if queue_writer(&writer_tx, WriterCommand::Frame(frame, Flush::None)).is_err() {\n                        let _ = reply.send(Err(ExternalError::Unavailable));\n                        break;\n                    }\n                    pending.insert(request_id, Pending { expected, deadline: Instant::now() + V6_LIFECYCLE_TIMEOUT, reply });\n''',
           )
           replace(
               'src/external_modules/v6_process.rs',
