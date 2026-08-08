@@ -456,7 +456,7 @@ fn encode_base64(input: &[u8]) -> String {
 
 fn decode_base64(input: &str) -> Result<Vec<u8>, V6ExecutorError> {
     let bytes = input.as_bytes();
-    if bytes.is_empty() || bytes.len() % 4 != 0 {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
         return Err(V6ExecutorError::InvalidParams("raw body is not base64"));
     }
     let mut output = Vec::with_capacity((bytes.len() / 4) * 3);
@@ -467,7 +467,7 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, V6ExecutorError> {
         let b = base64_value(chunk[1])?;
         let c_padding = chunk[2] == b'=';
         let d_padding = chunk[3] == b'=';
-        if !last && (c_padding || d_padding) || c_padding && !d_padding {
+        if !last && d_padding || c_padding && !d_padding {
             return Err(V6ExecutorError::InvalidParams("raw body is not base64"));
         }
         let c = if c_padding {

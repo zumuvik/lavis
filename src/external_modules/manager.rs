@@ -387,7 +387,21 @@ impl ExternalManagerHandle {
                                     Ok(super::protocol::V6InboundFrame::Initialized {
                                         module_id,
                                         ..
-                                    }) if module_id == id => Ok(ManagedProcess::V6(process)),
+                                    }) if module_id == id => {
+                                        match process.health(super::protocol::request_id()).await {
+                                            Ok(super::protocol::V6InboundFrame::Health {
+                                                ..
+                                            }) => Ok(ManagedProcess::V6(process)),
+                                            Ok(_) => {
+                                                process.terminate().await;
+                                                Err(ExternalError::ProtocolDecode)
+                                            }
+                                            Err(error) => {
+                                                process.terminate().await;
+                                                Err(error)
+                                            }
+                                        }
+                                    }
                                     Ok(_) => {
                                         process.terminate().await;
                                         Err(ExternalError::ProtocolDecode)

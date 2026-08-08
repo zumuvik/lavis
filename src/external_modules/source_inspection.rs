@@ -242,7 +242,7 @@ pub struct ArchiveStatistics {
 #[serde(rename_all = "snake_case")]
 pub enum InspectionWarning {
     StoredOnlyArchive,
-    /// `telegram.raw` grants reviewed RPC methods but does not sandbox a module.
+    /// `telegram.raw` grants raw Telegram RPC authority and does not sandbox a module.
     TelegramRawNotSandboxed,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -1315,7 +1315,7 @@ mod tests {
         let mut random = TestRandom(1);
         let first = inspect_pending(
             &config,
-            AcquiredLmod::archive(v6_archive("account.updateStatus")),
+            AcquiredLmod::archive(v6_archive("raw.invoke")),
             SystemTime::UNIX_EPOCH,
             SystemTime::UNIX_EPOCH,
             &mut random,
@@ -1329,10 +1329,7 @@ mod tests {
             &mut random,
         )
         .unwrap();
-        assert_eq!(
-            first.plan.telegram_methods,
-            vec!["account.updateStatus".to_owned()]
-        );
+        assert_eq!(first.plan.telegram_methods, vec!["raw.invoke".to_owned()]);
         assert!(
             first
                 .plan

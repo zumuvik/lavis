@@ -84,8 +84,8 @@ impl ExternalCapability {
             Self::MessagePeerId => "идентификатор чата сообщения",
             Self::MessageReact => "реакции на сообщения",
             Self::TelegramAccountStatus => "изменение статуса аккаунта Telegram",
-            // This grants reviewed raw RPC methods, not a sandbox or generic API.
-            Self::TelegramRaw => "высокорисковые проверенные вызовы Telegram без песочницы",
+            // This grants arbitrary Telegram RPC authority, not a sandbox boundary.
+            Self::TelegramRaw => "полный доступ к Telegram RPC без песочницы",
         }
     }
 
@@ -692,7 +692,7 @@ mod tests {
         let path = dir.join("module.json");
         assert!(matches!(
             validate_manifest_at(&path, Some("echo")),
-            Err(ExternalError::InvalidArgument)
+            Err(ExternalError::MalformedManifest)
         ));
         fs::remove_dir_all(&base).unwrap();
     }
@@ -776,7 +776,7 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
         assert!(matches!(
             validate_manifest_at(&path, Some("echo")),
-            Err(ExternalError::InvalidArgument)
+            Err(ExternalError::MalformedManifest)
         ));
 
         json.as_object_mut().unwrap().remove("timer_subscriptions");
@@ -799,7 +799,7 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
         assert!(matches!(
             validate_manifest_at(&path, Some("echo")),
-            Err(ExternalError::InvalidArgument)
+            Err(ExternalError::MalformedManifest)
         ));
         for schema_version in 2..=4 {
             json["schema_version"] = serde_json::json!(schema_version);

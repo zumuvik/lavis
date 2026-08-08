@@ -333,13 +333,17 @@ enum V6WireFrame {
         request_id: String,
         actions: Vec<serde_json::Value>,
     },
-    #[serde(rename = "telegram.invoke")]
-    TelegramInvoke {
-        protocol_version: u32,
-        call_id: String,
-        method: String,
-        params: Box<RawValue>,
-    },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct V6WireInvoke {
+    protocol_version: u32,
+    #[serde(rename = "type")]
+    message_type: String,
+    call_id: String,
+    method: String,
+    params: Box<RawValue>,
 }
 
 #[derive(Deserialize)]
@@ -372,6 +376,27 @@ struct V6WireError {
 }
 
 pub fn parse_v6_inbound_frame(line: &str) -> Result<V6InboundFrame, ExternalError> {
+    let value = parse_v6_value(line)?;
+    if value.get("type").and_then(serde_json::Value::as_str) == Some("telegram.invoke") {
+        let wire: V6WireInvoke =
+            serde_json::from_str(line).map_err(|_| ExternalError::ProtocolDecode)?;
+        if wire.protocol_version == 6
+            && wire.message_type == "telegram.invoke"
+            && is_v6_call_id(&wire.call_id)
+            && !wire.method.is_empty()
+            && validate_v6_raw_params(&wire.params).is_ok()
+        {
+            return Ok(V6InboundFrame::TelegramInvoke(
+                V6ModuleFrame::TelegramInvoke {
+                    call_id: wire.call_id,
+                    method: wire.method,
+                    params: wire.params,
+                },
+            ));
+        }
+        return Err(ExternalError::ProtocolDecode);
+    }
+
     let wire: V6WireFrame = parse_v6_wire(line)?;
     match wire {
         V6WireFrame::Initialized {
@@ -419,23 +444,6 @@ pub fn parse_v6_inbound_frame(line: &str) -> Result<V6InboundFrame, ExternalErro
             request_id,
             actions,
         }),
-        V6WireFrame::TelegramInvoke {
-            protocol_version: 6,
-            call_id,
-            method,
-            params,
-        } if is_v6_call_id(&call_id)
-            && !method.is_empty()
-            && validate_v6_raw_params(&params).is_ok() =>
-        {
-            Ok(V6InboundFrame::TelegramInvoke(
-                V6ModuleFrame::TelegramInvoke {
-                    call_id,
-                    method,
-                    params,
-                },
-            ))
-        }
         _ => Err(ExternalError::ProtocolDecode),
     }
 }

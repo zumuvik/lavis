@@ -255,6 +255,11 @@ impl V6Process {
         .await
     }
 
+    pub(crate) async fn health(&self, request_id: String) -> Result<V6InboundFrame, ExternalError> {
+        self.request(V6OutboundCoreFrame::Health { request_id }, Expected::Health)
+            .await
+    }
+
     pub(crate) async fn shutdown(&self, request_id: String) -> Result<(), ExternalError> {
         let (reply, response) = oneshot::channel();
         self.control
@@ -634,10 +639,10 @@ async fn write_stdin(
             Flush::Call(call_id) => Some(ActorEvent::Flushed(call_id)),
             Flush::Shutdown => Some(ActorEvent::ShutdownFlushed),
         };
-        if let Some(event) = event {
-            if tx.send(event).await.is_err() {
-                return;
-            }
+        if let Some(event) = event
+            && tx.send(event).await.is_err()
+        {
+            return;
         }
     }
 }
@@ -664,7 +669,7 @@ fn validate_invoke(
     }
     let method = v6_registry::lookup(method).ok_or_else(|| V6CallError {
         kind: "validation".to_owned(),
-        message: "method is not allowlisted".to_owned(),
+        message: "gateway method is not recognized".to_owned(),
     })?;
     if !descriptor.telegram_methods.contains(&method) {
         return Err(V6CallError {
