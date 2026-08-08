@@ -1198,11 +1198,28 @@ mod tests {
             super::super::process::ProcessStatus::Crashed
         );
 
+        fn descendant_is_live(pid: i32) -> bool {
+            let proc_stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+            match proc_stat {
+                Ok(stat) => {
+                    // `/proc/<pid>/stat` is `pid (comm) state ...`; comm may
+                    // contain spaces or parentheses, so find the final `) `.
+                    // A zombie has already been killed and cannot execute or
+                    // retain module resources; in a PID namespace its init is
+                    // responsible for the eventual wait/reap.
+                    let Some(after_comm) = stat.rsplit_once(") ").map(|(_, tail)| tail) else {
+                        return true;
+                    };
+                    !after_comm.starts_with('Z')
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(_) => true,
+            }
+        }
+
         let mut alive = true;
         for _ in 0..200 {
-            let result = unsafe { libc::kill(descendant, 0) };
-            alive =
-                result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+            alive = descendant_is_live(descendant);
             if !alive {
                 break;
             }
@@ -1214,6 +1231,9 @@ mod tests {
             }
         }
         let _ = fs::remove_dir_all(&root);
-        assert!(!alive, "descendant process survived v6 supervisor cleanup");
+        assert!(
+            !alive,
+            "live descendant process survived v6 supervisor cleanup"
+        );
     }
 }
