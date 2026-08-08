@@ -3075,6 +3075,61 @@ sys.exit(0)
         ));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_cancellation_consumes_delayed_lifecycle_ack_before_clean_exit() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let (lifecycle_reply, mut lifecycle_response) = oneshot::channel();
+        let mut in_flight = Some(Pending {
+            request_id: "7".to_owned(),
+            expected: Expected::Health,
+            deadline: None,
+            reply: lifecycle_reply,
+        });
+        let mut waiting = VecDeque::new();
+        let mut awaiting = HashSet::from(["7".to_owned()]);
+        let mut workers = JoinSet::new();
+        let (writer, mut writer_rx) = mpsc::channel(1);
+        let (shutdown_reply, _shutdown_response) = oneshot::channel();
+        let mut saved_shutdown_reply = None;
+        let mut closing = false;
+
+        // Exact controlled ordering: lifecycle write has flushed, shutdown
+        // cancels its caller, then the delayed internal ack is consumed.
+        start_shutdown(
+            &mut closing,
+            &mut in_flight,
+            &mut waiting,
+            &mut workers,
+            &writer,
+            "8".to_owned(),
+            Some(shutdown_reply),
+            &mut saved_shutdown_reply,
+        )
+        .expect("shutdown submission");
+        assert!(closing);
+        assert!(in_flight.is_none());
+        assert!(matches!(
+            lifecycle_response.try_recv(),
+            Ok(Err(ExternalError::Unavailable))
+        ));
+        assert!(matches!(
+            writer_rx.try_recv(),
+            Ok(WriterCommand::Frame(
+                V6OutboundCoreFrame::Shutdown { .. },
+                Flush::Shutdown
+            ))
+        ));
+        handle_lifecycle_flushed(&mut in_flight, &mut awaiting, "7")
+            .expect("delayed valid ack is consumed after shutdown cancellation");
+        assert!(awaiting.is_empty());
+        assert!(
+            shutdown_child_exit_result(true, Ok(std::process::ExitStatus::from_raw(0))).is_ok()
+        );
+        assert!(saved_shutdown_reply.is_some());
+    }
+
     #[test]
     fn request_id_reuse_is_blocked_until_flush_ack_consumption() {
         let in_flight = None;
