@@ -1038,7 +1038,12 @@ impl RuntimeState {
                 .await
         };
         match result {
-            Ok(operation) if operation.changed => Response::plain(format!("✅ Модуль «{}» {}.\n\nДля применения изменений выполните:\n,reboot", operation.module.display_name, if enabled { "включён" } else { "отключён" })),
+            Ok(operation) if operation.changed => Response::plain(format!(
+                "✅ Модуль «{}» {}.\n\nДля применения изменений выполните:\n{}reboot",
+                operation.module.display_name,
+                if enabled { "включён" } else { "отключён" },
+                self.prefix(),
+            )),
             Ok(operation) => Response::plain(format!("ℹ️ Модуль «{}» уже {}.", operation.module.display_name, if enabled { "включён" } else { "отключён" })),
             Err(control::ModuleControlError::DeclarativelyManaged) => Response::plain("⚠️ Модуль управляется декларативно через NixOS. Измените services.lavis.extensions и выполните nh os switch.".to_owned()),
             Err(_) => Response::plain("⚠️ Не удалось изменить состояние модуля.".to_owned()),
