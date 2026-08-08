@@ -493,11 +493,13 @@ mod tests {
     }
 
     async fn aliases_with_core_alias() -> (AliasStore, PathBuf) {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let directory = std::env::temp_dir().join(format!("lavis-help-{nonce}"));
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!("lavis-help-{nonce}-{seq}"));
         fs::create_dir_all(&directory).unwrap();
         let mut aliases = AliasStore::load(directory.join("aliases.json"))
             .await

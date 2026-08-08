@@ -2313,12 +2313,16 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     async fn runtime_with_alias() -> (super::RuntimeState, PathBuf) {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let directory =
-            std::env::temp_dir().join(format!("lavis-runtime-show-{}-{nonce}", std::process::id()));
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "lavis-runtime-show-{}-{nonce}-{seq}",
+            std::process::id()
+        ));
         fs::create_dir_all(&directory).unwrap();
         let path = directory.join("aliases.json");
         let mut aliases = AliasStore::load(path).await.unwrap();
@@ -2375,12 +2379,14 @@ mod tests {
     #[tokio::test]
     async fn lm_doctor_reports_installed_modules_and_unknown_targets() {
         use std::os::unix::fs::PermissionsExt;
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let directory = std::env::temp_dir().join(format!(
-            "lavis-runtime-doctor-{}-{nonce}",
+            "lavis-runtime-doctor-{}-{nonce}-{seq}",
             std::process::id()
         ));
         fs::create_dir_all(&directory).unwrap();
@@ -2876,11 +2882,13 @@ for line in sys.stdin:
             }
         }
 
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let directory = std::env::temp_dir().join(format!("lavis-runtime-events-{nonce}"));
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!("lavis-runtime-events-{nonce}-{seq}"));
         fs::create_dir_all(&directory).unwrap();
         let python = std::env::var_os("PATH")
             .into_iter()

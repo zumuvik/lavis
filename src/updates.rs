@@ -1259,8 +1259,10 @@ mod tests {
 
     #[tokio::test]
     async fn routes_edited_style_text_with_the_active_prefix() {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let directory = std::env::temp_dir().join(format!(
-            "lavis-updates-prefix-{}-{}",
+            "lavis-updates-prefix-{}-{}-{seq}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1291,8 +1293,10 @@ mod tests {
 
     #[tokio::test]
     async fn routes_modules_aliases_and_a_new_prefix_in_the_same_runtime() {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let directory = std::env::temp_dir().join(format!(
-            "lavis-updates-routing-{}-{}",
+            "lavis-updates-routing-{}-{}-{seq}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

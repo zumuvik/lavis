@@ -198,11 +198,13 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn path() -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let d = std::env::temp_dir().join(format!("lavis-ext-state-{nonce}"));
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("lavis-ext-state-{nonce}-{seq}"));
         fs::create_dir_all(&d).unwrap();
         #[cfg(unix)]
         {

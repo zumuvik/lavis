@@ -614,11 +614,13 @@ mod tests {
     }
 
     fn temp_dir() -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("lavis-manifest-test-{nonce}"));
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("lavis-manifest-test-{nonce}-{seq}"));
         fs::create_dir_all(&dir).unwrap();
         set_permissions(&dir, 0o700);
         dir
