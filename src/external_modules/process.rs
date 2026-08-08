@@ -792,12 +792,22 @@ pub(crate) fn build_crash_diagnostics(
         request_id,
         error,
         capture,
-        "runtime",
-        "runtime_failure",
-        None,
-        None,
-        0,
+        CrashDiagnosticContext {
+            lifecycle_stage: "runtime",
+            error_category: "runtime_failure",
+            exit_code: None,
+            signal: None,
+            restart_generation: 0,
+        },
     )
+}
+
+pub(crate) struct CrashDiagnosticContext<'a> {
+    pub(crate) lifecycle_stage: &'a str,
+    pub(crate) error_category: &'a str,
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) signal: Option<i32>,
+    pub(crate) restart_generation: u64,
 }
 
 pub(crate) fn build_crash_diagnostics_with_context(
@@ -805,11 +815,7 @@ pub(crate) fn build_crash_diagnostics_with_context(
     request_id: Option<&str>,
     error: &ExternalError,
     capture: &StderrCapture,
-    lifecycle_stage: &str,
-    error_category: &str,
-    exit_code: Option<i32>,
-    signal: Option<i32>,
-    restart_generation: u64,
+    context: CrashDiagnosticContext<'_>,
 ) -> CrashDiagnostics {
     let timestamp_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -819,16 +825,16 @@ pub(crate) fn build_crash_diagnostics_with_context(
     CrashDiagnostics {
         module_id: descriptor.id.clone(),
         protocol_version: descriptor.protocol_version,
-        lifecycle_stage: lifecycle_stage.to_owned(),
+        lifecycle_stage: context.lifecycle_stage.to_owned(),
         request_id: request_id.unwrap_or("-").to_owned(),
-        error_category: error_category.to_owned(),
+        error_category: context.error_category.to_owned(),
         error: error.to_string(),
-        exit_code,
-        signal,
+        exit_code: context.exit_code,
+        signal: context.signal,
         stderr_truncated: capture.truncated,
         stderr: capture.lossy_text().trim().to_owned(),
         timestamp_unix_ms,
-        restart_generation,
+        restart_generation: context.restart_generation,
     }
 }
 

@@ -343,7 +343,6 @@ enum Expected {
 #[derive(Clone, Copy)]
 enum FatalReason {
     Unavailable,
-    ProtocolEncode,
     ProtocolDecode,
     LineTooLarge,
     WrongRequestId,
@@ -358,7 +357,6 @@ impl FatalReason {
     fn error(self) -> ExternalError {
         match self {
             Self::Unavailable => ExternalError::Unavailable,
-            Self::ProtocolEncode => ExternalError::ProtocolEncode,
             Self::ProtocolDecode => ExternalError::ProtocolDecode,
             Self::LineTooLarge => ExternalError::LineTooLarge,
             Self::WrongRequestId => ExternalError::WrongRequestId,
@@ -373,7 +371,6 @@ impl FatalReason {
     fn category(self) -> &'static str {
         match self {
             Self::Unavailable => "unavailable",
-            Self::ProtocolEncode => "protocol_encode",
             Self::ProtocolDecode => "protocol_decode",
             Self::LineTooLarge => "line_too_large",
             Self::WrongRequestId => "wrong_request_id",
@@ -529,7 +526,6 @@ async fn supervise(
                     }
                 }
                 Some(Control::ForceTerminate { reply }) => {
-                    closing = true;
                     fail_pending(&mut pending);
                     workers.abort_all();
                     force_reply = Some(reply);
@@ -750,11 +746,13 @@ async fn supervise(
             fatal_request_id.as_deref(),
             &error,
             &capture,
-            fatal_stage,
-            reason.category(),
-            exit_code,
-            exit_signal,
-            0,
+            process::CrashDiagnosticContext {
+                lifecycle_stage: fatal_stage,
+                error_category: reason.category(),
+                exit_code,
+                signal: exit_signal,
+                restart_generation: 0,
+            },
         );
         {
             let mut state = lock_runtime_state(&runtime);
