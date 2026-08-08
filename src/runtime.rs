@@ -2457,6 +2457,134 @@ mod tests {
         fs::remove_dir_all(state_directory).unwrap();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lm_status_commands_use_a_fresh_snapshot_after_asynchronous_v6_crash() {
+        use std::{os::unix::fs::PermissionsExt, sync::Arc};
+
+        struct NoopExecutor;
+        impl crate::external_modules::v6_executor::V6TelegramExecutor for NoopExecutor {
+            fn execute<'a>(
+                &'a self,
+                _context: crate::external_modules::v6_executor::V6ExecutionContext,
+                _method: crate::external_modules::v6_registry::V6Method,
+                _params: Box<serde_json::value::RawValue>,
+            ) -> crate::external_modules::v6_executor::V6ExecutorFuture<'a> {
+                Box::pin(async {
+                    Err(crate::external_modules::v6_executor::V6ExecutorError::Transport)
+                })
+            }
+        }
+
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "lavis-runtime-fresh-status-{}-{nonce}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let module_dir = directory.join("sample");
+        fs::create_dir_all(&module_dir).unwrap();
+        let python = std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+            .map(|directory| directory.join("python3"))
+            .find(|candidate| candidate.is_file())
+            .expect("fixture tests require python3 in PATH");
+        let entrypoint = module_dir.join("run");
+        let script = format!(
+            "#!{}\nimport json, sys, time\nframe = json.loads(sys.stdin.readline())\nprint(json.dumps({{'protocol_version':6,'type':'initialized','request_id':frame['request_id'],'module_id':'sample'}}), flush=True)\nframe = json.loads(sys.stdin.readline())\nprint(json.dumps({{'protocol_version':6,'type':'health','request_id':frame['request_id']}}), flush=True)\ntime.sleep(0.4)\nsys.exit(7)\n",
+            python.display()
+        );
+        fs::write(&entrypoint, script).unwrap();
+        fs::set_permissions(&entrypoint, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(
+            module_dir.join("module.json"),
+            br#"{"schema_version":6,"id":"sample","name":"Sample","version":"1","author":"A","entrypoint":"run","capabilities":[],"telegram_methods":[],"commands":[{"name":"go","summary_ru":"x","description_ru":"x","usage":"<value>"}]}"#,
+        )
+        .unwrap();
+        let descriptor = crate::external_modules::manifest::validate_manifest_at(
+            &module_dir.join("module.json"),
+            Some("sample"),
+        )
+        .unwrap();
+        crate::external_modules::v6_process::set_test_state_base(directory.join("state-base"));
+        let handle = crate::external_modules::manager::ExternalManagerHandle::new(
+            crate::external_modules::manager::ExternalManager::new(),
+        );
+        {
+            let mut manager = handle.lock().await;
+            manager.set_descriptors(vec![descriptor]);
+            manager.set_v6_executor(Arc::new(NoopExecutor));
+        }
+        handle
+            .startup_enabled(&std::collections::BTreeSet::from(["sample".to_owned()]))
+            .await;
+
+        let (mut runtime, state_directory) = runtime_with_alias().await;
+        runtime.configure_module_control(
+            directory.clone(),
+            directory.join("state.json"),
+            directory.join("declarative.json"),
+            PeerId::user(1).unwrap(),
+        );
+        runtime.set_external_manager(handle.clone()).await;
+        assert_eq!(
+            runtime.external_snapshot.module_statuses[0].status, "активен",
+            "the cached routing snapshot intentionally predates the crash"
+        );
+        for _ in 0..200 {
+            if handle
+                .snapshot()
+                .await
+                .module_statuses
+                .iter()
+                .any(|status| status.id == "sample" && status.status == "ошибка")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            handle
+                .snapshot()
+                .await
+                .module_statuses
+                .iter()
+                .any(|status| status.id == "sample" && status.status == "ошибка")
+        );
+
+        assert!(
+            runtime
+                .render_lm_list()
+                .await
+                .text
+                .contains("Runtime: ошибка")
+        );
+        assert!(
+            runtime
+                .lm_info("sample")
+                .await
+                .text
+                .contains("Runtime: ошибка")
+        );
+        assert!(
+            runtime
+                .lm_doctor(Some("sample"))
+                .await
+                .text
+                .contains("Runtime: ошибка")
+        );
+
+        handle.shutdown_all().await;
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(state_directory).unwrap();
+    }
+
     #[tokio::test]
     async fn generated_username_has_no_botfather_side_effect_before_confirmation() {
         let mut setup = super::SetupCoordinator {

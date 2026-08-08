@@ -748,6 +748,79 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn healthy_restart_clears_retained_spawn_diagnostic() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct NoopExecutor;
+        impl super::super::v6_executor::V6TelegramExecutor for NoopExecutor {
+            fn execute<'a>(
+                &'a self,
+                _context: super::super::v6_executor::V6ExecutionContext,
+                _method: super::super::v6_registry::V6Method,
+                _params: Box<serde_json::value::RawValue>,
+            ) -> super::super::v6_executor::V6ExecutorFuture<'a> {
+                Box::pin(async { Err(super::super::v6_executor::V6ExecutorError::Transport) })
+            }
+        }
+
+        let python = std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+            .map(|directory| directory.join("python3"))
+            .find(|candidate| candidate.is_file())
+            .expect("fixture tests require python3 in PATH");
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "lavis-manager-start-recovery-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        crate::external_modules::v6_process::set_test_state_base(root.join("state"));
+        let entrypoint = root.join("run");
+        let mut module = descriptor("sample", "1.0");
+        module.protocol_version = 6;
+        module.module_dir = root.clone();
+        module.entrypoint = entrypoint.clone();
+        let handle = super::ExternalManagerHandle::new(ExternalManager::new());
+        {
+            let mut manager = handle.lock().await;
+            manager.set_descriptors(vec![module]);
+            manager.set_v6_executor(std::sync::Arc::new(NoopExecutor));
+        }
+        let enabled = std::collections::BTreeSet::from(["sample".to_owned()]);
+
+        // First attempt cannot spawn the missing entrypoint and is retained.
+        handle.startup_enabled(&enabled).await;
+        {
+            let manager = handle.lock().await;
+            assert!(manager.latest_diagnostics.contains_key("sample"));
+            assert_eq!(manager.statuses()[0].status, "ошибка");
+        }
+
+        // A healthy later start clears the stale spawn failure. The fixture
+        // answers the manager's initialize and health handshake, then exits
+        // cleanly on the shutdown sent during test cleanup.
+        let script = format!(
+            "#!{}\nimport json, sys\nline = json.loads(sys.stdin.readline())\nprint(json.dumps({{'protocol_version':6,'type':'initialized','request_id':line['request_id'],'module_id':'sample'}}), flush=True)\nline = json.loads(sys.stdin.readline())\nprint(json.dumps({{'protocol_version':6,'type':'health','request_id':line['request_id']}}), flush=True)\nsys.stdin.readline()\nsys.exit(0)\n",
+            python.display()
+        );
+        std::fs::write(&entrypoint, script).unwrap();
+        std::fs::set_permissions(&entrypoint, std::fs::Permissions::from_mode(0o700)).unwrap();
+        handle.startup_enabled(&enabled).await;
+        {
+            let manager = handle.lock().await;
+            assert!(!manager.latest_diagnostics.contains_key("sample"));
+            assert!(manager.has_running_process("sample"));
+            assert_eq!(manager.statuses()[0].status, "активен");
+        }
+        handle.shutdown_all().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn retained_diagnostic_marks_the_module_as_error_without_a_process() {
         let mut manager = ExternalManager::new();

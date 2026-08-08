@@ -996,8 +996,11 @@ fn dispatch_lifecycle(
         let _ = reply.send(Err(ExternalError::ProtocolEncode));
         return Ok(());
     };
-    queue_writer(writer, WriterCommand::Frame(frame, Flush::None))
-        .map_err(FatalReason::from_writer)?;
+    if let Err(error) = queue_writer(writer, WriterCommand::Frame(frame, Flush::None)) {
+        let reason = FatalReason::from_writer(error);
+        let _ = reply.send(Err(reason.error()));
+        return Err(reason);
+    }
     *in_flight = Some(Pending {
         request_id,
         expected,
@@ -2299,10 +2302,12 @@ sys.exit(0)
                 Err(failure) => failure,
             };
         assert_eq!(failure.diagnostics.lifecycle_stage, "spawn");
+        assert_eq!(failure.diagnostics.error_category, "unavailable");
         assert_eq!(failure.diagnostics.restart_generation, 7);
         assert_eq!(failure.diagnostics.exit_code, None);
         assert_eq!(failure.diagnostics.signal, None);
         assert!(failure.diagnostics.stderr.is_empty());
+        assert!(failure.diagnostics.timestamp_unix_ms > 0);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2376,6 +2381,182 @@ sys.exit(0)
             &[v6_registry::V6Method::ContactsGetContacts]
         );
         process.graceful_shutdown().await.unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lifecycle_waiting_queue_returns_backpressure_when_full() {
+        use std::fs;
+        let root = test_root("v6-queue-full");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        ensure_test_state_base();
+        let mut module = descriptor();
+        module.id = format!("v6queuefull{}", std::process::id());
+        module.module_dir = root.clone();
+        module.entrypoint = root.join("run");
+        let script = r#"#!/usr/bin/env python3
+import os, sys, time
+sys.stdin.readline()
+open("received", "w").close()
+time.sleep(30)
+"#;
+        write_v6_fixture(&module.entrypoint, script);
+        let process = V6Process::start(module.clone(), Arc::new(RecordingExecutor::default()), 1)
+            .await
+            .unwrap();
+        let initialize = {
+            let process = process.clone();
+            let id = module.id.clone();
+            tokio::spawn(async move { process.initialize("1".to_owned(), id).await })
+        };
+        for _ in 0..100 {
+            if root.join("received").exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(root.join("received").exists());
+        let mut queued = Vec::new();
+        for number in 0..V6_MAX_PENDING {
+            let process = process.clone();
+            queued.push(tokio::spawn(async move {
+                process
+                    .execute(
+                        (number + 2).to_string(),
+                        "go".to_owned(),
+                        String::new(),
+                        vec![],
+                    )
+                    .await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(matches!(
+            process
+                .execute("99".to_owned(), "go".to_owned(), String::new(), vec![],)
+                .await,
+            Err(ExternalError::Backpressure)
+        ));
+        process.terminate().await;
+        assert!(matches!(
+            initialize.await.unwrap(),
+            Err(ExternalError::Unavailable)
+        ));
+        for queued in queued {
+            assert!(matches!(
+                queued.await.unwrap(),
+                Err(ExternalError::Unavailable)
+            ));
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn force_terminate_bypasses_lifecycle_queue() {
+        use std::fs;
+        let root = test_root("v6-force-queue");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        ensure_test_state_base();
+        let mut module = descriptor();
+        module.id = format!("v6forcequeue{}", std::process::id());
+        module.module_dir = root.clone();
+        module.entrypoint = root.join("run");
+        write_v6_fixture(
+            &module.entrypoint,
+            "#!/usr/bin/env python3\nimport sys, time\nsys.stdin.readline()\nopen('received', 'w').close()\ntime.sleep(30)\n",
+        );
+        let process = V6Process::start(module.clone(), Arc::new(RecordingExecutor::default()), 1)
+            .await
+            .unwrap();
+        let initialize = {
+            let process = process.clone();
+            let id = module.id.clone();
+            tokio::spawn(async move { process.initialize("1".to_owned(), id).await })
+        };
+        for _ in 0..100 {
+            if root.join("received").exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let queued = {
+            let process = process.clone();
+            tokio::spawn(async move {
+                process
+                    .execute("2".to_owned(), "go".to_owned(), String::new(), vec![])
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::timeout(Duration::from_secs(1), process.terminate())
+            .await
+            .expect("force termination must not wait behind lifecycle work");
+        assert_eq!(process.status(), process::ProcessStatus::Terminated);
+        assert!(matches!(
+            initialize.await.unwrap(),
+            Err(ExternalError::Unavailable)
+        ));
+        assert!(matches!(
+            queued.await.unwrap(),
+            Err(ExternalError::Unavailable)
+        ));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_drains_queued_lifecycle_replies_without_writing_them() {
+        use std::fs;
+        let root = test_root("v6-shutdown-queue");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        ensure_test_state_base();
+        let mut module = descriptor();
+        module.id = format!("v6shutdownqueue{}", std::process::id());
+        module.module_dir = root.clone();
+        module.entrypoint = root.join("run");
+        write_v6_fixture(
+            &module.entrypoint,
+            "#!/usr/bin/env python3\nimport json, sys\nsys.stdin.readline()\nopen('received', 'w').close()\nframe = json.loads(sys.stdin.readline())\nassert frame['type'] == 'shutdown', frame\nopen('shutdown', 'w').close()\nsys.exit(0)\n",
+        );
+        let process = V6Process::start(module.clone(), Arc::new(RecordingExecutor::default()), 1)
+            .await
+            .unwrap();
+        let initialize = {
+            let process = process.clone();
+            let id = module.id.clone();
+            tokio::spawn(async move { process.initialize("1".to_owned(), id).await })
+        };
+        for _ in 0..100 {
+            if root.join("received").exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let queued = {
+            let process = process.clone();
+            tokio::spawn(async move {
+                process
+                    .execute("2".to_owned(), "go".to_owned(), String::new(), vec![])
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        process.graceful_shutdown().await.unwrap();
+        assert!(root.join("shutdown").exists());
+        assert_eq!(process.status(), process::ProcessStatus::Terminated);
+        assert!(matches!(
+            initialize.await.unwrap(),
+            Err(ExternalError::Unavailable)
+        ));
+        assert!(matches!(
+            queued.await.unwrap(),
+            Err(ExternalError::Unavailable)
+        ));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -2731,33 +2912,45 @@ sys.exit(0)
         ));
     }
 
-    #[test]
-    fn queued_request_has_no_deadline_until_dispatch() {
+    #[tokio::test]
+    async fn queued_request_has_no_deadline_until_dispatch() {
         // The sequential gate: a queued (not yet sent) lifecycle request must
         // not carry a deadline. Its timeout begins only when dispatch_lifecycle
         // actually writes it to the module stdin.
         let (writer, mut writer_rx) = mpsc::channel(8);
         let (reply, receiver) = oneshot::channel();
         let mut in_flight = None;
-        let before = Instant::now();
+        let enqueued_at = Instant::now();
+        let mut waiting = VecDeque::from([QueuedRequest {
+            frame: V6OutboundCoreFrame::Health {
+                request_id: "7".to_owned(),
+            },
+            expected: Expected::Health,
+            reply,
+        }]);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let queued = waiting.pop_front().expect("queued request");
+        let dispatched_at = Instant::now();
         dispatch_lifecycle(
             &mut in_flight,
             &writer,
-            V6OutboundCoreFrame::Health {
-                request_id: "7".to_owned(),
-            },
-            Expected::Health,
-            reply,
+            queued.frame,
+            queued.expected,
+            queued.reply,
         )
         .expect("dispatch must write the frame");
         let dispatched = in_flight.expect("in flight after dispatch");
         assert_eq!(dispatched.request_id, "7");
         // The deadline is anchored at dispatch time, not at enqueue time.
-        let expected = before + lifecycle_timeout();
+        let expected = dispatched_at + lifecycle_timeout();
         let window = Duration::from_millis(50);
         assert!(
             dispatched.deadline >= expected - window && dispatched.deadline <= expected + window,
             "deadline must start at dispatch"
+        );
+        assert!(
+            dispatched.deadline > enqueued_at + lifecycle_timeout() + window,
+            "queued time must not consume the lifecycle deadline"
         );
         // The frame reached the writer queue exactly once.
         assert!(matches!(
