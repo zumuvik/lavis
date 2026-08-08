@@ -74,7 +74,10 @@ impl ManagedProcess {
 
     fn descriptor(&self) -> Option<ExternalModuleDescriptor> {
         match self {
-            Self::Legacy(process) => process.try_lock().ok().map(|process| process.descriptor().clone()),
+            Self::Legacy(process) => process
+                .try_lock()
+                .ok()
+                .map(|process| process.descriptor().clone()),
             Self::V6(process) => Some(process.descriptor().clone()),
         }
     }
@@ -84,13 +87,17 @@ async fn shutdown_process(id: &str, process: ManagedProcess) {
     match process {
         ManagedProcess::Legacy(process) => {
             let mut process = process.lock().await;
-            if process.status() == ProcessStatus::Running && process.graceful_shutdown().await.is_err() {
+            if process.status() == ProcessStatus::Running
+                && process.graceful_shutdown().await.is_err()
+            {
                 tracing::warn!(event = "external_module_shutdown_forced", module_id = %id, "Forcefully terminating external module");
                 process.terminate().await;
             }
         }
         ManagedProcess::V6(process) => {
-            if process.status() == ProcessStatus::Running && process.graceful_shutdown().await.is_err() {
+            if process.status() == ProcessStatus::Running
+                && process.graceful_shutdown().await.is_err()
+            {
                 tracing::warn!(event = "external_module_shutdown_forced", module_id = %id, "Forcefully terminating external module");
                 process.terminate().await;
             }
@@ -208,7 +215,11 @@ impl ExternalManager {
         (process.status() == Some(ProcessStatus::Running))
             .then(|| process.descriptor())
             .flatten()
-            .and_then(|descriptor| descriptor.default_command.map(|command| (module_id.to_owned(), command)))
+            .and_then(|descriptor| {
+                descriptor
+                    .default_command
+                    .map(|command| (module_id.to_owned(), command))
+            })
     }
 
     pub fn command_refs(&self) -> Vec<ExternalCommandRef> {
@@ -217,7 +228,9 @@ impl ExternalManager {
             if process.status() != Some(ProcessStatus::Running) {
                 continue;
             }
-            let Some(desc) = process.descriptor() else { continue; };
+            let Some(desc) = process.descriptor() else {
+                continue;
+            };
             for cmd in desc.commands.iter().take(MAX_COMMANDS_PER_MODULE) {
                 refs.push(ExternalCommandRef {
                     module_id: desc.id.clone(),
@@ -304,7 +317,9 @@ impl ExternalRuntimeSnapshot {
             .filter(|process| process.status() == Some(ProcessStatus::Running))
             .filter_map(|process| {
                 let descriptor = process.descriptor()?;
-                descriptor.default_command.map(|command| (descriptor.id, command))
+                descriptor
+                    .default_command
+                    .map(|command| (descriptor.id, command))
             })
             .collect();
         Self {
@@ -360,30 +375,45 @@ impl ExternalManagerHandle {
         };
         for descriptor in descriptors {
             let id = descriptor.id.clone();
-            let process = match process_start_kind(descriptor.protocol_version, v6_executor.is_some()) {
-                Ok(ProcessStartKind::V6) => match v6_executor.clone() {
-                    Some(executor) => match V6Process::start(descriptor.clone(), executor).await {
-                        Ok(process) => match process.initialize(super::protocol::request_id(), id.clone()).await {
-                            Ok(super::protocol::V6InboundFrame::Initialized { module_id, .. }) if module_id == id => Ok(ManagedProcess::V6(process)),
-                            Ok(_) => { process.terminate().await; Err(ExternalError::ProtocolDecode) }
-                            Err(error) => { process.terminate().await; Err(error) }
-                        },
-                        Err(error) => Err(error),
+            let process =
+                match process_start_kind(descriptor.protocol_version, v6_executor.is_some()) {
+                    Ok(ProcessStartKind::V6) => match v6_executor.clone() {
+                        Some(executor) => {
+                            match V6Process::start(descriptor.clone(), executor).await {
+                                Ok(process) => match process
+                                    .initialize(super::protocol::request_id(), id.clone())
+                                    .await
+                                {
+                                    Ok(super::protocol::V6InboundFrame::Initialized {
+                                        module_id,
+                                        ..
+                                    }) if module_id == id => Ok(ManagedProcess::V6(process)),
+                                    Ok(_) => {
+                                        process.terminate().await;
+                                        Err(ExternalError::ProtocolDecode)
+                                    }
+                                    Err(error) => {
+                                        process.terminate().await;
+                                        Err(error)
+                                    }
+                                },
+                                Err(error) => Err(error),
+                            }
+                        }
+                        None => Err(ExternalError::Unavailable),
                     },
-                    None => Err(ExternalError::Unavailable),
-                },
-                Ok(ProcessStartKind::Legacy) => ModuleProcess::start_with_gateway(descriptor.clone(), gateway.clone())
-                    .await
-                    .map(|process| ManagedProcess::Legacy(Arc::new(Mutex::new(process)))),
-                Err(error) => Err(error),
-            };
+                    Ok(ProcessStartKind::Legacy) => {
+                        ModuleProcess::start_with_gateway(descriptor.clone(), gateway.clone())
+                            .await
+                            .map(|process| ManagedProcess::Legacy(Arc::new(Mutex::new(process))))
+                    }
+                    Err(error) => Err(error),
+                };
             match process {
                 Ok(process) => {
                     let replaced = {
                         let mut manager = self.inner.lock().await;
-                        manager
-                            .processes
-                            .insert(id.clone(), process)
+                        manager.processes.insert(id.clone(), process)
                     };
                     if let Some(replaced) = replaced {
                         shutdown_process(&id, replaced).await;
@@ -423,7 +453,11 @@ impl ExternalManagerHandle {
         match process {
             ManagedProcess::Legacy(process) => {
                 let mut process = process.lock().await;
-                if process.status() != ProcessStatus::Running || process.descriptor().protocol_version < 3 { return Err(ExternalError::Unavailable); }
+                if process.status() != ProcessStatus::Running
+                    || process.descriptor().protocol_version < 3
+                {
+                    return Err(ExternalError::Unavailable);
+                }
                 process.dispatch_event(event, payload).await
             }
             ManagedProcess::V6(process) => process.dispatch_event_result(event, payload).await,
@@ -445,11 +479,17 @@ impl ExternalManagerHandle {
         match process {
             ManagedProcess::Legacy(process) => {
                 let mut process = process.lock().await;
-                if process.status() != ProcessStatus::Running { return Err(ExternalError::Unavailable); }
-                process.execute_with_entities(command_name, arguments, argument_entities).await
+                if process.status() != ProcessStatus::Running {
+                    return Err(ExternalError::Unavailable);
+                }
+                process
+                    .execute_with_entities(command_name, arguments, argument_entities)
+                    .await
             }
             ManagedProcess::V6(process) => {
-                if process.status() != ProcessStatus::Running { return Err(ExternalError::Unavailable); }
+                if process.status() != ProcessStatus::Running {
+                    return Err(ExternalError::Unavailable);
+                }
                 process
                     .execute_command(command_name, arguments, argument_entities)
                     .await
@@ -460,7 +500,7 @@ impl ExternalManagerHandle {
 
 #[cfg(test)]
 mod tests {
-    use super::{process_start_kind, ExternalManager, ProcessStartKind};
+    use super::{ExternalManager, ProcessStartKind, process_start_kind};
     use crate::external_modules::manifest::{ExternalCommandDescriptor, ExternalModuleDescriptor};
     use std::path::PathBuf;
 

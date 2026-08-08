@@ -467,8 +467,16 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, V6ExecutorError> {
         if !last && (c_padding || d_padding) || c_padding && !d_padding {
             return Err(V6ExecutorError::InvalidParams("raw body is not base64"));
         }
-        let c = if c_padding { 0 } else { base64_value(chunk[2])? };
-        let d = if d_padding { 0 } else { base64_value(chunk[3])? };
+        let c = if c_padding {
+            0
+        } else {
+            base64_value(chunk[2])?
+        };
+        let d = if d_padding {
+            0
+        } else {
+            base64_value(chunk[3])?
+        };
         if c_padding && (b & 0x0f != 0) || d_padding && !c_padding && (c & 0x03 != 0) {
             return Err(V6ExecutorError::InvalidParams("raw body is not base64"));
         }
@@ -616,19 +624,24 @@ mod tests {
 
     #[test]
     fn raw_tl_result_uses_bounded_chunks() {
-        let value = raw_tl_result(2, vec![0u8; 16 * 1024])
-            .unwrap()
-            .into_value();
+        let value = raw_tl_result(2, vec![0u8; 16 * 1024]).unwrap().into_value();
         let chunks = value["body_base64_chunks"].as_array().unwrap();
         assert!(chunks.len() > 1);
-        assert!(chunks
-            .iter()
-            .all(|chunk| chunk.as_str().unwrap().len() <= RAW_BASE64_CHUNK_CHARS));
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.as_str().unwrap().len() <= RAW_BASE64_CHUNK_CHARS)
+        );
     }
 
     #[test]
     fn local_base64_codec_round_trips_padding_cases() {
-        for input in [b"a".as_slice(), b"ab".as_slice(), b"abc".as_slice(), b"abcd".as_slice()] {
+        for input in [
+            b"a".as_slice(),
+            b"ab".as_slice(),
+            b"abc".as_slice(),
+            b"abcd".as_slice(),
+        ] {
             let encoded = encode_base64(input);
             assert_eq!(decode_base64(&encoded).unwrap(), input);
         }
