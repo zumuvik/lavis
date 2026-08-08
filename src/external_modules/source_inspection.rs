@@ -1113,10 +1113,15 @@ mod tests {
     }
 
     fn v6_archive(method: &str) -> Vec<u8> {
+        let capabilities = if method == "raw.invoke" {
+            r#"["telegram.raw"]"#
+        } else {
+            "[]"
+        };
         let manifest = file(
             "module.json",
             format!(
-                "{{\"schema_version\":6,\"id\":\"raw\",\"name\":\"Raw\",\"version\":\"1\",\"author\":\"A\",\"entrypoint\":\"run\",\"capabilities\":[\"telegram.raw\"],\"telegram_methods\":[\"{method}\"],\"commands\":[{{\"name\":\"go\",\"summary_ru\":\"x\",\"description_ru\":\"x\",\"usage\":\"<value>\"}}]}}"
+                "{{\"schema_version\":6,\"id\":\"raw\",\"name\":\"Raw\",\"version\":\"1\",\"author\":\"A\",\"entrypoint\":\"run\",\"capabilities\":{capabilities},\"telegram_methods\":[\"{method}\"],\"commands\":[{{\"name\":\"go\",\"summary_ru\":\"x\",\"description_ru\":\"x\",\"usage\":\"<value>\"}}]}}"
             )
             .as_bytes(),
         );

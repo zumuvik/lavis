@@ -994,4 +994,83 @@ mod tests {
         .await
         .unwrap();
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervisor_kills_descendant_after_leader_exit() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        struct NoopExecutor;
+        impl V6TelegramExecutor for NoopExecutor {
+            fn execute<'a>(
+                &'a self,
+                _context: V6ExecutionContext,
+                _method: v6_registry::V6Method,
+                _params: Box<serde_json::value::RawValue>,
+            ) -> super::super::v6_executor::V6ExecutorFuture<'a> {
+                Box::pin(async { Err(V6ExecutorError::Transport) })
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "lavis-v6-descendant-{}-{}",
+            std::process::id(),
+            protocol::request_id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let entrypoint = root.join("run");
+        fs::write(
+            &entrypoint,
+            "#!/bin/sh\nsleep 30 &\necho $! > child.pid\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&entrypoint, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut module = descriptor();
+        module.id = format!("v6desc{}", std::process::id());
+        module.module_dir = root.clone();
+        module.entrypoint = entrypoint;
+        let process = V6Process::start(module, Arc::new(NoopExecutor))
+            .await
+            .unwrap();
+
+        let pid_path = root.join("child.pid");
+        for _ in 0..100 {
+            if pid_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let descendant: i32 = fs::read_to_string(&pid_path).unwrap().trim().parse().unwrap();
+
+        for _ in 0..100 {
+            if process.status() == super::super::process::ProcessStatus::Crashed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            process.status(),
+            super::super::process::ProcessStatus::Crashed
+        );
+
+        let mut alive = true;
+        for _ in 0..200 {
+            let result = unsafe { libc::kill(descendant, 0) };
+            alive = result == 0
+                || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+            if !alive {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if alive {
+            unsafe {
+                let _ = libc::kill(descendant, libc::SIGKILL);
+            }
+        }
+        let _ = fs::remove_dir_all(&root);
+        assert!(!alive, "descendant process survived v6 supervisor cleanup");
+    }
 }
