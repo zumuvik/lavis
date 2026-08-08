@@ -1946,7 +1946,7 @@ sys.exit(0)
         ensure_test_state_base();
         write_v6_fixture(
             &entrypoint,
-            "#!/usr/bin/env python3\nimport sys, time\nsys.stdin.readline()\nprint('{broken-json')\nsys.stdout.flush()\nprint('malformed-frame', file=sys.stderr)\nsys.stderr.flush()\ntime.sleep(30)\n",
+            "#!/usr/bin/env python3\nimport sys, time\nsys.stdin.readline()\nprint('malformed-frame', file=sys.stderr)\nsys.stderr.flush()\nprint('{broken-json')\nsys.stdout.flush()\ntime.sleep(30)\n",
         );
 
         let mut module = descriptor();
