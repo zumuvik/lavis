@@ -1,35 +1,27 @@
 # Module runtime roadmap
 
-This roadmap defines the order in which the external-module runtime should be
-stabilized and extended. The Priority 0 release gate is scoped to API v6;
-legacy diagnostics remain Priority 7 work and are not a PR #28 prerequisite.
+This roadmap tracks remaining work for the external-module runtime. Completed
+API v6 foundation and v6 observability milestones were removed after PR #28
+merged; Git history and `docs/module-api-v6.md` remain the implementation record.
 
 ## Current baseline
 
 Lavis currently has:
 
-- external module protocols v2-v5;
+- external module protocols v2-v6;
 - manifest validation and capability declarations;
 - `.lmod` inspection, staging, approval, atomic installation, and control UX;
 - persistent module state and declarative NixOS integration;
-- bounded process I/O, request correlation, lifecycle events, scheduler calls,
-  companion-bot calls, and Telegram gateway actions;
-- backwards-compatible discovery and command routing for installed modules.
-
-Draft PR #28 introduces the API v6 foundation:
-
-- a persistent module process supervisor;
-- strict v6 lifecycle and `telegram.invoke` frames;
-- bounded queues, pending requests, RPC workers, and shutdown handling;
-- an explicit `telegram.raw` capability;
-- curated typed Telegram helpers for common operations;
-- a stable `raw.invoke` escape hatch that forwards module-serialized TL request
-  bytes through Lavis' already-authorized Telegram sender and returns raw TL
-  response bytes;
-- a generated registry for typed helpers and the single stable raw gateway,
-  rather than a registry that must grow for every Telegram method;
-- a dedicated Telegram client/transport with retries and peer caching disabled;
-- a global RPC concurrency limit.
+- backwards-compatible discovery and command routing for installed modules;
+- a persistent API v6 module supervisor with strict lifecycle framing;
+- parentless `telegram.invoke` calls and curated typed Telegram helpers;
+- explicit `telegram.raw` plus the stable `raw.invoke` TL escape hatch;
+- generated v6 method metadata shared by manifest and runtime validation;
+- bounded lifecycle/RPC queues, concurrency, timeouts, shutdown handling, and
+  complete process-group termination;
+- retained v6 crash diagnostics, stderr/module-log capture, and user-facing
+  `lm info`, `lm logs`, and `lm doctor` diagnostics;
+- a dedicated Telegram client/transport and a global v6 RPC concurrency limit.
 
 The completeness rule for API v6 is:
 
@@ -40,99 +32,9 @@ Typed helpers are convenience and policy surfaces. They are not the ceiling of
 what a v6 module can do. A module that explicitly receives `telegram.raw` and
 the `raw.invoke` grant owns TL serialization/deserialization for raw calls.
 
-## Priority 0: module observability and failure recovery (v6 only)
-
-This work must land before expanding the curated helper surface.
-
-### Structured failure records
-
-Every v6 module termination must retain a bounded diagnostic record containing:
-
-- module ID and protocol version;
-- lifecycle stage: spawn, initialize, execute, event, health, RPC, or shutdown;
-- request ID or event kind when available;
-- stable error category;
-- process exit status or signal;
-- bounded and UTF-8-lossy stderr;
-- whether output was truncated;
-- timestamp and restart generation.
-
-Legacy v2-v5 remain supported; their retained-diagnostic backport stays
-Priority 7 work and is not a PR #28 prerequisite.
-
-Lavis must not intentionally include Telegram credentials, session data, raw
-access hashes, environment secrets, raw TL request/response bodies, or
-unrestricted request payloads. Module-controlled stderr remains untrusted text
-and may itself contain sensitive content; bounding and filtering it is not an
-absolute secrecy guarantee.
-
-### Runtime logging
-
-- Log failed lifecycle dispatches instead of discarding their results.
-- Forward valid module `log` frames into `tracing` with module metadata.
-- Log protocol decode failures with the frame type and validation category,
-  without dumping arbitrary untrusted payloads.
-- Preserve stderr after process exit instead of aborting and discarding the
-  capture task.
-- Distinguish clean shutdown, module-reported error, protocol violation,
-  timeout, transport failure, and unexpected child exit.
-
-### User-facing diagnostics
-
-Add commands equivalent to:
-
-```text
-,lm info <id>
-,lm logs <id>
-,lm doctor <id>
-```
-
-`lm info` must distinguish these states:
-
-- discovered;
-- installed and disabled;
-- enabled but not started;
-- running;
-- crashed;
-- invalid manifest;
-- missing module directory;
-- declaratively managed.
-
-A module developer must be able to identify a malformed `event_result`, a
-missing required field, a bad request ID, or stderr failure without using
-`strace` or reading Lavis source code.
-
-### Regression coverage
-
-Add process fixtures for:
-
-- malformed JSON;
-- missing required `actions` in `event_result`;
-- wrong request ID;
-- wrong module ID during initialization;
-- oversized line and result;
-- immediate process exit;
-- non-zero exit after successful initialization;
-- stderr before crash;
-- lifecycle event failure;
-- timeout and forced termination.
-
-### Acceptance gate
-
-Given a fixture that returns an invalid lifecycle response, Lavis must:
-
-1. mark the module as crashed;
-2. terminate and reap the complete process group;
-3. retain the bounded diagnostic record;
-4. emit a structured warning containing the exact failure category;
-5. expose the same category through `lm info` or `lm logs`;
-6. keep other modules and the Telegram update loop operational.
-
 ## Priority 0B: Telegram authorization diagnostics and session recovery
 
-Priority 0B is an independent authorization/session-recovery milestone. It is
-not an unconditional API v6 runtime or protocol gate, is not required for PR
-#28, and is not currently implemented merely because it is described here.
+This is an independent authorization/session-recovery milestone.
 
 Authorization failures must preserve an actionable, sanitized cause instead of
 collapsing every `Client::is_authorized()` failure into
@@ -230,94 +132,9 @@ Given an `AUTH_KEY_DUPLICATED` fixture, Lavis must:
 5. exit without repeatedly retrying the invalidated key;
 6. expose no credential or session secret in normal or debug output.
 
-## Priority 1: finish the API v6 foundation in PR #28
-
-### CI and source quality
-
-- Run `cargo fmt` and make formatting CI green.
-- Pass compilation, Clippy, unit tests, `nix flake check`, and package builds.
-- Add a CI check that regenerates `src/external_modules/v6_registry.rs` from
-  `tools/v6-methods.json` and fails on a dirty diff.
-- Keep protocols v2-v5 byte-compatible and covered by regression tests.
-
-### Supervisor correctness
-
-- Add end-to-end tests using a real v6 fixture process, not only helper-unit
-  tests.
-- Verify initialize, execute, event, health, concurrent RPC, timeout, shutdown,
-  EOF, and forced-kill paths.
-- Record the first terminal failure instead of collapsing all later requests
-  into `Unavailable`.
-- Make child exit status part of shutdown success criteria.
-- Provide a real force-termination operation; `terminate()` must not merely
-  retry graceful shutdown.
-- Define queue-full behavior explicitly. Temporary backpressure must not be
-  indistinguishable from a protocol crash.
-- Verify that dropped handles cannot leak a child, writer, reader, RPC worker,
-  or process group.
-- Retain and publish stderr and module log frames through the Priority 0
-  diagnostic path.
-
-### Protocol contract
-
-Create `docs/module-api-v6.md` covering:
-
-- lifecycle frame schemas;
-- parentless `telegram.invoke` and `telegram.result` correlation;
-- request-ID and call-ID requirements;
-- JSON depth, string, collection, line, and result limits;
-- queue, concurrency, and timeout semantics;
-- shutdown behavior;
-- error categories and retry expectations;
-- capability and typed-helper grant rules;
-- the `raw.invoke` request/response encoding and body-size limit;
-- responsibility for TL layer compatibility in raw modules;
-- compatibility guarantees for v2-v5.
-
-### Security gate
-
-API v6 deliberately has two Telegram access levels.
-
-Curated helpers:
-
-- require an explicit entry in `telegram_methods` under the current v6 manifest model;
-- do not require `telegram.raw`; that high-risk capability is reserved for `raw.invoke`;
-- use strict typed decoding with unknown fields rejected;
-- expose bounded, intentionally shaped outputs.
-
-Raw escape hatch:
-
-- is available only through the single stable `raw.invoke` grant;
-- requires the explicit high-risk `telegram.raw` capability;
-- accepts an opaque, bounded, 4-byte-aligned serialized TL request body;
-- sends it only through Lavis' existing authorized `SenderPoolHandle`;
-- returns opaque bounded TL response bytes;
-- may target an explicitly selected, bounded `dc_id`; this is not finite
-  known-DC validation;
-- Lavis does not transmit auth keys, session storage, the sender handle, or API
-  credentials through the Module API v6 IPC protocol;
-- never logs or persists raw TL bodies;
-- shares the same global concurrency, timeout, shutdown, and process-lifecycle
-  controls as typed helpers.
-
-The install plan and fingerprint must make both `telegram.raw` and `raw.invoke`
-visible. Granting `raw.invoke` means trusting the module to act with the
-Telegram authority of the signed-in account. The capability is an API/IPC
-authority guarantee, not an OS sandbox; capabilities are not a sandbox
-boundary.
-
-### Acceptance gate
-
-PR #28 can leave draft status only when all CI stages pass and a packaged v6
-fixture completes initialize, execute, event dispatch, one curated Telegram RPC,
-one `raw.invoke` call, health, and graceful shutdown under integration tests.
-
-A conformance fixture must also prove the completeness rule by successfully
-invoking a valid TL request that has no purpose-built Lavis adapter.
-
 ## Priority 2: API v6 alpha and module conformance kit
 
-After PR #28 is stable:
+With the v6 foundation merged:
 
 - freeze an alpha wire contract and publish examples;
 - provide a protocol conformance runner for third-party modules;
@@ -440,8 +257,7 @@ Every runtime or protocol PR must satisfy all applicable gates:
   `Unavailable`;
 - changes affecting Telegram authorization or session management preserve
   actionable sanitized authorization categories rather than collapsing
-  failures to `AuthorizationCheck`; unrelated runtime/protocol PRs are not
-  blocked by unfinished Priority 0B work.
+  failures to `AuthorizationCheck`.
 
 ## Explicit non-goals
 
