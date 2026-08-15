@@ -9,9 +9,7 @@
 Работает напрямую через MTProto, ориентирован на Linux и предоставляет полноценную декларативную интеграцию с NixOS.
 
 <p>
-  <a href="https://github.com/zumuvik/lavis/actions/workflows/ci.yml">
-    <img src="https://github.com/zumuvik/lavis/actions/workflows/ci.yml/badge.svg" alt="CI">
-  </a>
+  <a href="https://tangled.org/did:plc:xhzbac5le4gwflk4t6stjjgf/pipelines">CI pipelines</a>
   <a href="LICENSE">
     <img src="https://img.shields.io/badge/license-GPL--3.0--only-blue.svg" alt="GPL-3.0-only">
   </a>
@@ -67,10 +65,18 @@ Lavis — персональный Telegram userbot, написанный на R
 * `API ID`;
 * `API hash`.
 
-### 2. Запустите Lavis
+### 2. Подключите бинарный кэш Cachix
+
+Это позволит Nix скачивать готовые сборки Lavis вместо локальной сборки:
 
 ```bash
-nix run github:zumuvik/lavis
+nix run nixpkgs#cachix -- use lavis
+```
+
+### 3. Запустите Lavis
+
+```bash
+nix run 'git+ssh://git@tangled.org/did:plc:xhzbac5le4gwflk4t6stjjgf'
 ```
 
 При первом запуске Lavis запросит:
@@ -197,7 +203,7 @@ lavis modules status
 
 ```nix
 {
-  inputs.lavis.url = "github:zumuvik/lavis";
+  inputs.lavis.url = "git+ssh://git@tangled.org/did:plc:xhzbac5le4gwflk4t6stjjgf";
 }
 ```
 
@@ -304,7 +310,7 @@ lavis logout
 ## Разработка
 
 ```bash
-git clone https://github.com/zumuvik/lavis
+git clone git@tangled.org:did:plc:xhzbac5le4gwflk4t6stjjgf lavis
 cd lavis
 
 nix develop
