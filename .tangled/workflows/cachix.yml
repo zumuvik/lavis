@@ -1,0 +1,25 @@
+name: Cachix
+
+when:
+  - event: push
+    branch: ["main"]
+
+engine: nixery
+
+dependencies:
+  nixpkgs:
+    - bash
+    - nix
+    - cachix
+
+environment:
+  CACHIX_NAME: lavis
+
+steps:
+  - name: Build and publish cache outputs
+    command: |
+      bash <<'BASH'
+      set -euo pipefail
+      export CACHIX_AUTH_TOKEN="$cachix"
+      cachix watch-exec "$CACHIX_NAME" -- nix build --no-link --print-build-logs
+      BASH
