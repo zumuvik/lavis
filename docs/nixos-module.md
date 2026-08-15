@@ -18,7 +18,7 @@ Add the Lavis flake input and import the module:
 
 ```nix
 {
-  inputs.lavis.url = "github:zumuvik/lavis";
+  inputs.lavis.url = "git+ssh://git@tangled.org/did:plc:xhzbac5le4gwflk4t6stjjgf";
 
   outputs = { self, nixpkgs, lavis, ... }: {
     nixosConfigurations.host = nixpkgs.lib.nixosSystem {
