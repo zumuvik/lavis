@@ -9,7 +9,7 @@
 Работает напрямую через MTProto, ориентирован на Linux и предоставляет полноценную декларативную интеграцию с NixOS.
 
 <p>
-  <a href="https://tangled.org/did:plc:xhzbac5le4gwflk4t6stjjgf/pipelines">CI pipelines</a>
+  <a href="https://tangled.org/zumuvik.tngl.sh/lavis/pipelines">CI pipelines</a>
   <a href="LICENSE">
     <img src="https://img.shields.io/badge/license-GPL--3.0--only-blue.svg" alt="GPL-3.0-only">
   </a>
@@ -76,7 +76,7 @@ nix run nixpkgs#cachix -- use lavis
 ### 3. Запустите Lavis
 
 ```bash
-nix run 'git+ssh://git@tangled.org/did:plc:xhzbac5le4gwflk4t6stjjgf'
+nix run 'git+https://tangled.org/zumuvik.tngl.sh/lavis'
 ```
 
 При первом запуске Lavis запросит:
@@ -203,7 +203,7 @@ lavis modules status
 
 ```nix
 {
-  inputs.lavis.url = "git+ssh://git@tangled.org/did:plc:xhzbac5le4gwflk4t6stjjgf";
+  inputs.lavis.url = "git+https://tangled.org/zumuvik.tngl.sh/lavis";
 }
 ```
 
@@ -310,7 +310,7 @@ lavis logout
 ## Разработка
 
 ```bash
-git clone git@tangled.org:did:plc:xhzbac5le4gwflk4t6stjjgf lavis
+git clone https://tangled.org/zumuvik.tngl.sh/lavis
 cd lavis
 
 nix develop
