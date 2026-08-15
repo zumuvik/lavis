@@ -1,0 +1,95 @@
+name: CI
+
+when:
+  - event: push
+    branch: ["**"]
+  - event: pull_request
+    branch: ["**"]
+  - event: manual
+
+engine: nixery
+
+dependencies:
+  nixpkgs:
+    - bash
+    - coreutils
+    - git
+    - nix
+    - python3
+
+steps:
+  - name: Test GAF module and artifact
+    command: |
+      bash -euo pipefail <<'BASH'
+      cp modules/gaf/dist/gaf.lmod /tmp/gaf.lmod
+      nix develop -c bash -c 'set -euo pipefail; test -z "$(gofmt -l modules/gaf/*.go)"; cd modules/gaf; go test ./...; go vet ./...; ./build-lmod.sh'
+      python3 - <<'PY'
+      import zipfile
+
+      expected_names = ['module.json', 'gaf']
+      expected_modes = {'module.json': 0o600, 'gaf': 0o700}
+
+      def inspect(path):
+          with zipfile.ZipFile(path) as archive:
+              names = archive.namelist()
+              assert names == expected_names, (path, names)
+              assert all(
+                  item.compress_type == zipfile.ZIP_STORED
+                  for item in archive.infolist()
+              ), path
+              modes = {
+                  item.filename: (item.external_attr >> 16) & 0o777
+                  for item in archive.infolist()
+              }
+              assert modes == expected_modes, (path, modes)
+              return {name: archive.read(name) for name in expected_names}
+
+      committed = inspect('/tmp/gaf.lmod')
+      rebuilt = inspect('modules/gaf/dist/gaf.lmod')
+      assert committed == rebuilt, (
+          'committed gaf.lmod payload differs from the reproducible rebuild'
+      )
+      PY
+      BASH
+
+  - name: Check generated v6 registry
+    command: |
+      bash -euo pipefail <<'BASH'
+      python3 tools/generate_v6_registry.py --check
+      BASH
+
+  - name: Check formatting
+    command: |
+      bash -euo pipefail <<'BASH'
+      nix develop -c cargo fmt --check
+      BASH
+
+  - name: Check compilation
+    command: |
+      bash -euo pipefail <<'BASH'
+      nix develop -c cargo check --all-targets --all-features
+      BASH
+
+  - name: Run Clippy
+    command: |
+      bash -euo pipefail <<'BASH'
+      nix develop -c cargo clippy --all-targets --all-features -- -D warnings
+      BASH
+
+  - name: Run tests
+    command: |
+      bash -euo pipefail <<'BASH'
+      nix develop -c cargo test --all-targets --all-features
+      BASH
+
+  - name: Check flake
+    command: |
+      bash -euo pipefail <<'BASH'
+      nix flake check --print-build-logs
+      BASH
+
+  - name: Build package
+    command: |
+      bash -euo pipefail <<'BASH'
+      nix build --print-build-logs
+      BASH
