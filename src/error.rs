@@ -178,6 +178,14 @@ pub enum ClientError {
     OpenSession,
     #[error("failed to secure the local session database")]
     SecureSessionFile,
+    #[error("another Lavis process is already using the local Telegram session")]
+    SessionLocked,
+    #[error("failed to open the local session lock")]
+    OpenSessionLock,
+    #[error("failed to secure the local session lock")]
+    SecureSessionLock,
+    #[error("failed to lock the local Telegram session")]
+    LockSession,
     #[error("Telegram runner task failed")]
     RunnerTask,
     #[error("Telegram update stream has already been started")]

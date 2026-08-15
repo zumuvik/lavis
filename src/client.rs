@@ -8,7 +8,7 @@ use grammers_mtsender::{SenderPool, SenderPoolFatHandle};
 use grammers_session::storages::SqliteSession;
 use tokio::{sync::mpsc::UnboundedReceiver, task::JoinHandle};
 
-use crate::{config::Config, error::ClientError};
+use crate::{config::Config, error::ClientError, session::SessionLock};
 
 /// Dedicated Telegram transport exposed to the module RPC executor.
 ///
@@ -25,11 +25,13 @@ pub struct TelegramClient {
     module_rpc_handle: SenderPoolFatHandle,
     runner: JoinHandle<()>,
     updates: Option<UnboundedReceiver<grammers_session::updates::UpdatesLike>>,
+    session_lock: SessionLock,
 }
 
 impl TelegramClient {
     pub async fn connect(config: &Config) -> Result<Self, ClientError> {
         prepare_session_path(config.session_path.clone()).await?;
+        let session_lock = SessionLock::acquire(&config.session_path)?;
         let session = Arc::new(
             SqliteSession::open(&config.session_path)
                 .await
@@ -48,6 +50,7 @@ impl TelegramClient {
             module_rpc_handle,
             runner,
             updates: Some(pool.updates),
+            session_lock,
         })
     }
 
@@ -79,12 +82,15 @@ impl TelegramClient {
             module_rpc_handle,
             runner,
             updates,
+            session_lock,
         } = self;
         drop(updates);
         drop(module_rpc_handle);
         client.disconnect();
         drop(client);
-        runner.await.map_err(|_| ClientError::RunnerTask)
+        let result = runner.await.map_err(|_| ClientError::RunnerTask);
+        drop(session_lock);
+        result
     }
 }
 

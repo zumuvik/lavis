@@ -27,6 +27,7 @@ pub mod modules;
 pub mod reboot_receipt;
 pub mod response;
 pub mod runtime;
+pub mod session;
 pub mod settings;
 pub mod setup;
 pub mod setup_grammers;
