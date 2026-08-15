@@ -186,6 +186,16 @@ pub enum ClientError {
     SecureSessionLock,
     #[error("failed to lock the local Telegram session")]
     LockSession,
+    #[error("failed to inspect the local Telegram session")]
+    InspectSession,
+    #[error("session reset requires an interactive terminal")]
+    SessionResetNonInteractive,
+    #[error("local session storage has an unexpected file type")]
+    InvalidSessionFile,
+    #[error("failed to create the session backup directory")]
+    CreateSessionBackup,
+    #[error("failed to move local session storage into the backup directory")]
+    BackupSessionFile,
     #[error("Telegram runner task failed")]
     RunnerTask,
     #[error("Telegram update stream has already been started")]
@@ -200,8 +210,8 @@ pub enum AuthError {
     ReadInput,
     #[error("authorization input must not be empty")]
     EmptyInput,
-    #[error("failed to check Telegram authorization status")]
-    AuthorizationCheck,
+    #[error("failed to check Telegram authorization status ({0})")]
+    AuthorizationCheck(AuthorizationCheckFailure),
     #[error("failed to request a Telegram login code")]
     RequestLoginCode,
     #[error("Telegram sign-up must be completed in an official client")]
@@ -214,6 +224,43 @@ pub enum AuthError {
     SignIn,
     #[error("failed to retrieve the authorized Telegram account")]
     GetAuthorizedUser,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthorizationCheckFailure {
+    AuthKeyDuplicated,
+    Rpc { symbolic_name: String },
+    Unknown,
+}
+
+impl AuthorizationCheckFailure {
+    pub fn category(&self) -> &'static str {
+        match self {
+            Self::AuthKeyDuplicated => "auth_key_duplicated",
+            Self::Rpc { .. } => "rpc_error",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn is_auth_key_duplicated(&self) -> bool {
+        matches!(self, Self::AuthKeyDuplicated)
+    }
+}
+
+impl std::fmt::Display for AuthorizationCheckFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AuthKeyDuplicated => write!(formatter, "category: {}", self.category()),
+            Self::Rpc { symbolic_name } => {
+                write!(
+                    formatter,
+                    "category: {}, rpc: {symbolic_name}",
+                    self.category()
+                )
+            }
+            Self::Unknown => write!(formatter, "category: {}", self.category()),
+        }
+    }
 }
 
 #[derive(Debug, Error)]

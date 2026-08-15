@@ -33,19 +33,21 @@ pub const PASSWORD_NOTIFICATION: &str = "Пароль 2FA временно об�
 use std::io::{self, IsTerminal, Write};
 
 use grammers_client::{Client, SignInError};
+use grammers_mtsender::InvocationError;
 use grammers_session::types::PeerId;
 
-use crate::{config::Config, error::AuthError};
+use crate::{
+    config::Config,
+    error::{AuthError, AuthorizationCheckFailure},
+};
 
 pub async fn authorize(
     client: &Client,
     config: &Config,
 ) -> Result<AuthorizationOutcome, AuthError> {
-    let just_completed = if !client
-        .is_authorized()
-        .await
-        .map_err(|_| AuthError::AuthorizationCheck)?
-    {
+    let just_completed = if !client.is_authorized().await.map_err(|error| {
+        AuthError::AuthorizationCheck(classify_authorization_check_error(&error))
+    })? {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             return Err(AuthError::NonInteractive);
         }
@@ -95,6 +97,35 @@ pub async fn authorize(
         }
     };
     Ok(outcome)
+}
+
+fn classify_authorization_check_error(error: &InvocationError) -> AuthorizationCheckFailure {
+    match error {
+        InvocationError::Rpc(error) => classify_rpc_symbolic_name(&error.name),
+        _ => AuthorizationCheckFailure::Unknown,
+    }
+}
+
+fn classify_rpc_symbolic_name(name: &str) -> AuthorizationCheckFailure {
+    if name == "AUTH_KEY_DUPLICATED" {
+        return AuthorizationCheckFailure::AuthKeyDuplicated;
+    }
+    if is_safe_rpc_symbolic_name(name) {
+        AuthorizationCheckFailure::Rpc {
+            symbolic_name: name.to_owned(),
+        }
+    } else {
+        AuthorizationCheckFailure::Unknown
+    }
+}
+
+fn is_safe_rpc_symbolic_name(name: &str) -> bool {
+    const MAX_SYMBOLIC_NAME_LENGTH: usize = 64;
+    !name.is_empty()
+        && name.len() <= MAX_SYMBOLIC_NAME_LENGTH
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 async fn read_line(prompt: &'static str) -> Result<String, AuthError> {
@@ -164,8 +195,64 @@ fn display_name(user: &grammers_client::peer::User) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CREDENTIAL_NOTIFICATION, PASSWORD_NOTIFICATION, normalize_input, preserve_password_input,
+        CREDENTIAL_NOTIFICATION, PASSWORD_NOTIFICATION, classify_authorization_check_error,
+        classify_rpc_symbolic_name, normalize_input, preserve_password_input,
     };
+    use crate::error::AuthorizationCheckFailure;
+    use grammers_mtsender::{InvocationError, RpcError};
+    use std::io;
+
+    fn rpc_error(name: &str) -> InvocationError {
+        InvocationError::Rpc(RpcError {
+            code: 500,
+            name: name.to_owned(),
+            value: Some(123),
+            caused_by: Some(456),
+        })
+    }
+
+    #[test]
+    fn categorizes_auth_key_duplicated_for_recovery() {
+        let failure = classify_authorization_check_error(&rpc_error("AUTH_KEY_DUPLICATED"));
+        assert_eq!(failure, AuthorizationCheckFailure::AuthKeyDuplicated);
+        assert_eq!(failure.category(), "auth_key_duplicated");
+        assert_eq!(failure.to_string(), "category: auth_key_duplicated");
+        assert!(failure.is_auth_key_duplicated());
+    }
+
+    #[test]
+    fn retains_only_safe_rpc_symbolic_names() {
+        let failure = classify_rpc_symbolic_name("INTERNAL_SERVER_ERROR");
+        assert_eq!(
+            failure,
+            AuthorizationCheckFailure::Rpc {
+                symbolic_name: "INTERNAL_SERVER_ERROR".to_owned(),
+            }
+        );
+        assert_eq!(
+            failure.to_string(),
+            "category: rpc_error, rpc: INTERNAL_SERVER_ERROR"
+        );
+    }
+
+    #[test]
+    fn suppresses_hostile_or_malformed_dependency_error_text() {
+        for name in [
+            "AUTH_KEY_DUPLICATED\napi_hash=secret",
+            "auth_key_duplicated",
+            "A message with spaces",
+            "X".repeat(65).as_str(),
+        ] {
+            let failure = classify_rpc_symbolic_name(name);
+            assert_eq!(failure, AuthorizationCheckFailure::Unknown);
+            assert!(!failure.to_string().contains(name));
+        }
+        let failure = classify_authorization_check_error(&InvocationError::Io(io::Error::other(
+            "api_hash=secret",
+        )));
+        assert_eq!(failure, AuthorizationCheckFailure::Unknown);
+        assert!(!failure.to_string().contains("api_hash"));
+    }
 
     #[test]
     fn normalizes_non_empty_input() {

@@ -5,11 +5,11 @@ use std::{
     fs,
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
 pub mod aliases;
 pub mod auth;
@@ -73,6 +73,8 @@ pub async fn run() -> anyhow::Result<()> {
     match parse_cli(env::args_os().skip(1))? {
         CliCommand::Run => run_command(false).await,
         CliCommand::Auth => run_command(true).await,
+        CliCommand::AuthDoctor => auth_doctor().await,
+        CliCommand::AuthResetBackup => auth_reset_backup().await,
         CliCommand::Credentials => credentials_status().await,
         CliCommand::CredentialsReset => credentials_reset().await,
         CliCommand::Logout => logout().await,
@@ -87,6 +89,8 @@ pub async fn run() -> anyhow::Result<()> {
 enum CliCommand {
     Run,
     Auth,
+    AuthDoctor,
+    AuthResetBackup,
     Credentials,
     CredentialsReset,
     Logout,
@@ -106,6 +110,10 @@ fn parse_cli(arguments: impl IntoIterator<Item = OsString>) -> anyhow::Result<Cl
         [] => Ok(CliCommand::Run),
         [argument] if argument == "run" => Ok(CliCommand::Run),
         [argument] if argument == "auth" => Ok(CliCommand::Auth),
+        [auth, doctor] if auth == "auth" && doctor == "doctor" => Ok(CliCommand::AuthDoctor),
+        [auth, reset, backup] if auth == "auth" && reset == "reset" && backup == "--backup" => {
+            Ok(CliCommand::AuthResetBackup)
+        }
         [argument] if argument == "credentials" => Ok(CliCommand::Credentials),
         [credentials, reset] if credentials == "credentials" && reset == "reset" => {
             Ok(CliCommand::CredentialsReset)
@@ -130,7 +138,7 @@ fn parse_cli(arguments: impl IntoIterator<Item = OsString>) -> anyhow::Result<Cl
             })
         }
         _ => anyhow::bail!(
-            "usage: lavis [run|auth|credentials [reset]|logout|modules [validate <path>|enable <id>|disable <id>|status]]"
+            "usage: lavis [run|auth [doctor|reset --backup]|credentials [reset]|logout|modules [validate <path>|enable <id>|disable <id>|status]]"
         ),
     }
 }
@@ -393,9 +401,22 @@ fn authorization_failure(error: anyhow::Error, newly_saved: bool) -> anyhow::Err
             Some(AuthError::NonInteractive)
         )
     });
+    let auth_key_duplicated = error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<AuthError>(),
+            Some(AuthError::AuthorizationCheck(failure)) if failure.is_auth_key_duplicated()
+        )
+    });
     let error = if newly_saved {
         error.context(
             "new credentials were saved; if they are incorrect, run `lavis credentials reset`",
+        )
+    } else {
+        error
+    };
+    let error = if auth_key_duplicated {
+        error.context(
+            "the local Telegram authorization key was duplicated; run `lavis auth reset --backup` before authorizing again",
         )
     } else {
         error
@@ -507,6 +528,167 @@ async fn credentials_status() -> anyhow::Result<()> {
         Err(error) => return Err(error.into()),
     }
     Ok(())
+}
+
+async fn auth_doctor() -> anyhow::Result<()> {
+    let environment = |name: &str| std::env::var_os(name);
+    let session_path = config::ConfigPaths::state_session_path_with(&environment)?;
+    let report = tokio::task::spawn_blocking(move || session_doctor_report(&session_path))
+        .await
+        .map_err(|_| anyhow::anyhow!("session doctor task failed"))??;
+    println!("{report}");
+    Ok(())
+}
+
+async fn auth_reset_backup() -> anyhow::Result<()> {
+    require_interactive_session_reset(io::stdin().is_terminal(), io::stdout().is_terminal())?;
+    let environment = |name: &str| std::env::var_os(name);
+    let session_path = config::ConfigPaths::state_session_path_with(&environment)?;
+    let backup = tokio::task::spawn_blocking(move || reset_session_with_backup(&session_path))
+        .await
+        .map_err(|_| anyhow::anyhow!("session reset task failed"))??;
+
+    match backup {
+        Some(_) => println!("Local Telegram session moved to a private backup directory."),
+        None => println!("No local Telegram session files were found."),
+    }
+    Ok(())
+}
+
+fn require_interactive_session_reset(
+    stdin_is_terminal: bool,
+    stdout_is_terminal: bool,
+) -> Result<(), ClientError> {
+    if stdin_is_terminal && stdout_is_terminal {
+        Ok(())
+    } else {
+        Err(ClientError::SessionResetNonInteractive)
+    }
+}
+
+fn session_doctor_report(session_path: &Path) -> Result<String, ClientError> {
+    let lock_state = match session::lock_state(session_path)? {
+        session::SessionLockState::Locked => "locked",
+        session::SessionLockState::Unlocked => "unlocked",
+    };
+    let metadata = session_file_metadata(session_path)?;
+    Ok(format!(
+        "session path: {}\nlock state: {lock_state}\nsession file: type={}, mode={}, readable={}",
+        session_path.display(),
+        metadata.file_type,
+        metadata.mode,
+        metadata.readable,
+    ))
+}
+
+struct SessionFileMetadata {
+    file_type: &'static str,
+    mode: String,
+    readable: &'static str,
+}
+
+fn session_file_metadata(session_path: &Path) -> Result<SessionFileMetadata, ClientError> {
+    let metadata = match fs::symlink_metadata(session_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(SessionFileMetadata {
+                file_type: "absent",
+                mode: "not-applicable".to_owned(),
+                readable: "not-applicable",
+            });
+        }
+        Err(_) => return Err(ClientError::InspectSession),
+    };
+    let file_type = metadata.file_type();
+    let kind = if file_type.is_file() {
+        "regular"
+    } else if file_type.is_dir() {
+        "directory"
+    } else if file_type.is_symlink() {
+        "symlink"
+    } else {
+        "other"
+    };
+    let readable = if file_type.is_file() {
+        match fs::File::open(session_path) {
+            Ok(file) => {
+                drop(file);
+                "yes"
+            }
+            Err(_) => "no",
+        }
+    } else {
+        "not-applicable"
+    };
+    #[cfg(unix)]
+    let mode = format!("{:04o}", metadata.permissions().mode() & 0o777);
+    #[cfg(not(unix))]
+    let mode = "not-applicable".to_owned();
+
+    Ok(SessionFileMetadata {
+        file_type: kind,
+        mode,
+        readable,
+    })
+}
+
+fn reset_session_with_backup(session_path: &Path) -> Result<Option<PathBuf>, ClientError> {
+    let lock = session::SessionLock::acquire(session_path)?;
+    let files = session_files_for_backup(session_path)?;
+    if files.is_empty() {
+        drop(lock);
+        return Ok(None);
+    }
+
+    let parent = session_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or(ClientError::MissingSessionDirectory)?;
+    let backup = create_session_backup_directory(parent)?;
+    for source in files {
+        let name = source.file_name().ok_or(ClientError::InvalidSessionFile)?;
+        fs::rename(&source, backup.join(name)).map_err(|_| ClientError::BackupSessionFile)?;
+    }
+    drop(lock);
+    Ok(Some(backup))
+}
+
+fn session_files_for_backup(session_path: &Path) -> Result<Vec<PathBuf>, ClientError> {
+    let mut files = Vec::new();
+    for suffix in ["", "-journal", "-wal", "-shm"] {
+        let mut path = session_path.to_path_buf();
+        path.as_mut_os_string().push(suffix);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => files.push(path),
+            Ok(_) => return Err(ClientError::InvalidSessionFile),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return Err(ClientError::InspectSession),
+        }
+    }
+    Ok(files)
+}
+
+fn create_session_backup_directory(parent: &Path) -> Result<PathBuf, ClientError> {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ClientError::CreateSessionBackup)?;
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let backup = parent.join(format!(
+        "session-backup-{}-{}-{sequence}",
+        timestamp.as_secs(),
+        timestamp.subsec_nanos()
+    ));
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder
+        .create(&backup)
+        .map_err(|_| ClientError::CreateSessionBackup)?;
+    #[cfg(unix)]
+    fs::set_permissions(&backup, fs::Permissions::from_mode(0o700))
+        .map_err(|_| ClientError::CreateSessionBackup)?;
+    Ok(backup)
 }
 
 async fn logout() -> anyhow::Result<()> {
@@ -776,8 +958,10 @@ mod tests {
         AuthorizationOutcome, CliCommand, ClientError, NONINTERACTIVE_LOGOUT,
         NONINTERACTIVE_MISSING_CREDENTIALS, authorization_failure,
         combine_application_and_shutdown, logout_confirmed, parse_cli, remove_session_files,
-        render_quick_start, render_quick_start_fallback, should_show_quick_start,
+        render_quick_start, render_quick_start_fallback, require_interactive_session_reset,
+        reset_session_with_backup, session_doctor_report, should_show_quick_start,
     };
+    use crate::error::AuthorizationCheckFailure;
     use std::{
         ffi::OsString,
         fs,
@@ -799,6 +983,19 @@ mod tests {
             CliCommand::Auth
         );
         assert_eq!(
+            parse_cli(vec![OsString::from("auth"), OsString::from("doctor")]).unwrap(),
+            CliCommand::AuthDoctor
+        );
+        assert_eq!(
+            parse_cli(vec![
+                OsString::from("auth"),
+                OsString::from("reset"),
+                OsString::from("--backup"),
+            ])
+            .unwrap(),
+            CliCommand::AuthResetBackup
+        );
+        assert_eq!(
             parse_cli(vec![OsString::from("credentials")]).unwrap(),
             CliCommand::Credentials
         );
@@ -811,6 +1008,7 @@ mod tests {
             CliCommand::Logout
         );
         assert!(parse_cli(vec![OsString::from("auth"), OsString::from("extra")]).is_err());
+        assert!(parse_cli(vec![OsString::from("auth"), OsString::from("reset")]).is_err());
         assert!(
             parse_cli(vec![
                 OsString::from("credentials"),
@@ -820,6 +1018,104 @@ mod tests {
             .is_err()
         );
         assert!(parse_cli(vec![OsString::from("unknown")]).is_err());
+    }
+
+    #[test]
+    fn doctor_reports_only_safe_session_metadata() {
+        let directory = std::env::temp_dir().join(format!(
+            "lavis-auth-doctor-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let session = directory.join("session");
+
+        let report = session_doctor_report(&session).unwrap();
+        assert!(report.contains(&format!("session path: {}", session.display())));
+        assert!(report.contains("lock state: unlocked"));
+        assert!(report.contains("type=absent, mode=not-applicable, readable=not-applicable"));
+        assert!(!report.contains("api_hash"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn reset_requires_an_interactive_terminal() {
+        assert!(matches!(
+            require_interactive_session_reset(false, true),
+            Err(ClientError::SessionResetNonInteractive)
+        ));
+        assert!(matches!(
+            require_interactive_session_reset(true, false),
+            Err(ClientError::SessionResetNonInteractive)
+        ));
+        assert!(require_interactive_session_reset(true, true).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reset_moves_only_session_files_to_a_private_backup() {
+        let directory = std::env::temp_dir().join(format!(
+            "lavis-auth-reset-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let session = directory.join("session");
+        for suffix in ["", "-journal", "-wal", "-shm"] {
+            fs::write(format!("{}{}", session.display(), suffix), "session data").unwrap();
+        }
+        let unrelated = directory.join("settings.json");
+        fs::write(&unrelated, "persistent").unwrap();
+
+        let backup = reset_session_with_backup(&session).unwrap().unwrap();
+        assert_eq!(
+            fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for suffix in ["", "-journal", "-wal", "-shm"] {
+            assert!(!std::path::PathBuf::from(format!("{}{}", session.display(), suffix)).exists());
+            assert_eq!(
+                fs::read_to_string(backup.join(format!("session{suffix}"))).unwrap(),
+                "session data"
+            );
+        }
+        assert_eq!(fs::read_to_string(unrelated).unwrap(), "persistent");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reset_refuses_a_contended_session_without_mutation() {
+        let directory = std::env::temp_dir().join(format!(
+            "lavis-auth-reset-lock-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let session = directory.join("session");
+        fs::write(&session, "session data").unwrap();
+        let lock = crate::session::SessionLock::acquire(&session).unwrap();
+
+        assert!(matches!(
+            reset_session_with_backup(&session),
+            Err(ClientError::SessionLocked)
+        ));
+        assert_eq!(fs::read_to_string(&session).unwrap(), "session data");
+        assert!(fs::read_dir(&directory).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("session-backup-")
+        }));
+        drop(lock);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(unix)]
@@ -891,6 +1187,23 @@ mod tests {
         assert!(
             error.chain().any(|cause| cause.to_string()
                 == "Telegram authorization requires an interactive terminal")
+        );
+    }
+
+    #[test]
+    fn authorization_failure_explains_auth_key_duplication_recovery() {
+        let error = authorization_failure(
+            anyhow::Error::new(crate::error::AuthError::AuthorizationCheck(
+                AuthorizationCheckFailure::AuthKeyDuplicated,
+            )),
+            false,
+        );
+
+        assert!(error.to_string().contains("lavis auth reset --backup"));
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains("category: auth_key_duplicated"))
         );
     }
 

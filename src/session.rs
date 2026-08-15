@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+};
 
 use rustix::{
     fd::OwnedFd,
@@ -14,6 +17,12 @@ use crate::error::ClientError;
 /// the lock, while the stable path prevents replacement races between users.
 pub(crate) struct SessionLock {
     _file: OwnedFd,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionLockState {
+    Locked,
+    Unlocked,
 }
 
 impl SessionLock {
@@ -36,13 +45,28 @@ impl SessionLock {
     }
 }
 
+pub(crate) fn lock_state(session_path: &Path) -> Result<SessionLockState, ClientError> {
+    match fs::symlink_metadata(lock_path(session_path)) {
+        Ok(_) => match SessionLock::acquire(session_path) {
+            Ok(lock) => {
+                drop(lock);
+                Ok(SessionLockState::Unlocked)
+            }
+            Err(ClientError::SessionLocked) => Ok(SessionLockState::Locked),
+            Err(error) => Err(error),
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(SessionLockState::Unlocked),
+        Err(_) => Err(ClientError::InspectSession),
+    }
+}
+
 fn lock_path(session_path: &Path) -> PathBuf {
     session_path.with_extension("lock")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionLock, lock_path};
+    use super::{SessionLock, SessionLockState, lock_path, lock_state};
     use crate::error::ClientError;
     use std::{
         fs,
@@ -103,6 +127,22 @@ mod tests {
             Err(ClientError::OpenSessionLock)
         ));
         assert_eq!(fs::read_to_string(&target).unwrap(), "unrelated");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn reports_existing_lock_contention_without_modifying_the_lock() {
+        let directory = test_directory("state");
+        fs::create_dir(&directory).unwrap();
+        let session_path = directory.join("session");
+        let lock = SessionLock::acquire(&session_path).unwrap();
+
+        assert_eq!(lock_state(&session_path).unwrap(), SessionLockState::Locked);
+        drop(lock);
+        assert_eq!(
+            lock_state(&session_path).unwrap(),
+            SessionLockState::Unlocked
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 }
