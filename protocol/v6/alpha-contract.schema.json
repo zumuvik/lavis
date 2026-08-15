@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lavis.example/protocol/v6/alpha-contract.schema.json",
+  "title": "Lavis Module API v6 alpha contract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "protocol_version", "contract_revision", "timeout_start", "compatibility", "inbound", "outbound", "race_semantics"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "protocol_version": {"const": 6},
+    "contract_revision": {"type": "integer", "minimum": 1},
+    "timeout_start": {"enum": ["after_write_flush"]},
+    "compatibility": {"type": "string", "minLength": 1},
+    "inbound": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/inboundCase"}},
+    "outbound": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/outboundCase"}},
+    "race_semantics": {"type": "object", "additionalProperties": false, "required": ["duplicate_active_call_id", "cancellation", "shutdown"], "properties": {"duplicate_active_call_id":{"const":"protocol_violation"},"cancellation":{"const":"drain_active_lifecycle_log"},"shutdown":{"const":"discard_late_telegram_result"}}}
+  },
+  "$defs": {
+    "inboundCase": {"type":"object","additionalProperties":false,"required":["name","frame"],"properties":{"name":{"type":"string","minLength":1},"frame":{"type":"object"},"accepted":{"type":"boolean"},"module_accepted":{"type":"boolean"},"core_accepted":{"type":"boolean"}}},
+    "outboundCase": {"type":"object","additionalProperties":false,"required":["name","call_id","expected"],"properties":{"name":{"type":"string","minLength":1},"call_id":{"type":"string","minLength":1},"result":{},"error":{"type":"object","additionalProperties":false,"required":["kind","message","retry_after_seconds"],"properties":{"kind":{"type":"string"},"message":{"type":"string"},"retry_after_seconds":{"type":["integer","null"],"minimum":0}}},"expected":{"type":"object"}},"oneOf":[{"required":["result"]},{"required":["error"]}]}
+  }
+}

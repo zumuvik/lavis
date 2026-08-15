@@ -8,7 +8,11 @@ use grammers_mtsender::{SenderPool, SenderPoolFatHandle};
 use grammers_session::storages::SqliteSession;
 use tokio::{sync::mpsc::UnboundedReceiver, task::JoinHandle};
 
-use crate::{config::Config, error::ClientError, session::SessionLock};
+use crate::{
+    config::Config,
+    error::ClientError,
+    session::{SessionLock, SessionLockContext},
+};
 
 /// Dedicated Telegram transport exposed to the module RPC executor.
 ///
@@ -31,7 +35,8 @@ pub struct TelegramClient {
 impl TelegramClient {
     pub async fn connect(config: &Config) -> Result<Self, ClientError> {
         prepare_session_path(config.session_path.clone()).await?;
-        let session_lock = SessionLock::acquire(&config.session_path)?;
+        let session_lock = SessionLock::acquire(&config.session_path, SessionLockContext::Client)?;
+        validate_session_file_no_follow(config.session_path.clone()).await?;
         let session = Arc::new(
             SqliteSession::open(&config.session_path)
                 .await
@@ -94,6 +99,14 @@ impl TelegramClient {
     }
 }
 
+async fn validate_session_file_no_follow(session_path: PathBuf) -> Result<(), ClientError> {
+    tokio::task::spawn_blocking(move || {
+        crate::session::validate_session_file_no_follow(&session_path)
+    })
+    .await
+    .map_err(|_| ClientError::OpenSession)?
+}
+
 async fn prepare_session_path(session_path: PathBuf) -> Result<(), ClientError> {
     tokio::task::spawn_blocking(move || {
         let parent = session_path
@@ -130,4 +143,38 @@ async fn secure_session_file(session_path: PathBuf) -> Result<(), ClientError> {
     })
     .await
     .map_err(|_| ClientError::SecureSessionFile)?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_session_file_no_follow;
+    use crate::error::ClientError;
+    use std::{
+        fs,
+        os::unix::fs::symlink,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    #[tokio::test]
+    async fn rejects_a_symlink_before_opening_the_session_database() {
+        let directory = std::env::temp_dir().join(format!(
+            "lavis-client-session-symlink-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let target = directory.join("target");
+        fs::write(&target, "unrelated").unwrap();
+        let session = directory.join("session");
+        symlink(&target, &session).unwrap();
+
+        assert!(matches!(
+            validate_session_file_no_follow(session).await,
+            Err(ClientError::SessionSymlink)
+        ));
+        assert_eq!(fs::read_to_string(target).unwrap(), "unrelated");
+        fs::remove_dir_all(directory).unwrap();
+    }
 }

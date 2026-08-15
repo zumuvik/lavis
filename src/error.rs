@@ -176,6 +176,10 @@ pub enum ClientError {
     SecureSessionDirectory,
     #[error("failed to open the local session database")]
     OpenSession,
+    #[error("local session path must not be a symbolic link")]
+    SessionSymlink,
+    #[error("local session database is malformed")]
+    MalformedSession,
     #[error("failed to secure the local session database")]
     SecureSessionFile,
     #[error("another Lavis process is already using the local Telegram session")]
@@ -196,6 +200,10 @@ pub enum ClientError {
     CreateSessionBackup,
     #[error("failed to move local session storage into the backup directory")]
     BackupSessionFile,
+    #[error("failed to write the last authorization diagnostic")]
+    WriteAuthorizationDiagnostic,
+    #[error("failed to read the last authorization diagnostic")]
+    ReadAuthorizationDiagnostic,
     #[error("Telegram runner task failed")]
     RunnerTask,
     #[error("Telegram update stream has already been started")]
@@ -228,37 +236,103 @@ pub enum AuthError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthorizationCheckFailure {
-    AuthKeyDuplicated,
-    Rpc { symbolic_name: String },
+    AuthKeyDuplicated { code: i32, symbolic_name: String },
+    Rpc { code: i32, symbolic_name: String },
+    Timeout,
+    Transport,
+    SessionStorage,
+    MalformedLocalSession,
     Unknown,
 }
 
 impl AuthorizationCheckFailure {
     pub fn category(&self) -> &'static str {
         match self {
-            Self::AuthKeyDuplicated => "auth_key_duplicated",
+            Self::AuthKeyDuplicated { .. } => "auth_key_duplicated",
             Self::Rpc { .. } => "rpc_error",
+            Self::Timeout => "timeout",
+            Self::Transport => "transport",
+            Self::SessionStorage => "session_storage",
+            Self::MalformedLocalSession => "malformed_local_session",
             Self::Unknown => "unknown",
         }
     }
 
     pub fn is_auth_key_duplicated(&self) -> bool {
-        matches!(self, Self::AuthKeyDuplicated)
+        matches!(self, Self::AuthKeyDuplicated { .. })
     }
 }
 
 impl std::fmt::Display for AuthorizationCheckFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::AuthKeyDuplicated => write!(formatter, "category: {}", self.category()),
-            Self::Rpc { symbolic_name } => {
+            Self::AuthKeyDuplicated {
+                code,
+                symbolic_name,
+            } => write!(
+                formatter,
+                "category: {}, rpc_code: {code}, rpc: {symbolic_name}",
+                self.category()
+            ),
+            Self::Rpc {
+                code,
+                symbolic_name,
+            } => {
                 write!(
                     formatter,
-                    "category: {}, rpc: {symbolic_name}",
+                    "category: {}, rpc_code: {code}, rpc: {symbolic_name}",
                     self.category()
                 )
             }
+            Self::Timeout
+            | Self::Transport
+            | Self::SessionStorage
+            | Self::MalformedLocalSession => write!(formatter, "category: {}", self.category()),
             Self::Unknown => write!(formatter, "category: {}", self.category()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LastAuthorizationDiagnostic {
+    AuthKeyDuplicated,
+    RpcError,
+    Timeout,
+    Transport,
+    SessionStorage,
+    MalformedLocalSession,
+    InteractiveAuth,
+    Resolved,
+    Unknown,
+}
+
+impl LastAuthorizationDiagnostic {
+    pub fn category(self) -> &'static str {
+        match self {
+            Self::AuthKeyDuplicated => "auth_key_duplicated",
+            Self::RpcError => "rpc_error",
+            Self::Timeout => "timeout",
+            Self::Transport => "transport",
+            Self::SessionStorage => "session_storage",
+            Self::MalformedLocalSession => "malformed_local_session",
+            Self::InteractiveAuth => "interactive_auth",
+            Self::Resolved => "resolved",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn from_category(category: &str) -> Option<Self> {
+        match category {
+            "auth_key_duplicated" => Some(Self::AuthKeyDuplicated),
+            "rpc_error" => Some(Self::RpcError),
+            "timeout" => Some(Self::Timeout),
+            "transport" => Some(Self::Transport),
+            "session_storage" => Some(Self::SessionStorage),
+            "malformed_local_session" => Some(Self::MalformedLocalSession),
+            "interactive_auth" => Some(Self::InteractiveAuth),
+            "resolved" => Some(Self::Resolved),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
         }
     }
 }

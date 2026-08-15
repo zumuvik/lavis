@@ -26,6 +26,33 @@ All frames are one UTF-8 JSON object followed by `\n` on stdout/stdin. V6 uses
 `protocol_version: 6`. A line may not exceed 64 KiB (`MAX_LINE_BYTES`); longer
 lines are a protocol violation.
 
+## Alpha wire-contract fixture
+
+The independently consumable frozen artifact is
+`protocol/v6/alpha-contract.json`, with its schema at
+`protocol/v6/alpha-contract.schema.json`. `schema_version` governs the artifact
+format; `contract_revision` governs compatible v6-alpha clarifications; and an
+incompatible wire change requires a new `protocol_version`. The artifact covers
+both inbound and outbound JSON transcripts, including malformed frames and
+closing/timeout/shutdown semantics.
+
+V6 keeps distinct lifecycle and RPC deadlines even though alpha currently sets
+both to five seconds: lifecycle timeout begins after its frame is written and
+flushed, while RPC timeout applies to executor work. V2-v5 peers must never be
+sent v6 frames; compatible clarifications require a `contract_revision` bump.
+
+## Conformance runner
+
+`lavis-v6-conformance <executable> [arguments...]` embeds the frozen alpha
+contract, launches the supplied module with piped stdin/stdout, drives
+initialize/health/shutdown, and validates every received frame through Lavis'
+production v6 parser. During lifecycle waits it deterministically services
+module-initiated curated and `raw.invoke` calls with contract-shaped results.
+The mandatory lifecycle transcript is initialize, execute, event, health, then
+shutdown; every lifecycle response must carry the matching request ID, and the
+initialized response must echo module ID `conformance`. Each response read has a
+five-second deadline; malformed or uncorrelated frames fail conformance.
+
 Lifecycle frames use decimal `request_id` values of 1-64 ASCII digits. A
 lifecycle request has exactly one matching response; mismatched or duplicate
 request IDs are a protocol violation. Parentless Telegram calls use independent
@@ -113,6 +140,10 @@ or a sanitized error:
   }
 }
 ```
+
+RPC errors are not retried by the module protocol. V6 alpha error frames contain
+only the sanitized `kind` and `message` fields; no retry delay or retryability
+metadata is promised. Modules must not infer a retry policy from error text.
 
 Call IDs must be unique while a call is active. Duplicate active call IDs are a
 protocol violation.

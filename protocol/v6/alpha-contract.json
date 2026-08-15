@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "protocol_version": 6,
+  "contract_revision": 1,
+  "timeout_start": "after_write_flush",
+  "compatibility": "v6-only; incompatible wire changes require a new protocol_version",
+  "inbound": [
+    {"name":"lifecycle_initialized","frame":{"protocol_version":6,"type":"initialized","request_id":"1","module_id":"sample"},"accepted":true},
+    {"name":"lifecycle_result","frame":{"protocol_version":6,"type":"result","request_id":"2","text":"ok"},"accepted":true},
+    {"name":"lifecycle_error","frame":{"protocol_version":6,"type":"error","request_id":"2","code":"failed","message":"safe failure"},"accepted":true},
+    {"name":"raw_invoke","frame":{"protocol_version":6,"type":"telegram.invoke","call_id":"raw-1","method":"raw.invoke","params":{"body_base64_chunks":["eFY0Eg=="]}},"module_accepted":true},
+    {"name":"malformed_unknown_field","frame":{"protocol_version":6,"type":"health","request_id":"3","unexpected":true},"accepted":false},
+    {"name":"malformed_request_id","frame":{"protocol_version":6,"type":"health","request_id":"bad id"},"accepted":false},
+    {"name":"core_success","frame":{"protocol_version":6,"type":"telegram.result","call_id":"rpc-1","ok":true,"result":{}},"core_accepted":true},
+    {"name":"core_error_retry","frame":{"protocol_version":6,"type":"telegram.result","call_id":"rpc-2","ok":false,"error":{"kind":"rpc","message":"Telegram RPC request failed"}},"core_accepted":true}
+  ],
+  "outbound": [
+    {"name":"core_success","call_id":"rpc-1","result":{},"expected":{"protocol_version":6,"type":"telegram.result","call_id":"rpc-1","ok":true,"result":{}}},
+    {"name":"core_error","call_id":"rpc-2","error":{"kind":"rpc","message":"Telegram RPC request failed","retry_after_seconds":null},"expected":{"protocol_version":6,"type":"telegram.result","call_id":"rpc-2","ok":false,"error":{"kind":"rpc","message":"Telegram RPC request failed","code":null,"name":null,"retry_after_seconds":null}}}
+  ],
+  "race_semantics": {
+    "duplicate_active_call_id":"protocol_violation",
+    "cancellation":"drain_active_lifecycle_log",
+    "shutdown":"discard_late_telegram_result"
+  }
+}

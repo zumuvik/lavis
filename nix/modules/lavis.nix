@@ -467,6 +467,7 @@ in
         XDG_STATE_HOME = stateHome;
         XDG_DATA_HOME = dataHome;
         RUST_LOG = cfg.logLevel;
+        LAVIS_SERVICE = "1";
       };
 
       preStart = "${setupScript}";
@@ -478,6 +479,9 @@ in
         Group = serviceGroup;
         WorkingDirectory = effectiveHome;
         Restart = "on-failure";
+        # Status 78 means local interactive reauthorization is required; retrying
+        # cannot recover it and would only create a restart loop.
+        RestartPreventExitStatus = "78";
         RestartSec = "5s";
         EnvironmentFile = optional (cfg.credentialsEnvironmentFile != null) cfg.credentialsEnvironmentFile;
       };

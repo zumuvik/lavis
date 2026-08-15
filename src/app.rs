@@ -9,7 +9,7 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 
 pub mod aliases;
 pub mod auth;
@@ -85,6 +85,15 @@ pub async fn run() -> anyhow::Result<()> {
     }
 }
 
+pub fn requires_reauthorization(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<AuthError>(),
+            Some(AuthError::AuthorizationCheck(failure)) if failure.is_auth_key_duplicated()
+        )
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliCommand {
     Run,
@@ -152,9 +161,35 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
         .context("failed to determine application paths")?;
     let config = config::Config::from_credentials(resolved.credentials, paths)
         .context("failed to load configuration")?;
-    let client = client::TelegramClient::connect(&config)
-        .await
-        .context("failed to open the Telegram session")?;
+    let client = match client::TelegramClient::connect(&config).await {
+        Ok(client) => client,
+        Err(error) => {
+            if matches!(
+                &error,
+                ClientError::OpenSession | ClientError::MalformedSession
+            ) {
+                let malformed = matches!(&error, ClientError::MalformedSession);
+                let session_path = config.session_path.clone();
+                let persisted = tokio::task::spawn_blocking(move || {
+                    if malformed || session::has_invalid_sqlite_header(&session_path)? {
+                        session::write_last_authorization_diagnostic(
+                            &session_path,
+                            crate::error::LastAuthorizationDiagnostic::MalformedLocalSession,
+                        )?;
+                    }
+                    Ok::<(), ClientError>(())
+                })
+                .await;
+                if !matches!(persisted, Ok(Ok(()))) {
+                    tracing::warn!(
+                        event = "authorization_diagnostic_persist_failed",
+                        "Could not persist sanitized authorization diagnostic"
+                    );
+                }
+            }
+            return Err(anyhow::Error::new(error).context("failed to open the Telegram session"));
+        }
+    };
     let mut guard = TelegramClientGuard::new(client);
     let mut external_handle = None;
     let application_result = async {
@@ -164,11 +199,64 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
             .context("failed to load persistent settings")?;
         let prefix = settings.prefix().to_owned();
 
-        let outcome = auth::authorize(guard.inner().client(), &config)
-            .await
-            .context("Telegram authorization failed")
-            .map_err(|error| authorization_failure(error, newly_saved))?;
-
+        let outcome = match auth::authorize(guard.inner().client(), &config).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let diagnostic = auth::last_authorization_diagnostic(&error);
+                if let AuthError::AuthorizationCheck(
+                    crate::error::AuthorizationCheckFailure::Rpc {
+                        code,
+                        symbolic_name,
+                    }
+                    | crate::error::AuthorizationCheckFailure::AuthKeyDuplicated {
+                        code,
+                        symbolic_name,
+                    },
+                ) = &error
+                {
+                    tracing::warn!(
+                        event = "authorization_check_failed",
+                        category = diagnostic.category(),
+                        rpc_code = *code,
+                        rpc_name = %symbolic_name,
+                        "Telegram authorization check failed"
+                    );
+                } else {
+                    tracing::warn!(
+                        event = "authorization_check_failed",
+                        category = diagnostic.category(),
+                        "Telegram authorization check failed"
+                    );
+                }
+                let session_path = config.session_path.clone();
+                if !matches!(tokio::task::spawn_blocking(move || {
+                    session::write_last_authorization_diagnostic(&session_path, diagnostic)
+                })
+                .await, Ok(Ok(()))) {
+                    tracing::warn!(
+                        event = "authorization_diagnostic_persist_failed",
+                        "Could not persist sanitized authorization diagnostic"
+                    );
+                }
+                return Err(authorization_failure(
+                    anyhow::Error::new(error).context("Telegram authorization failed"),
+                    newly_saved,
+                ));
+            }
+        };
+        let session_path = config.session_path.clone();
+        if !matches!(tokio::task::spawn_blocking(move || {
+            session::write_last_authorization_diagnostic(
+                &session_path,
+                crate::error::LastAuthorizationDiagnostic::Resolved,
+            )
+        })
+        .await, Ok(Ok(()))) {
+            tracing::warn!(
+                event = "authorization_diagnostic_persist_failed",
+                "Could not persist sanitized authorization diagnostic"
+            );
+        }
         if should_show_quick_start(&outcome) {
             let quick_start = render_quick_start(&prefix);
             if let Err(error) = guard
@@ -416,7 +504,7 @@ fn authorization_failure(error: anyhow::Error, newly_saved: bool) -> anyhow::Err
     };
     let error = if auth_key_duplicated {
         error.context(
-            "the local Telegram authorization key was duplicated; run `lavis auth reset --backup` before authorizing again",
+            "Telegram invalidated this authorization key; the current local session cannot retry. Run `lavis auth reset --backup` before authorizing again",
         )
     } else {
         error
@@ -549,7 +637,10 @@ async fn auth_reset_backup() -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("session reset task failed"))??;
 
     match backup {
-        Some(_) => println!("Local Telegram session moved to a private backup directory."),
+        Some(path) => println!(
+            "Local Telegram session moved to private backup directory: {}",
+            path.display()
+        ),
         None => println!("No local Telegram session files were found."),
     }
     Ok(())
@@ -567,17 +658,45 @@ fn require_interactive_session_reset(
 }
 
 fn session_doctor_report(session_path: &Path) -> Result<String, ClientError> {
-    let lock_state = match session::lock_state(session_path)? {
-        session::SessionLockState::Locked => "locked",
-        session::SessionLockState::Unlocked => "unlocked",
+    let lock_state = match session::lock_state(session_path) {
+        Ok(session::SessionLockState::Locked(Some(holder))) => {
+            format!("locked (pid={}, context={})", holder.pid, holder.context)
+        }
+        Ok(session::SessionLockState::Locked(None)) => "locked".to_owned(),
+        Ok(session::SessionLockState::Unlocked) => "unlocked".to_owned(),
+        Err(_) => "unavailable".to_owned(),
     };
-    let metadata = session_file_metadata(session_path)?;
+    let metadata = session_file_metadata(session_path).unwrap_or(SessionFileMetadata {
+        file_type: "unavailable",
+        mode: "unavailable".to_owned(),
+        readable: "unavailable",
+        owner: "unavailable".to_owned(),
+    });
+    let diagnostic = match session::read_last_authorization_diagnostic(session_path) {
+        Ok(session::StoredAuthorizationDiagnostic::Absent) => "absent".to_owned(),
+        Ok(session::StoredAuthorizationDiagnostic::Present(diagnostic)) => {
+            diagnostic.category().to_owned()
+        }
+        Ok(session::StoredAuthorizationDiagnostic::Invalid) => "invalid".to_owned(),
+        Err(_) => "unavailable".to_owned(),
+    };
+    let sidecars = session_sidecar_status(session_path);
+    let execution = if std::env::var_os("LAVIS_SERVICE").is_some() {
+        "service"
+    } else {
+        "interactive"
+    };
+    let reauthorization = matches!(
+        diagnostic.as_str(),
+        "auth_key_duplicated" | "malformed_local_session"
+    );
     Ok(format!(
-        "session path: {}\nlock state: {lock_state}\nsession file: type={}, mode={}, readable={}",
+        "session path: {}\nlock state: {lock_state}\nsession file: type={}, mode={}, readable={}, owner={}\nsession sidecars: {sidecars}\nlast authorization diagnostic: {diagnostic}\nreauthorization required: {reauthorization}\nexecution context: {execution}",
         session_path.display(),
         metadata.file_type,
         metadata.mode,
         metadata.readable,
+        metadata.owner,
     ))
 }
 
@@ -585,6 +704,7 @@ struct SessionFileMetadata {
     file_type: &'static str,
     mode: String,
     readable: &'static str,
+    owner: String,
 }
 
 fn session_file_metadata(session_path: &Path) -> Result<SessionFileMetadata, ClientError> {
@@ -595,6 +715,7 @@ fn session_file_metadata(session_path: &Path) -> Result<SessionFileMetadata, Cli
                 file_type: "absent",
                 mode: "not-applicable".to_owned(),
                 readable: "not-applicable",
+                owner: "not-applicable".to_owned(),
             });
         }
         Err(_) => return Err(ClientError::InspectSession),
@@ -622,35 +743,72 @@ fn session_file_metadata(session_path: &Path) -> Result<SessionFileMetadata, Cli
     };
     #[cfg(unix)]
     let mode = format!("{:04o}", metadata.permissions().mode() & 0o777);
+    #[cfg(unix)]
+    let owner = format!("uid={},gid={}", metadata.uid(), metadata.gid());
     #[cfg(not(unix))]
     let mode = "not-applicable".to_owned();
+    #[cfg(not(unix))]
+    let owner = "not-applicable".to_owned();
 
     Ok(SessionFileMetadata {
         file_type: kind,
         mode,
         readable,
+        owner,
     })
 }
 
+fn session_sidecar_status(session_path: &Path) -> String {
+    ["-journal", "-wal", "-shm"]
+        .into_iter()
+        .map(|suffix| {
+            let mut path = session_path.to_path_buf();
+            path.as_mut_os_string().push(suffix);
+            match fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_file() => format!("{suffix}=present"),
+                Ok(_) => format!("{suffix}=unsafe"),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => format!("{suffix}=absent"),
+                Err(_) => format!("{suffix}=unavailable"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn reset_session_with_backup(session_path: &Path) -> Result<Option<PathBuf>, ClientError> {
-    let lock = session::SessionLock::acquire(session_path)?;
+    let lock = session::SessionLock::acquire(session_path, session::SessionLockContext::Reset)?;
+    let parent = session_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or(ClientError::MissingSessionDirectory)?;
+    recover_staged_session_backups(parent, session_path)?;
     let files = session_files_for_backup(session_path)?;
     if files.is_empty() {
         drop(lock);
         return Ok(None);
     }
-
-    let parent = session_path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .ok_or(ClientError::MissingSessionDirectory)?;
     let backup = create_session_backup_directory(parent)?;
+    let mut moved = Vec::new();
     for source in files {
         let name = source.file_name().ok_or(ClientError::InvalidSessionFile)?;
-        fs::rename(&source, backup.join(name)).map_err(|_| ClientError::BackupSessionFile)?;
+        let target = backup.join(name);
+        if fs::rename(&source, &target).is_err() {
+            for (source, target) in moved.into_iter().rev() {
+                fs::rename(target, source).map_err(|_| ClientError::BackupSessionFile)?;
+            }
+            fs::remove_dir(&backup).map_err(|_| ClientError::BackupSessionFile)?;
+            return Err(ClientError::BackupSessionFile);
+        }
+        moved.push((source, target));
+        sync_directory(parent)?;
+        sync_directory(&backup)?;
     }
+    sync_directory(&backup)?;
+    sync_directory(parent)?;
+    let published_backup = publish_session_backup(&backup)?;
+    sync_directory(parent)?;
     drop(lock);
-    Ok(Some(backup))
+    Ok(Some(published_backup))
 }
 
 fn session_files_for_backup(session_path: &Path) -> Result<Vec<PathBuf>, ClientError> {
@@ -675,7 +833,7 @@ fn create_session_backup_directory(parent: &Path) -> Result<PathBuf, ClientError
         .map_err(|_| ClientError::CreateSessionBackup)?;
     let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let backup = parent.join(format!(
-        "session-backup-{}-{}-{sequence}",
+        ".session-backup-{}-{}-{sequence}.staging",
         timestamp.as_secs(),
         timestamp.subsec_nanos()
     ));
@@ -689,6 +847,70 @@ fn create_session_backup_directory(parent: &Path) -> Result<PathBuf, ClientError
     fs::set_permissions(&backup, fs::Permissions::from_mode(0o700))
         .map_err(|_| ClientError::CreateSessionBackup)?;
     Ok(backup)
+}
+
+fn publish_session_backup(staging: &Path) -> Result<PathBuf, ClientError> {
+    let parent = staging.parent().ok_or(ClientError::CreateSessionBackup)?;
+    let name = staging
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix('.'))
+        .and_then(|name| name.strip_suffix(".staging"))
+        .ok_or(ClientError::CreateSessionBackup)?;
+    let published = parent.join(name);
+    fs::rename(staging, &published).map_err(|_| ClientError::CreateSessionBackup)?;
+    Ok(published)
+}
+
+fn recover_staged_session_backups(parent: &Path, session_path: &Path) -> Result<(), ClientError> {
+    let session_name = session_path
+        .file_name()
+        .ok_or(ClientError::MissingSessionDirectory)?;
+    for entry in fs::read_dir(parent).map_err(|_| ClientError::BackupSessionFile)? {
+        let entry = entry.map_err(|_| ClientError::BackupSessionFile)?;
+        let name = entry.file_name();
+        let name_text = name.to_string_lossy();
+        if !name_text.starts_with(".session-backup-") || !name_text.ends_with(".staging") {
+            continue;
+        }
+        let metadata = entry
+            .metadata()
+            .map_err(|_| ClientError::BackupSessionFile)?;
+        if !metadata.is_dir() {
+            return Err(ClientError::BackupSessionFile);
+        }
+        for child in fs::read_dir(entry.path()).map_err(|_| ClientError::BackupSessionFile)? {
+            let child = child.map_err(|_| ClientError::BackupSessionFile)?;
+            let child_name = child.file_name();
+            let allowed = ["", "-journal", "-wal", "-shm"].iter().any(|suffix| {
+                let mut expected = session_name.to_os_string();
+                expected.push(suffix);
+                child_name == expected
+            });
+            if !allowed
+                || !child
+                    .metadata()
+                    .map_err(|_| ClientError::BackupSessionFile)?
+                    .is_file()
+            {
+                return Err(ClientError::BackupSessionFile);
+            }
+            let target = parent.join(&child_name);
+            if target.exists() {
+                return Err(ClientError::BackupSessionFile);
+            }
+            fs::rename(child.path(), target).map_err(|_| ClientError::BackupSessionFile)?;
+        }
+        fs::remove_dir(entry.path()).map_err(|_| ClientError::BackupSessionFile)?;
+        sync_directory(parent)?;
+    }
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> Result<(), ClientError> {
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| ClientError::BackupSessionFile)
 }
 
 async fn logout() -> anyhow::Result<()> {
@@ -723,6 +945,7 @@ fn logout_confirmed(answer: &str) -> bool {
 }
 
 fn remove_session_files(session: &Path) -> anyhow::Result<()> {
+    let lock = session::SessionLock::acquire(session, session::SessionLockContext::Logout)?;
     for suffix in ["", "-journal", "-wal", "-shm"] {
         let mut path = session.to_path_buf();
         path.as_mut_os_string().push(suffix);
@@ -732,6 +955,7 @@ fn remove_session_files(session: &Path) -> anyhow::Result<()> {
             Err(error) => return Err(error.into()),
         }
     }
+    drop(lock);
     Ok(())
 }
 
@@ -1036,6 +1260,30 @@ mod tests {
         assert!(report.contains(&format!("session path: {}", session.display())));
         assert!(report.contains("lock state: unlocked"));
         assert!(report.contains("type=absent, mode=not-applicable, readable=not-applicable"));
+        assert!(report.contains("last authorization diagnostic: absent"));
+        assert!(!report.contains("api_hash"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn doctor_exposes_the_last_sanitized_authorization_diagnostic_offline() {
+        let directory = std::env::temp_dir().join(format!(
+            "lavis-auth-doctor-diagnostic-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let session = directory.join("session");
+        crate::session::write_last_authorization_diagnostic(
+            &session,
+            crate::error::LastAuthorizationDiagnostic::Timeout,
+        )
+        .unwrap();
+
+        let report = session_doctor_report(&session).unwrap();
+        assert!(report.contains("last authorization diagnostic: timeout"));
         assert!(!report.contains("api_hash"));
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1087,6 +1335,30 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    #[test]
+    fn reset_recovers_an_interrupted_staged_backup_before_retrying() {
+        let directory = std::env::temp_dir().join(format!(
+            "lavis-auth-reset-recovery-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let session = directory.join("session");
+        let staging = directory.join(".session-backup-interrupted.staging");
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("session"), "session data").unwrap();
+
+        let backup = reset_session_with_backup(&session).unwrap().unwrap();
+        assert_eq!(
+            fs::read_to_string(backup.join("session")).unwrap(),
+            "session data"
+        );
+        assert!(!staging.exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn reset_refuses_a_contended_session_without_mutation() {
@@ -1100,7 +1372,11 @@ mod tests {
         fs::create_dir(&directory).unwrap();
         let session = directory.join("session");
         fs::write(&session, "session data").unwrap();
-        let lock = crate::session::SessionLock::acquire(&session).unwrap();
+        let lock = crate::session::SessionLock::acquire(
+            &session,
+            crate::session::SessionLockContext::Client,
+        )
+        .unwrap();
 
         assert!(matches!(
             reset_session_with_backup(&session),
@@ -1194,7 +1470,10 @@ mod tests {
     fn authorization_failure_explains_auth_key_duplication_recovery() {
         let error = authorization_failure(
             anyhow::Error::new(crate::error::AuthError::AuthorizationCheck(
-                AuthorizationCheckFailure::AuthKeyDuplicated,
+                AuthorizationCheckFailure::AuthKeyDuplicated {
+                    code: 500,
+                    symbolic_name: "AUTH_KEY_DUPLICATED".to_owned(),
+                },
             )),
             false,
         );

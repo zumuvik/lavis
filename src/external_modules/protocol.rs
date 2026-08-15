@@ -12,6 +12,8 @@ pub const MAX_REACTIONS_PER_ACTION: usize = 3;
 pub const V6_MAX_JSON_DEPTH: usize = 8;
 pub const V6_MAX_JSON_STRING_BYTES: usize = 8 * 1024;
 pub const V6_MAX_JSON_COLLECTION_ITEMS: usize = 64;
+pub const V6_ALPHA_CONTRACT_REVISION: u32 = 1;
+pub const V6_TIMEOUT_START: &str = "after_write_flush";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CustomEmojiEntity {
@@ -116,6 +118,9 @@ pub enum V6ModuleFrame {
 pub struct V6CallError {
     pub kind: String,
     pub message: String,
+    pub code: Option<i32>,
+    pub name: Option<String>,
+    pub retry_after_seconds: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -375,6 +380,12 @@ struct V6WireFailure {
 struct V6WireError {
     kind: String,
     message: String,
+    #[serde(default)]
+    code: Option<i32>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    retry_after_seconds: Option<u32>,
 }
 
 pub fn parse_v6_inbound_frame(line: &str) -> Result<V6InboundFrame, ExternalError> {
@@ -504,6 +515,9 @@ pub fn parse_v6_core_frame(line: &str) -> Result<V6CoreFrame, ExternalError> {
         result: Err(V6CallError {
             kind: failure.error.kind,
             message: failure.error.message,
+            code: failure.error.code,
+            name: failure.error.name,
+            retry_after_seconds: failure.error.retry_after_seconds,
         }),
     })
 }
@@ -528,7 +542,7 @@ pub fn serialize_v6_core_result(
             "type": "telegram.result",
             "call_id": call_id,
             "ok": false,
-            "error": {"kind": error.kind, "message": error.message},
+            "error": {"kind": error.kind, "message": error.message, "code": error.code, "name": error.name, "retry_after_seconds": error.retry_after_seconds},
         }),
         Err(_) => return Err(ExternalError::ProtocolEncode),
     };
@@ -1008,6 +1022,72 @@ pub fn request_id() -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn v6_alpha_contract_fixture_matches_parser_semantics() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../protocol/v6/alpha-contract.json")).unwrap();
+        assert_eq!(fixture["schema_version"], 1);
+        assert_eq!(fixture["protocol_version"], 6);
+        assert_eq!(fixture["contract_revision"], V6_ALPHA_CONTRACT_REVISION);
+        assert_eq!(fixture["timeout_start"], V6_TIMEOUT_START);
+
+        for case in fixture["inbound"].as_array().unwrap() {
+            let frame = case.get("frame").unwrap();
+            let line = serde_json::to_string(frame).unwrap();
+            if let Some(accepted) = case.get("accepted").and_then(serde_json::Value::as_bool) {
+                assert_eq!(
+                    parse_v6_inbound_frame(&line).is_ok(),
+                    accepted,
+                    "{}",
+                    case["name"]
+                );
+            }
+            if case
+                .get("module_accepted")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                assert!(parse_v6_module_frame(&line).is_ok(), "{}", case["name"]);
+            }
+            if case
+                .get("core_accepted")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                assert!(parse_v6_core_frame(&line).is_ok(), "{}", case["name"]);
+            }
+        }
+        for case in fixture["outbound"].as_array().unwrap() {
+            let result = match case.get("error") {
+                Some(error) => Err(V6CallError {
+                    kind: error["kind"].as_str().unwrap().to_owned(),
+                    message: error["message"].as_str().unwrap().to_owned(),
+                    code: None,
+                    name: None,
+                    retry_after_seconds: None,
+                }),
+                None => Ok(case["result"].clone()),
+            };
+            let line = serialize_v6_core_result(case["call_id"].as_str().unwrap(), result).unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&line).unwrap(),
+                case["expected"]
+            );
+        }
+        assert_eq!(
+            fixture["race_semantics"]["duplicate_active_call_id"],
+            "protocol_violation"
+        );
+        assert_eq!(
+            fixture["race_semantics"]["cancellation"],
+            "drain_active_lifecycle_log"
+        );
+        assert_eq!(
+            fixture["race_semantics"]["shutdown"],
+            "discard_late_telegram_result"
+        );
+    }
+
+    #[test]
     fn outbound_lifecycle_allows_strings_above_untrusted_input_guard() {
         let frame = V6OutboundCoreFrame::Event {
             request_id: "12".to_owned(),
@@ -1230,6 +1310,9 @@ mod tests {
                 Err(V6CallError {
                     kind: "validation".to_owned(),
                     message: "x".repeat(V6_MAX_JSON_STRING_BYTES + 1),
+                    code: None,
+                    name: None,
+                    retry_after_seconds: None,
                 })
             ),
             Err(ExternalError::ProtocolEncode)
@@ -1391,6 +1474,9 @@ mod tests {
             result: Err(V6CallError {
                 kind: "validation".to_owned(),
                 message: "bad params".to_owned(),
+                code: None,
+                name: None,
+                retry_after_seconds: None,
             }),
         }
         .serialize()

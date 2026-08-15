@@ -59,6 +59,10 @@ returned only the generic `AuthError::AuthorizationCheck` wrapper.
 For `AUTH_KEY_DUPLICATED`, startup output must explain that the stored auth key
 has been invalidated and that retrying the same session is not sufficient.
 
+For the NixOS service, a terminal Lavis application exit must not enter a
+systemd restart loop. The module must preserve restarts for abnormal process
+termination while preventing restart of Lavis' terminal status `1`.
+
 ### Single-session protection
 
 - Add an exclusive local lock associated with the session path before opening

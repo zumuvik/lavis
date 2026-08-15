@@ -234,6 +234,16 @@ sudo systemctl start lavis.service
 После успешной авторизации можно убрать `autoStart = false` или заменить на
 `autoStart = true`.
 
+Если сервис остановился с требованием повторной авторизации, не запускайте его
+в цикле: NixOS-модуль не перезапускает штатный терминальный exit status `1`.
+Сначала остановите unit, затем выполните `lavis auth doctor` и при необходимости
+`lavis auth reset --backup` от имени service user с теми же XDG-путями. После
+сброса используйте `sudo lavis-auth` и запустите сервис снова. Не удаляйте
+`session.lock` вручную: он показывает конфликт с локальным сервисом или
+интерактивным процессом. Этот lock работает только на одном хосте; не копируйте
+сеанс и не используйте его параллельно на другом хосте. Подробные безопасные
+команды: [NixOS module](docs/nixos-module.md#authorization-recovery).
+
 Full service, credentials and declarative extension setup:
 [NixOS module](docs/nixos-module.md).
 

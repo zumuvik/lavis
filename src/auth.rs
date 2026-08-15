@@ -30,7 +30,10 @@ pub const PASSWORD_NOTIFICATION: &str = "Пароль 2FA временно об�
     Lavis намеренно не записывает пароль в постоянное хранилище\n\
     и не добавляет его в логи или диагностику.";
 
-use std::io::{self, IsTerminal, Write};
+use std::{
+    io::{self, IsTerminal, Write},
+    time::Duration,
+};
 
 use grammers_client::{Client, SignInError};
 use grammers_mtsender::InvocationError;
@@ -38,16 +41,21 @@ use grammers_session::types::PeerId;
 
 use crate::{
     config::Config,
-    error::{AuthError, AuthorizationCheckFailure},
+    error::{AuthError, AuthorizationCheckFailure, LastAuthorizationDiagnostic},
 };
 
 pub async fn authorize(
     client: &Client,
     config: &Config,
 ) -> Result<AuthorizationOutcome, AuthError> {
-    let just_completed = if !client.is_authorized().await.map_err(|error| {
-        AuthError::AuthorizationCheck(classify_authorization_check_error(&error))
-    })? {
+    const AUTHORIZATION_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+    let authorized = tokio::time::timeout(AUTHORIZATION_CHECK_TIMEOUT, client.is_authorized())
+        .await
+        .map_err(|_| AuthError::AuthorizationCheck(AuthorizationCheckFailure::Timeout))?
+        .map_err(|error| {
+            AuthError::AuthorizationCheck(classify_authorization_check_error(&error))
+        })?;
+    let just_completed = if !authorized {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             return Err(AuthError::NonInteractive);
         }
@@ -101,17 +109,66 @@ pub async fn authorize(
 
 fn classify_authorization_check_error(error: &InvocationError) -> AuthorizationCheckFailure {
     match error {
-        InvocationError::Rpc(error) => classify_rpc_symbolic_name(&error.name),
+        InvocationError::Rpc(error) => classify_rpc_error(error.code, &error.name),
+        InvocationError::Io(error) if error.kind() == io::ErrorKind::TimedOut => {
+            AuthorizationCheckFailure::Timeout
+        }
+        InvocationError::Io(_) | InvocationError::Transport(_) => {
+            AuthorizationCheckFailure::Transport
+        }
+        InvocationError::Session(_) => AuthorizationCheckFailure::SessionStorage,
         _ => AuthorizationCheckFailure::Unknown,
+    }
+}
+
+fn classify_rpc_error(code: i32, name: &str) -> AuthorizationCheckFailure {
+    match classify_rpc_symbolic_name(name) {
+        AuthorizationCheckFailure::Rpc { symbolic_name, .. } => AuthorizationCheckFailure::Rpc {
+            code,
+            symbolic_name,
+        },
+        AuthorizationCheckFailure::AuthKeyDuplicated { symbolic_name, .. } => {
+            AuthorizationCheckFailure::AuthKeyDuplicated {
+                code,
+                symbolic_name,
+            }
+        }
+        failure => failure,
+    }
+}
+
+pub(crate) fn last_authorization_diagnostic(error: &AuthError) -> LastAuthorizationDiagnostic {
+    match error {
+        AuthError::NonInteractive => LastAuthorizationDiagnostic::InteractiveAuth,
+        AuthError::AuthorizationCheck(failure) => match failure {
+            AuthorizationCheckFailure::AuthKeyDuplicated { .. } => {
+                LastAuthorizationDiagnostic::AuthKeyDuplicated
+            }
+            AuthorizationCheckFailure::Rpc { .. } => LastAuthorizationDiagnostic::RpcError,
+            AuthorizationCheckFailure::Timeout => LastAuthorizationDiagnostic::Timeout,
+            AuthorizationCheckFailure::Transport => LastAuthorizationDiagnostic::Transport,
+            AuthorizationCheckFailure::SessionStorage => {
+                LastAuthorizationDiagnostic::SessionStorage
+            }
+            AuthorizationCheckFailure::MalformedLocalSession => {
+                LastAuthorizationDiagnostic::MalformedLocalSession
+            }
+            AuthorizationCheckFailure::Unknown => LastAuthorizationDiagnostic::Unknown,
+        },
+        _ => LastAuthorizationDiagnostic::Unknown,
     }
 }
 
 fn classify_rpc_symbolic_name(name: &str) -> AuthorizationCheckFailure {
     if name == "AUTH_KEY_DUPLICATED" {
-        return AuthorizationCheckFailure::AuthKeyDuplicated;
+        return AuthorizationCheckFailure::AuthKeyDuplicated {
+            code: 0,
+            symbolic_name: name.to_owned(),
+        };
     }
     if is_safe_rpc_symbolic_name(name) {
         AuthorizationCheckFailure::Rpc {
+            code: 0,
             symbolic_name: name.to_owned(),
         }
     } else {
@@ -198,7 +255,7 @@ mod tests {
         CREDENTIAL_NOTIFICATION, PASSWORD_NOTIFICATION, classify_authorization_check_error,
         classify_rpc_symbolic_name, normalize_input, preserve_password_input,
     };
-    use crate::error::AuthorizationCheckFailure;
+    use crate::error::{AuthError, AuthorizationCheckFailure, LastAuthorizationDiagnostic};
     use grammers_mtsender::{InvocationError, RpcError};
     use std::io;
 
@@ -214,9 +271,18 @@ mod tests {
     #[test]
     fn categorizes_auth_key_duplicated_for_recovery() {
         let failure = classify_authorization_check_error(&rpc_error("AUTH_KEY_DUPLICATED"));
-        assert_eq!(failure, AuthorizationCheckFailure::AuthKeyDuplicated);
+        assert_eq!(
+            failure,
+            AuthorizationCheckFailure::AuthKeyDuplicated {
+                code: 500,
+                symbolic_name: "AUTH_KEY_DUPLICATED".to_owned(),
+            }
+        );
         assert_eq!(failure.category(), "auth_key_duplicated");
-        assert_eq!(failure.to_string(), "category: auth_key_duplicated");
+        assert_eq!(
+            failure.to_string(),
+            "category: auth_key_duplicated, rpc_code: 500, rpc: AUTH_KEY_DUPLICATED"
+        );
         assert!(failure.is_auth_key_duplicated());
     }
 
@@ -226,12 +292,20 @@ mod tests {
         assert_eq!(
             failure,
             AuthorizationCheckFailure::Rpc {
+                code: 0,
                 symbolic_name: "INTERNAL_SERVER_ERROR".to_owned(),
             }
         );
         assert_eq!(
             failure.to_string(),
-            "category: rpc_error, rpc: INTERNAL_SERVER_ERROR"
+            "category: rpc_error, rpc_code: 0, rpc: INTERNAL_SERVER_ERROR"
+        );
+        assert_eq!(
+            classify_authorization_check_error(&rpc_error("INTERNAL_SERVER_ERROR")),
+            AuthorizationCheckFailure::Rpc {
+                code: 500,
+                symbolic_name: "INTERNAL_SERVER_ERROR".to_owned(),
+            }
         );
     }
 
@@ -250,8 +324,38 @@ mod tests {
         let failure = classify_authorization_check_error(&InvocationError::Io(io::Error::other(
             "api_hash=secret",
         )));
-        assert_eq!(failure, AuthorizationCheckFailure::Unknown);
+        assert_eq!(failure, AuthorizationCheckFailure::Transport);
         assert!(!failure.to_string().contains("api_hash"));
+    }
+
+    #[test]
+    fn classifies_timeout_and_session_storage_without_exposing_error_text() {
+        let timeout = classify_authorization_check_error(&InvocationError::Io(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "api_hash=secret",
+        )));
+        assert_eq!(timeout, AuthorizationCheckFailure::Timeout);
+        assert_eq!(timeout.category(), "timeout");
+
+        let storage = classify_authorization_check_error(&InvocationError::Session(Box::new(
+            io::Error::other("session path contains secret"),
+        )));
+        assert_eq!(storage, AuthorizationCheckFailure::SessionStorage);
+        assert_eq!(storage.category(), "session_storage");
+    }
+
+    #[test]
+    fn persists_only_safe_authorization_diagnostic_categories() {
+        assert_eq!(
+            super::last_authorization_diagnostic(&AuthError::NonInteractive),
+            LastAuthorizationDiagnostic::InteractiveAuth
+        );
+        assert_eq!(
+            super::last_authorization_diagnostic(&AuthError::AuthorizationCheck(
+                AuthorizationCheckFailure::MalformedLocalSession,
+            )),
+            LastAuthorizationDiagnostic::MalformedLocalSession
+        );
     }
 
     #[test]
