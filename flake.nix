@@ -24,6 +24,7 @@
         nativeBuildInputs = [
           pkgs.makeWrapper
           pkgs.python3 # JSON-line external-process fixtures (test-only)
+          pkgs.util-linux # `flock` session-lock test helper
         ];
         postFixup = ''
           wrapProgram $out/bin/lavis \
@@ -227,7 +228,19 @@
           ! grep -q 'chown -R' "$preStartScript"
           ! grep -q 'PermissionsStartOnly=true' "$unit/lavis.service"
 
+          mkdir -p '/build/lavis-test home/.local/state/lavis'
+          printf '%s\n' '{"version":2,"prefix":"!","locale":"en","onboarding":"companion"}' \
+            > '/build/lavis-test home/.local/state/lavis/settings.json'
+          chmod 600 '/build/lavis-test home/.local/state/lavis/settings.json'
           "$preStartScript"
+          "$preStartScript"
+          ${pkgs.python3}/bin/python3 - <<'PY'
+import json
+with open('/build/lavis-test home/.local/state/lavis/settings.json', encoding='utf-8') as handle:
+    state = json.load(handle)
+if state != {"version": 2, "prefix": ".", "locale": "en", "onboarding": "companion"}:
+    raise SystemExit(state)
+PY
           printf '%s\n' '{"enabled":true,"next_id":2,"triggers":[{"id":1,"word":"nix","reactions":[{"type":"emoji","emoji":"👍"}],"enabled":true}],"active":{}}' \
             > '/build/lavis-test home/.local/share/lavis/modules/fixture/state.json'
           "$preStartScript"
@@ -296,6 +309,7 @@ PY
           rustfmt
           fastfetch
           python3 # JSON-line external-process fixtures
+          util-linux # `flock` session-lock test helper
           go
           zip
         ];

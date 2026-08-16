@@ -14,8 +14,8 @@ use crate::{
     bot_api::{BotApi, HttpBotApi},
     command::Command,
     commands::{
-        Action, AliasRequest, ExternalInvocation, LmRequest, ModulesRequest, PrefixRequest,
-        SetupRequest, dispatch,
+        Action, AliasRequest, ExternalInvocation, LanguageRequest, LmRequest, ModulesRequest,
+        PrefixRequest, SetupRequest, StartRequest, dispatch,
     },
     error::ExternalError,
     external_modules::{
@@ -38,7 +38,9 @@ use crate::{
         state::ExternalStateStore,
     },
     fastfetch::{self, FastfetchInputError, FastfetchProfileError, FastfetchResult},
-    help::{render_modules_overview_with_external, render_with_external},
+    help::{render_modules_overview_with_external, render_with_external_locale},
+    i18n::{Locale, RuntimeText, Text, runtime_text, text},
+    onboarding::OnboardingProgress,
     response::Response,
     settings::{DEFAULT_PREFIX, SettingsStore},
     setup::{self, UsernameCandidate},
@@ -58,6 +60,9 @@ pub struct RuntimeState {
     setup_notification_ids: VecDeque<(PeerId, i32)>,
     setup_edit_fallback_sources: VecDeque<(PeerId, i32)>,
     setup: Option<SetupCoordinator>,
+    // Projection is held closed after setup is configured until BotFather's
+    // authoritative peer identity has been resolved for this process.
+    external_projection_permitted: bool,
     module_installation: Option<ModuleInstallation>,
     module_control: Option<ModuleControlConfig>,
     module_approvals: ApprovalStore<SystemClock, OsRandom>,
@@ -170,6 +175,7 @@ struct SetupCoordinator {
     token_path: PathBuf,
     saved_messages_peer: PeerId,
     botfather_peer: Option<PeerId>,
+    locale: Locale,
     phase: SetupPhase,
 }
 
@@ -212,6 +218,7 @@ pub(crate) struct RuntimeExecution {
     pub provision: Option<ProvisionRequest>,
     pub shutdown: Option<ShutdownReason>,
     pub post_edit: Option<PostEditAction>,
+    pub onboarding_page: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,6 +246,7 @@ impl From<Response> for RuntimeExecution {
             provision: None,
             shutdown: None,
             post_edit: None,
+            onboarding_page: false,
         }
     }
 }
@@ -278,6 +286,7 @@ impl RuntimeState {
             setup_notification_ids: VecDeque::new(),
             setup_edit_fallback_sources: VecDeque::new(),
             setup: None,
+            external_projection_permitted: true,
             module_installation: None,
             module_control: None,
             module_approvals: ApprovalStore::new(
@@ -303,8 +312,10 @@ impl RuntimeState {
             token_path,
             saved_messages_peer,
             botfather_peer: None,
+            locale: self.locale(),
             phase: SetupPhase::Idle,
         });
+        self.external_projection_permitted = false;
     }
 
     /// Marks a resolved BotFather peer as setup-private. Resolution is kept in
@@ -313,7 +324,13 @@ impl RuntimeState {
     pub fn set_setup_botfather_peer(&mut self, peer: PeerId) {
         if let Some(setup) = &mut self.setup {
             setup.botfather_peer = Some(peer);
+            self.external_projection_permitted = true;
         }
+    }
+
+    #[cfg(test)]
+    fn external_projection_permitted_for_tests(&self) -> bool {
+        self.external_projection_permitted
     }
 
     pub fn setup_protects_message(&self, peer: PeerId, authored_by_self: bool) -> bool {
@@ -349,9 +366,10 @@ impl RuntimeState {
         // Only the ephemeral conversation ends. Persisted bot data remains
         // available to the repair path.
         setup.phase = SetupPhase::Idle;
-        Some(Response::plain(
-            "⌛ Настройка остановлена по таймауту. Постоянные данные сохранены; повторите setup или setup repair.".to_owned(),
-        ))
+        Some(Response::plain(setup.message(
+            "⌛ Setup timed out. Persistent data is retained; retry setup or setup repair.",
+            "⌛ Настройка остановлена по таймауту. Постоянные данные сохранены; повторите setup или setup repair.",
+        ).to_owned()))
     }
 
     pub(crate) async fn handle_setup_input(
@@ -374,6 +392,10 @@ impl RuntimeState {
                 };
             }
             let outcome = setup.handle_botfather_reply(client, text).await;
+            let resolved = setup.botfather_peer.is_some();
+            if resolved {
+                self.external_projection_permitted = true;
+            }
             return SetupInput::Consumed {
                 response: outcome.response,
                 provision: outcome.provision,
@@ -460,6 +482,9 @@ impl RuntimeState {
         outgoing: bool,
         entities: Vec<crate::external_modules::protocol::CustomEmojiEntity>,
     ) -> Option<CreatedEventDispatch> {
+        if !self.external_projection_permitted {
+            return None;
+        }
         let handle = self.external_manager.clone()?;
         let mut requests = Vec::new();
         for descriptor in self
@@ -512,6 +537,10 @@ impl RuntimeState {
 
     pub fn prefix(&self) -> &str {
         self.settings.prefix()
+    }
+
+    pub(crate) fn locale(&self) -> Locale {
+        self.settings.locale().unwrap_or(Locale::Russian)
     }
 
     pub fn register_expected_self_edit(&mut self, peer_id: PeerId, message_id: i32, text: String) {
@@ -646,9 +675,16 @@ impl RuntimeState {
     }
 
     async fn execute_external(&mut self, invocation: &ExternalInvocation) -> Response {
+        let english = self.locale() == Locale::English;
         let handle = match self.external_manager.clone() {
             Some(h) => h,
-            None => return Response::plain("⚠️ Внешние модули не доступны.".to_owned()),
+            None => {
+                return Response::plain(if english {
+                    "⚠️ External modules are unavailable."
+                } else {
+                    "⚠️ Внешние модули не доступны."
+                });
+            }
         };
         let result = handle
             .execute(
@@ -675,14 +711,22 @@ impl RuntimeState {
                     )),
                 }
             }
-            Err(ExternalError::Unavailable) => Response::plain(format!(
-                "⚠️ Модуль «{}» недоступен или завершился с ошибкой.",
-                invocation.module_id
-            )),
-            Err(ExternalError::ExecutionTimeout) => Response::plain(format!(
-                "⚠️ Модуль «{}» не ответил вовремя.",
-                invocation.module_id
-            )),
+            Err(ExternalError::Unavailable) => Response::plain(
+                (if english {
+                    "⚠️ Module «{}» is unavailable or stopped with an error."
+                } else {
+                    "⚠️ Модуль «{}» недоступен или завершился с ошибкой."
+                })
+                .replace("{}", &invocation.module_id),
+            ),
+            Err(ExternalError::ExecutionTimeout) => Response::plain(
+                (if english {
+                    "⚠️ Module «{}» did not respond in time."
+                } else {
+                    "⚠️ Модуль «{}» не ответил вовремя."
+                })
+                .replace("{}", &invocation.module_id),
+            ),
             Err(ExternalError::ProtocolDecode) => Response::plain(format!(
                 "⚠️ Модуль «{}» прислал некорректный ответ.",
                 invocation.module_id
@@ -708,8 +752,14 @@ impl RuntimeState {
                     "External command failed"
                 );
                 Response::plain(format!(
-                    "⚠️ Ошибка модуля «{}»: {}",
-                    invocation.module_id, error
+                    "⚠️ {} «{}»: {}",
+                    if english {
+                        "Module error"
+                    } else {
+                        "Ошибка модуля"
+                    },
+                    invocation.module_id,
+                    error
                 ))
             }
         };
@@ -729,15 +779,19 @@ impl RuntimeState {
     ) -> RuntimeExecution {
         self.recognized_commands = self.recognized_commands.saturating_add(1);
         let prefix = self.prefix().to_owned();
+        if let Action::Start(request) = action {
+            return self.execute_start(client, request, peer_id).await;
+        }
         if let Action::Setup(request) = action {
             return self.execute_setup(client, request, peer_id).await;
         }
         match action {
+            Action::Language(request) => self.execute_language(request).await,
             Action::Ping => match telegram_ping(client, message_id).await {
                 Ok(latency) => Response::plain(format!("🏓 Pong: {}", format_latency(latency))),
                 Err(error) => {
                     log_ping_failure(action, message_id, &error);
-                    Response::plain("⚠️ Telegram ping failed")
+                    Response::plain(runtime_text(self.locale(), RuntimeText::PingFailed))
                 }
             },
             Action::Stats => {
@@ -758,12 +812,13 @@ impl RuntimeState {
                 ))
             }
             Action::Help(request) => {
-                let rendered = render_with_external(
+                let rendered = render_with_external_locale(
                     request,
                     &prefix,
                     &self.aliases,
                     self.external_command_refs(),
                     self.external_descriptors(),
+                    self.locale(),
                 );
                 if rendered.entity_fallback {
                     tracing::warn!(
@@ -784,9 +839,144 @@ impl RuntimeState {
             Action::Lm(request) => self.execute_lm(client, message_context, request).await,
             Action::Reboot => return self.execute_reboot(message_context),
             Action::Setup(_) => unreachable!("setup actions return before response dispatch"),
+            Action::Start(_) => unreachable!("start actions return before response dispatch"),
             Action::External(invocation) => self.execute_external(invocation).await,
         }
         .into()
+    }
+
+    async fn execute_language(&mut self, request: &LanguageRequest) -> Response {
+        match request {
+            LanguageRequest::Show => match self.settings.locale() {
+                Some(locale) => Response::plain(format!(
+                    "🌐 {}: {}",
+                    text(locale, Text::LanguageCurrent),
+                    locale.code()
+                )),
+                None => {
+                    Response::plain(crate::i18n::bilingual(Text::LanguageChoose, self.prefix()))
+                }
+            },
+            LanguageRequest::Set(locale) => match self.settings.set_locale(Some(*locale)).await {
+                Ok(()) => {
+                    if let Some(setup) = &mut self.setup {
+                        setup.locale = *locale;
+                    }
+                    Response::plain(format!(
+                        "🌐 {}: {}",
+                        text(*locale, Text::LanguageChanged),
+                        locale.code()
+                    ))
+                }
+                Err(_) => Response::plain("⚠️ Could not save language.".to_owned()),
+            },
+            LanguageRequest::Invalid => {
+                Response::plain(format!("⚠️ {}", text(self.locale(), Text::LanguageUsage)))
+            }
+        }
+    }
+
+    async fn execute_start(
+        &mut self,
+        client: &Client,
+        request: &StartRequest,
+        peer: PeerId,
+    ) -> RuntimeExecution {
+        if self.settings.locale().is_none()
+            && matches!(request, StartRequest::Bot | StartRequest::Skip)
+        {
+            return Response::plain(crate::i18n::bilingual(
+                Text::OnboardingSelect,
+                self.prefix(),
+            ))
+            .into();
+        }
+        let progress = match request {
+            StartRequest::Bot => {
+                return self.execute_setup(client, &SetupRequest::Start, peer).await;
+            }
+            // Repair is the existing idempotent provisioning path. It verifies the
+            // stored bot/token before creating or repairing the private group.
+            StartRequest::Invalid => {
+                return Response::plain(format!(
+                    "⚠️ {}",
+                    text(self.locale(), Text::StartUsage).replace("{prefix}", self.prefix())
+                ))
+                .into();
+            }
+            StartRequest::Skip => {
+                if self.settings.locale().is_none() {
+                    return Response::plain(crate::i18n::bilingual(
+                        Text::OnboardingSelect,
+                        self.prefix(),
+                    ))
+                    .into();
+                }
+                let locale = self.locale();
+                return match self
+                    .settings
+                    .set_onboarding(OnboardingProgress::skip())
+                    .await
+                {
+                    Ok(()) => {
+                        Response::plain(OnboardingProgress::Skipped.message(locale, self.prefix()))
+                            .into()
+                    }
+                    Err(_) => {
+                        Response::plain("⚠️ Could not save tutorial progress.".to_owned()).into()
+                    }
+                };
+            }
+            StartRequest::Locale(locale) => {
+                if self.settings.set_locale(Some(*locale)).await.is_err() {
+                    return Response::plain("⚠️ Could not save language.".to_owned()).into();
+                }
+                if let Some(setup) = &mut self.setup {
+                    setup.locale = *locale;
+                }
+                OnboardingProgress::restart()
+            }
+            StartRequest::Begin => {
+                let Some(_) = self.settings.locale() else {
+                    return Response::plain(crate::i18n::bilingual(
+                        Text::OnboardingSelect,
+                        self.prefix(),
+                    ))
+                    .into();
+                };
+                match self.settings.onboarding() {
+                    OnboardingProgress::NotStarted
+                    | OnboardingProgress::Complete
+                    | OnboardingProgress::Skipped => OnboardingProgress::restart(),
+                    progress => progress,
+                }
+            }
+        };
+        let locale = self.locale();
+        let response = format!(
+            "{}\n\n{}",
+            progress.message(locale, self.prefix()),
+            text(locale, Text::StartUsage).replace("{prefix}", self.prefix())
+        );
+        // Keep the rendered page as the durable cursor. This makes a failed
+        // delivery retry the same page rather than silently skipping it.
+        match self.settings.set_onboarding(progress).await {
+            Ok(()) => RuntimeExecution {
+                response: Response::plain(response),
+                provision: None,
+                shutdown: None,
+                post_edit: None,
+                onboarding_page: true,
+            },
+            Err(_) => Response::plain("⚠️ Could not save tutorial progress.".to_owned()).into(),
+        }
+    }
+
+    pub(crate) async fn mark_onboarding_delivered(&mut self) {
+        let next = self.settings.onboarding().mark_delivered();
+        if let Err(error) = self.settings.set_onboarding(next).await {
+            tracing::warn!(event = "onboarding_progress_save_failed", error = %error, "Could not advance delivered tutorial page");
+        }
     }
 
     async fn execute_lm(
@@ -831,21 +1021,25 @@ impl RuntimeState {
 
     async fn render_lm_list(&self) -> Response {
         let Some(config) = &self.module_control else {
-            return Response::plain("⚠️ Управление внешними модулями недоступно.".to_owned());
+            return Response::plain(runtime_text(self.locale(), RuntimeText::LmUnavailable));
         };
         let state = match ExternalStateStore::load(config.state_path.clone()).await {
             Ok(state) => state,
             Err(_) => {
-                return Response::plain("⚠️ Состояние внешних модулей недоступно.".to_owned());
+                return Response::plain(runtime_text(
+                    self.locale(),
+                    RuntimeText::LmStateUnavailable,
+                ));
             }
         };
         let list = match control::list_modules(&config.root, &config.declarative_state_path, &state)
         {
             Ok(list) => list,
             Err(_) => {
-                return Response::plain(
-                    "⚠️ Не удалось прочитать список внешних модулей.".to_owned(),
-                );
+                return Response::plain(runtime_text(
+                    self.locale(),
+                    RuntimeText::LmListUnavailable,
+                ));
             }
         };
         let fresh_snapshot = match &self.external_manager {
@@ -1070,10 +1264,11 @@ impl RuntimeState {
     fn execute_reboot(&self, context: MessageExecutionContext<'_>) -> RuntimeExecution {
         match self.authorize_sensitive_command(SensitiveCommandPolicy::Reboot, context, None) {
             Ok(()) => RuntimeExecution {
-                response: Response::plain("♻️ Lavis перезапускается…".to_owned()),
+                response: Response::plain(runtime_text(self.locale(), RuntimeText::Rebooting)),
                 provision: None,
                 shutdown: None,
                 post_edit: Some(PostEditAction::ArmRebootReceipt),
+                onboarding_page: false,
             },
             Err(response) => response.into(),
         }
@@ -1253,7 +1448,14 @@ impl RuntimeState {
                     .to_owned(),
             ).into();
         }
-        setup.handle_command(client, request).await
+        let execution = setup.handle_command(client, request).await;
+        // Starting setup resolves BotFather as part of the confirmed flow. That
+        // authoritative peer is also sufficient to re-open external projection
+        // after a startup resolution failure.
+        if setup.botfather_peer.is_some() {
+            self.external_projection_permitted = true;
+        }
+        execution
     }
 
     fn execute_modules(&self, request: &ModulesRequest, prefix: &str) -> Response {
@@ -1285,33 +1487,87 @@ impl RuntimeState {
     }
 
     pub(crate) async fn execute_prefix(&mut self, request: &PrefixRequest) -> Response {
+        let russian = self.locale() == Locale::Russian;
         match request {
-            PrefixRequest::Show => Response::plain(format!("⚙️ Active prefix: {}", self.prefix())),
+            PrefixRequest::Show => Response::plain(format!(
+                "⚙️ {}: {}",
+                if russian {
+                    "Текущий префикс"
+                } else {
+                    "Active prefix"
+                },
+                self.prefix()
+            )),
             PrefixRequest::Set(prefix) => match self.settings.set_prefix(prefix.clone()).await {
-                Ok(()) => Response::plain(format!("⚙️ Command prefix set to: {}", self.prefix())),
-                Err(error) => Response::plain(format!("⚠️ Could not change prefix: {error}")),
+                Ok(()) => Response::plain(format!(
+                    "⚙️ {}: {}",
+                    if russian {
+                        "Префикс команд изменён"
+                    } else {
+                        "Command prefix set"
+                    },
+                    self.prefix()
+                )),
+                Err(error) => Response::plain(format!(
+                    "⚠️ {}: {error}",
+                    if russian {
+                        "Не удалось изменить префикс"
+                    } else {
+                        "Could not change prefix"
+                    }
+                )),
             },
             PrefixRequest::Reset => match self.settings.set_prefix(DEFAULT_PREFIX.to_owned()).await
             {
-                Ok(()) => Response::plain(format!("⚙️ Command prefix reset to: {}", self.prefix())),
-                Err(error) => Response::plain(format!("⚠️ Could not reset prefix: {error}")),
+                Ok(()) => Response::plain(format!(
+                    "⚙️ {}: {}",
+                    if russian {
+                        "Префикс сброшен"
+                    } else {
+                        "Command prefix reset"
+                    },
+                    self.prefix()
+                )),
+                Err(error) => Response::plain(format!(
+                    "⚠️ {}: {error}",
+                    if russian {
+                        "Не удалось сбросить префикс"
+                    } else {
+                        "Could not reset prefix"
+                    }
+                )),
             },
             PrefixRequest::Invalid => Response::plain(format!(
-                "⚠️ Usage: {}prefix [new-prefix|reset]",
+                "⚠️ {}: {}prefix [new-prefix|reset]",
+                if russian {
+                    "Использование"
+                } else {
+                    "Usage"
+                },
                 self.prefix()
             )),
         }
     }
 
     async fn execute_alias(&mut self, request: &AliasRequest, prefix: &str) -> Response {
+        let russian = self.locale() == Locale::Russian;
         match request {
             AliasRequest::List => {
                 let aliases = self.aliases.aliases();
                 if aliases.is_empty() {
-                    return Response::plain("🔗 No aliases configured");
+                    return Response::plain(if russian {
+                        "🔗 Псевдонимы не настроены"
+                    } else {
+                        "🔗 No aliases configured"
+                    });
                 }
                 Response::plain(format!(
-                    "🔗 Aliases\n\n{}",
+                    "🔗 {}\n\n{}",
+                    if russian {
+                        "Псевдонимы"
+                    } else {
+                        "Aliases"
+                    },
                     aliases
                         .iter()
                         .map(|(name, alias)| {
@@ -1337,23 +1593,59 @@ impl RuntimeState {
                 )
                 .await
             {
-                Ok(_) => Response::plain(format!("🔗 Added alias: {prefix}{name}")),
-                Err(error) => Response::plain(format!("⚠️ Could not add alias: {error}")),
+                Ok(_) => Response::plain(format!(
+                    "🔗 {}: {prefix}{name}",
+                    if russian {
+                        "Добавлен псевдоним"
+                    } else {
+                        "Added alias"
+                    }
+                )),
+                Err(error) => Response::plain(format!(
+                    "⚠️ {}: {error}",
+                    if russian {
+                        "Не удалось добавить псевдоним"
+                    } else {
+                        "Could not add alias"
+                    }
+                )),
             },
             AliasRequest::Delete { name } => match self.aliases.delete(name).await {
-                Ok(DeleteResult::Deleted) => {
-                    Response::plain(format!("🔗 Deleted alias: {prefix}{name}"))
-                }
-                Ok(DeleteResult::NotFound) => {
-                    Response::plain(format!("❓ Alias not found: {name}"))
-                }
-                Err(error) => Response::plain(format!("⚠️ Could not delete alias: {error}")),
+                Ok(DeleteResult::Deleted) => Response::plain(format!(
+                    "🔗 {}: {prefix}{name}",
+                    if russian {
+                        "Псевдоним удалён"
+                    } else {
+                        "Deleted alias"
+                    }
+                )),
+                Ok(DeleteResult::NotFound) => Response::plain(format!(
+                    "❓ {}: {name}",
+                    if russian {
+                        "Псевдоним не найден"
+                    } else {
+                        "Alias not found"
+                    }
+                )),
+                Err(error) => Response::plain(format!(
+                    "⚠️ {}: {error}",
+                    if russian {
+                        "Не удалось удалить псевдоним"
+                    } else {
+                        "Could not delete alias"
+                    }
+                )),
             },
             AliasRequest::Show { name } => {
                 let normalized_name = name.to_ascii_lowercase();
                 let Some(alias) = self.aliases.lookup(name) else {
                     return Response::plain(format!(
-                        "⚠️ Alias {prefix}{normalized_name} does not exist"
+                        "⚠️ {} {prefix}{normalized_name}",
+                        if russian {
+                            "Псевдоним не существует:"
+                        } else {
+                            "Alias does not exist:"
+                        }
                     ));
                 };
                 let args = if alias.args.is_empty() {
@@ -1363,12 +1655,25 @@ impl RuntimeState {
                 };
                 Response::collapsed(
                     format!("🔗 {prefix}{normalized_name}"),
-                    format!("Alias for:\n{prefix}{}{args}", alias.target),
+                    format!(
+                        "{}:\n{prefix}{}{args}",
+                        if russian {
+                            "Псевдоним для"
+                        } else {
+                            "Alias for"
+                        },
+                        alias.target
+                    ),
                 )
                 .response
             }
             AliasRequest::Invalid => Response::plain(format!(
-                "⚠️ Usage: {prefix}alias [list|add <name> <command> [arguments...]|show <name>|del <name>]"
+                "⚠️ {}: {prefix}alias [list|add <name> <command> [arguments...]|show <name>|del <name>]",
+                if russian {
+                    "Использование"
+                } else {
+                    "Usage"
+                }
             )),
         }
     }
@@ -1570,6 +1875,13 @@ fn render_install_plan(
 }
 
 impl SetupCoordinator {
+    fn message(&self, english: &'static str, russian: &'static str) -> &'static str {
+        if self.locale == Locale::English {
+            english
+        } else {
+            russian
+        }
+    }
     fn is_active(&self) -> bool {
         !matches!(self.phase, SetupPhase::Idle)
     }
@@ -1585,14 +1897,21 @@ impl SetupCoordinator {
         ) {
             if self.is_active() {
                 return Response::plain(
-                    "⚠️ Настройка уже выполняется. Напишите cancel для отмены.".to_owned(),
+                    self.message(
+                        "⚠️ Setup is already active. Send cancel to stop it.",
+                        "⚠️ Настройка уже выполняется. Напишите cancel для отмены.",
+                    )
+                    .to_owned(),
                 )
                 .into();
             }
             if self.has_created_bot().await {
                 return Response::plain(
-                    "ℹ️ Бот уже создан. Используйте setup repair для восстановления workspace."
-                        .to_owned(),
+                    self.message(
+                        "ℹ️ The bot already exists. Use setup repair to restore the workspace.",
+                        "ℹ️ Бот уже создан. Используйте setup repair для восстановления workspace.",
+                    )
+                    .to_owned(),
                 )
                 .into();
             }
@@ -1604,33 +1923,33 @@ impl SetupCoordinator {
             SetupRequest::Status => self.status().await,
             SetupRequest::Cancel => {
                 if !self.is_active() {
-                    return Response::plain("ℹ️ Нет активной настройки для отмены.".to_owned())
+                    return Response::plain(self.message("ℹ️ No active setup to cancel.", "ℹ️ Нет активной настройки для отмены.").to_owned())
                         .into();
                 }
                 self.phase = SetupPhase::Idle;
-                Response::plain("✅ Настройка отменена.".to_owned())
+                Response::plain(self.message("✅ Setup cancelled.", "✅ Настройка отменена.").to_owned())
             }
             SetupRequest::Start => {
                 self.phase = SetupPhase::AwaitingUsername {
                     automatic: false,
                     deadline: Instant::now() + SETUP_STAGE_TIMEOUT,
                 };
-                Response::plain("🤖 Введите желаемое имя бота, оканчивающееся на _bot.".to_owned())
+                Response::plain(self.message("🤖 Enter the bot username ending in _bot.", "🤖 Введите желаемое имя бота, оканчивающееся на _bot.").to_owned())
             }
             SetupRequest::Auto => match setup::generate_candidate() {
                 Ok(username) => self.confirm_or_start(username, true, 1).await,
-                Err(_) => Response::plain("⚠️ Не удалось сгенерировать имя бота.".to_owned()),
+                Err(_) => Response::plain(self.message("⚠️ Could not generate a bot username.", "⚠️ Не удалось сгенерировать имя бота.").to_owned()),
             },
             SetupRequest::Username(value) => match setup::validate_username(value) {
                 Ok(username) => self.confirm_or_start(username, false, 1).await,
                 Err(_) => Response::plain(
-                    "⚠️ Имя должно содержать 5–32 ASCII-букв, цифр или _ и оканчиваться на _bot."
+                    self.message("⚠️ The username must contain 5–32 ASCII letters, digits, or _ and end in _bot.", "⚠️ Имя должно содержать 5–32 ASCII-букв, цифр или _ и оканчиваться на _bot.")
                         .to_owned(),
                 ),
             },
             SetupRequest::Repair => unreachable!("repair returns a provisioning request"),
             SetupRequest::Invalid => Response::plain(
-                "⚠️ Использование: setup [auto|<username_bot>|status|repair|cancel]".to_owned(),
+                self.message("⚠️ Usage: setup [auto|<username_bot>|status|repair|cancel]", "⚠️ Использование: setup [auto|<username_bot>|status|repair|cancel]").to_owned(),
             ),
         }
         .into()
@@ -1648,11 +1967,11 @@ impl SetupCoordinator {
             attempts,
             deadline: Instant::now() + SETUP_STAGE_TIMEOUT,
         };
-        Response::plain(format!(
-            "📋 План настройки\n\n• Создать companion-бота @{} с именем «{}».\n• Создать или восстановить приватный Lavis workspace.\n• Присоединить ваш Telegram-аккаунт к официальному публичному сообществу @lavis_userbot.\n• Добавить workspace, бота и сообщество в папку Lavis.\n\nНапишите confirm для подтверждения или cancel для отмены.",
-            username.display(),
-            crate::setup_telegram::DISPLAY_NAME
-        ))
+        let plan = self
+            .message("📋 Setup plan\n\n• Create companion bot @{username} named «{display_name}».\n• Create or repair the private Lavis workspace.\n• Join your account to the official public community @lavis_userbot.\n• Add the workspace, bot, and community to the Lavis folder.\n\nSend confirm to proceed or cancel to stop.", "📋 План настройки\n\n• Создать companion-бота @{username} с именем «{display_name}».\n• Создать или восстановить приватный Lavis workspace.\n• Присоединить ваш Telegram-аккаунт к официальному публичному сообществу @lavis_userbot.\n• Добавить workspace, бота и сообщество в папку Lavis.\n\nНапишите confirm для подтверждения или cancel для отмены.")
+            .replace("{username}", username.display())
+            .replace("{display_name}", crate::setup_telegram::DISPLAY_NAME);
+        Response::plain(plan)
     }
 
     async fn handle_input(&mut self, client: &Client, text: &str) -> Response {
@@ -1661,7 +1980,10 @@ impl SetupCoordinator {
             Some(setup::Confirmation::Cancelled)
         ) {
             self.phase = SetupPhase::Idle;
-            return Response::plain("✅ Настройка отменена.".to_owned());
+            return Response::plain(
+                self.message("✅ Setup cancelled.", "✅ Настройка отменена.")
+                    .to_owned(),
+            );
         }
         match &self.phase {
             SetupPhase::AwaitingUsername { .. } => self.handle_username_input(text).await,
@@ -1678,10 +2000,22 @@ impl SetupCoordinator {
                     self.start_flow(client, username.clone(), *automatic, *attempts)
                         .await
                 } else {
-                    Response::plain("⚠️ Напишите confirm или cancel.".to_owned())
+                    Response::plain(
+                        self.message(
+                            "⚠️ Send confirm or cancel.",
+                            "⚠️ Напишите confirm или cancel.",
+                        )
+                        .to_owned(),
+                    )
                 }
             }
-            _ => Response::plain("ℹ️ Настройка ожидает ответ BotFather.".to_owned()),
+            _ => Response::plain(
+                self.message(
+                    "ℹ️ Setup is waiting for BotFather.",
+                    "ℹ️ Настройка ожидает ответ BotFather.",
+                )
+                .to_owned(),
+            ),
         }
     }
 
@@ -1927,6 +2261,7 @@ impl SetupCoordinator {
                 )),
                 shutdown: None,
                 post_edit: None,
+                onboarding_page: false,
             },
             Err(response) => response.into(),
         }
@@ -2385,6 +2720,11 @@ mod tests {
     #[tokio::test]
     async fn setup_timeout_ends_flow_without_an_inbound_botfather_update() {
         let (mut runtime, directory) = runtime_with_alias().await;
+        runtime
+            .settings
+            .set_locale(Some(crate::i18n::Locale::English))
+            .await
+            .unwrap();
         let saved_messages = PeerId::user(1).unwrap();
         let botfather = PeerId::user(2).unwrap();
         runtime.configure_setup(
@@ -2402,9 +2742,41 @@ mod tests {
         tokio::time::sleep_until(deadline.into()).await;
         let response = runtime.handle_setup_timeout().unwrap();
 
-        assert!(response.text.contains("таймаут"));
+        assert!(response.text.contains("timed out"));
         assert!(runtime.setup_timeout_deadline().is_none());
         assert!(runtime.setup_protects_message(botfather, false));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_without_botfather_resolution_fails_closed_for_token_text() {
+        let (mut runtime, directory) = runtime_with_alias().await;
+        runtime
+            .settings
+            .set_locale(Some(crate::i18n::Locale::English))
+            .await
+            .unwrap();
+        runtime.configure_setup(
+            directory.join("state.json"),
+            directory.join("token"),
+            PeerId::user(1).unwrap(),
+        );
+        assert!(!runtime.external_projection_permitted_for_tests());
+        // This is representative BotFather token-shaped text. The gate is set
+        // before external modules are attached, so a restarted process cannot
+        // project it while authoritative peer resolution is unavailable.
+        assert!(
+            runtime
+                .prepare_message_event_dispatch(
+                    PeerId::user(2).unwrap(),
+                    1,
+                    crate::external_modules::protocol::MessageEventKind::Created,
+                    "123456:abcdefghijklmnopqrstUVWX",
+                    false,
+                    vec![],
+                )
+                .is_none()
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -2613,6 +2985,7 @@ mod tests {
             token_path: PathBuf::new(),
             saved_messages_peer: PeerId::user(1).unwrap(),
             botfather_peer: None,
+            locale: crate::i18n::Locale::Russian,
             phase: super::SetupPhase::Idle,
         };
 
@@ -2635,6 +3008,7 @@ mod tests {
             token_path: PathBuf::new(),
             saved_messages_peer: PeerId::user(1).unwrap(),
             botfather_peer: None,
+            locale: crate::i18n::Locale::Russian,
             phase: super::SetupPhase::AwaitingUsername {
                 automatic: false,
                 deadline: Instant::now(),
@@ -2781,6 +3155,11 @@ mod tests {
     #[tokio::test]
     async fn shows_existing_alias_with_utf16_safe_collapsed_body() {
         let (mut runtime, directory) = runtime_with_alias().await;
+        runtime
+            .settings
+            .set_locale(Some(crate::i18n::Locale::English))
+            .await
+            .unwrap();
         let response = runtime
             .execute_alias(
                 &AliasRequest::Show {
@@ -2817,6 +3196,11 @@ mod tests {
     #[tokio::test]
     async fn reports_missing_alias_and_invalid_show_usage() {
         let (mut runtime, directory) = runtime_with_alias().await;
+        runtime
+            .settings
+            .set_locale(Some(crate::i18n::Locale::English))
+            .await
+            .unwrap();
 
         assert_eq!(
             runtime
@@ -2827,7 +3211,7 @@ mod tests {
                     "!"
                 )
                 .await,
-            Response::plain("⚠️ Alias !missing does not exist")
+            Response::plain("⚠️ Alias does not exist: !missing")
         );
         assert_eq!(
             runtime.execute_alias(&AliasRequest::Invalid, "!").await,
@@ -2848,7 +3232,7 @@ mod tests {
             runtime.execute_modules(&crate::commands::ModulesRequest::Overview, runtime.prefix());
         assert!(overview.text.starts_with("🧩 Модули Lavis: 3\n\n"));
         assert!(overview.text.contains("🦀fastfetch"));
-        assert!(overview.text.contains("Команды (10)"));
+        assert!(overview.text.contains("Команды (12)"));
         assert_eq!(overview.entities.len(), 2);
         assert_eq!(
             runtime.execute_modules(&crate::commands::ModulesRequest::Invalid, runtime.prefix(),),
@@ -2866,7 +3250,7 @@ mod tests {
             "🧩 Модули Lavis: 3\n\n"
         );
         let body = String::from_utf16(&units[offset..offset + length]).unwrap();
-        assert!(body.contains("Команды (10)"));
+        assert!(body.contains("Команды (12)"));
         let grammers_client::tl::enums::MessageEntity::Blockquote(provenance) =
             &overview.entities[1]
         else {
@@ -2931,7 +3315,7 @@ mod tests {
                 .execute_prefix(&crate::commands::PrefixRequest::Set(".".to_owned()))
                 .await
                 .text,
-            "⚙️ Command prefix set to: ."
+            "⚙️ Префикс команд изменён: ."
         );
         assert_eq!(runtime.prefix(), ".");
         assert_eq!(
@@ -2946,7 +3330,7 @@ mod tests {
                 .execute_prefix(&crate::commands::PrefixRequest::Reset)
                 .await
                 .text,
-            "⚙️ Command prefix reset to: ,"
+            "⚙️ Префикс сброшен: ,"
         );
         assert_eq!(runtime.prefix(), ",");
         assert!(
@@ -2954,7 +3338,7 @@ mod tests {
                 .execute_prefix(&crate::commands::PrefixRequest::Set("bad".to_owned()))
                 .await
                 .text
-                .contains("Could not change")
+                .contains("Не удалось изменить")
         );
         assert_eq!(runtime.prefix(), ",");
         fs::remove_dir_all(directory).unwrap();

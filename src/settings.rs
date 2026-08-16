@@ -7,14 +7,29 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::error::SettingsError;
+use crate::{i18n::Locale, onboarding::OnboardingProgress};
 
 pub const DEFAULT_PREFIX: &str = ",";
-const VERSION: u32 = 1;
+/// Version 2 adds the locale and durable tutorial cursor. Version 1 is read as
+/// a migration input only and is rewritten as version 2 on the next mutation.
+const VERSION: u32 = 2;
+const LEGACY_VERSION: u32 = 1;
 const MAX_FILE_BYTES: usize = 4096;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SettingsFile {
+struct SettingsFileV2 {
+    version: u32,
+    prefix: String,
+    #[serde(default)]
+    locale: Option<Locale>,
+    #[serde(default)]
+    onboarding: OnboardingProgress,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SettingsFileV1 {
     version: u32,
     prefix: String,
 }
@@ -22,20 +37,24 @@ struct SettingsFile {
 pub struct SettingsStore {
     path: PathBuf,
     prefix: String,
+    locale: Option<Locale>,
+    onboarding: OnboardingProgress,
     temporary_counter: u64,
 }
 
 impl SettingsStore {
     pub async fn load(path: PathBuf) -> Result<Self, SettingsError> {
-        let prefix = tokio::task::spawn_blocking({
+        let settings = tokio::task::spawn_blocking({
             let path = path.clone();
-            move || load_prefix(&path)
+            move || load_settings(&path)
         })
         .await
         .map_err(|_| SettingsError::StorageTask)??;
         Ok(Self {
             path,
-            prefix,
+            prefix: settings.prefix,
+            locale: settings.locale,
+            onboarding: settings.onboarding,
             temporary_counter: 0,
         })
     }
@@ -43,13 +62,50 @@ impl SettingsStore {
     pub fn prefix(&self) -> &str {
         &self.prefix
     }
+    pub fn locale(&self) -> Option<Locale> {
+        self.locale
+    }
+    pub fn onboarding(&self) -> OnboardingProgress {
+        self.onboarding
+    }
 
     pub async fn set_prefix(&mut self, prefix: String) -> Result<(), SettingsError> {
         validate_prefix(&prefix)?;
+        self.persist(prefix.clone(), self.locale, self.onboarding)
+            .await?;
+        self.prefix = prefix;
+        Ok(())
+    }
+
+    pub async fn set_locale(&mut self, locale: Option<Locale>) -> Result<(), SettingsError> {
+        self.persist(self.prefix.clone(), locale, self.onboarding)
+            .await?;
+        self.locale = locale;
+        Ok(())
+    }
+
+    pub async fn set_onboarding(
+        &mut self,
+        onboarding: OnboardingProgress,
+    ) -> Result<(), SettingsError> {
+        self.persist(self.prefix.clone(), self.locale, onboarding)
+            .await?;
+        self.onboarding = onboarding;
+        Ok(())
+    }
+
+    async fn persist(
+        &mut self,
+        prefix: String,
+        locale: Option<Locale>,
+        onboarding: OnboardingProgress,
+    ) -> Result<(), SettingsError> {
         self.temporary_counter = self.temporary_counter.saturating_add(1);
-        let bytes = serde_json::to_vec_pretty(&SettingsFile {
+        let bytes = serde_json::to_vec_pretty(&SettingsFileV2 {
             version: VERSION,
-            prefix: prefix.clone(),
+            prefix,
+            locale,
+            onboarding,
         })
         .map_err(|_| SettingsError::WriteTemporary)?;
         let directory_sync_error = tokio::task::spawn_blocking({
@@ -59,7 +115,6 @@ impl SettingsStore {
         })
         .await
         .map_err(|_| SettingsError::StorageTask)??;
-        self.prefix = prefix;
         if let Some(error) = directory_sync_error {
             tracing::warn!(
                 event = "settings_directory_sync_failed",
@@ -100,11 +155,16 @@ fn is_invisible_format_control(character: char) -> bool {
         '\u{E0100}'..='\u{E01EF}')
 }
 
-fn load_prefix(path: &Path) -> Result<String, SettingsError> {
+fn load_settings(path: &Path) -> Result<SettingsFileV2, SettingsError> {
     let file = match fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(DEFAULT_PREFIX.to_owned());
+            return Ok(SettingsFileV2 {
+                version: VERSION,
+                prefix: DEFAULT_PREFIX.to_owned(),
+                locale: None,
+                onboarding: OnboardingProgress::NotStarted,
+            });
         }
         Err(_) => return Err(SettingsError::Read),
     };
@@ -115,13 +175,35 @@ fn load_prefix(path: &Path) -> Result<String, SettingsError> {
     if bytes.len() > MAX_FILE_BYTES {
         return Err(SettingsError::FileTooLarge);
     }
-    let settings: SettingsFile =
+    let value: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|_| SettingsError::MalformedFile)?;
-    if settings.version != VERSION {
-        return Err(SettingsError::UnsupportedVersion);
-    }
+    let version = value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or(SettingsError::MalformedFile)?;
+    let settings = match version {
+        version if version == u64::from(LEGACY_VERSION) => {
+            let v1: SettingsFileV1 =
+                serde_json::from_value(value).map_err(|_| SettingsError::MalformedFile)?;
+            // Keep this assertion explicit so a malformed probe cannot become a
+            // future migration path by accident.
+            if v1.version != LEGACY_VERSION {
+                return Err(SettingsError::UnsupportedVersion);
+            }
+            SettingsFileV2 {
+                version: VERSION,
+                prefix: v1.prefix,
+                locale: None,
+                onboarding: OnboardingProgress::NotStarted,
+            }
+        }
+        version if version == u64::from(VERSION) => {
+            serde_json::from_value(value).map_err(|_| SettingsError::MalformedFile)?
+        }
+        _ => return Err(SettingsError::UnsupportedVersion),
+    };
     validate_prefix(&settings.prefix)?;
-    Ok(settings.prefix)
+    Ok(settings)
 }
 
 fn write_settings(
@@ -234,17 +316,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v1_settings_migrate_locale_and_progress_without_changing_prefix() {
+        let path = path();
+        fs::write(&path, br#"{"version":1,"prefix":"!"}"#).unwrap();
+        let mut store = SettingsStore::load(path.clone()).await.unwrap();
+        assert_eq!(store.prefix(), "!");
+        assert_eq!(store.locale(), None);
+        assert_eq!(store.onboarding(), OnboardingProgress::NotStarted);
+        store.set_locale(Some(Locale::English)).await.unwrap();
+        store
+            .set_onboarding(OnboardingProgress::Ping)
+            .await
+            .unwrap();
+        let reloaded = SettingsStore::load(path.clone()).await.unwrap();
+        assert_eq!(reloaded.prefix(), "!");
+        assert_eq!(reloaded.locale(), Some(Locale::English));
+        assert_eq!(reloaded.onboarding(), OnboardingProgress::Ping);
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("\"version\": 2")
+        );
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn v2_uses_stable_short_locale_codes_and_rejects_unknown_values() {
+        let path = path();
+        let mut store = SettingsStore::load(path.clone()).await.unwrap();
+        store.set_locale(Some(Locale::English)).await.unwrap();
+        let persisted = fs::read_to_string(&path).unwrap();
+        assert!(persisted.contains("\"locale\": \"en\""));
+        assert!(!persisted.contains("english"));
+        fs::write(
+            &path,
+            br#"{"version":2,"prefix":",","locale":"de","onboarding":"intro"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            SettingsStore::load(path.clone()).await,
+            Err(SettingsError::MalformedFile)
+        ));
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
     async fn rejects_invalid_settings_bytes_without_replacing_them() {
         let path = path();
         let fixtures = [
             (vec![0xff, 0xfe], SettingsError::MalformedFile),
             (
-                br#"{"version":2,"prefix":"."}"#.to_vec(),
+                br#"{"version":3,"prefix":"."}"#.to_vec(),
                 SettingsError::UnsupportedVersion,
             ),
             (vec![b'x'; MAX_FILE_BYTES + 1], SettingsError::FileTooLarge),
             (
-                br#"{"version":1,"prefix":"\u200b"}"#.to_vec(),
+                br#"{"version":2,"prefix":"\u200b"}"#.to_vec(),
                 SettingsError::InvalidPrefix,
             ),
         ];

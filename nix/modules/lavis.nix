@@ -65,17 +65,6 @@ let
     id: builtins.match "[a-z][a-z0-9-]{0,31}" id != null
   );
 
-  settingsFile =
-    if cfg.settings.prefix == null then
-      null
-    else
-      pkgs.writeText "lavis-settings.json" (
-        builtins.toJSON {
-          version = 1;
-          prefix = cfg.settings.prefix;
-        }
-      );
-
   fastfetchProfileFile =
     if cfg.fastfetchProfile == null then
       null
@@ -156,9 +145,81 @@ let
       ${lib.escapeShellArg modulesDir} \
       ${lib.escapeShellArg moduleStagingDir}
 
-    ${lib.optionalString (settingsFile != null) ''
-      install -m 600 \
-        ${lib.escapeShellArg settingsFile} ${lib.escapeShellArg "${lavisStateDir}/settings.json"}
+    ${lib.optionalString (cfg.settings.prefix != null) ''
+      ${pkgs.python3}/bin/python3 - ${lib.escapeShellArg "${lavisStateDir}/settings.json"} ${lib.escapeShellArg cfg.settings.prefix} <<'PY'
+import json
+import os
+import stat
+import sys
+import tempfile
+
+path, prefix = sys.argv[1:]
+parent = os.path.dirname(path)
+allowed_progress = {
+    "not_started", "intro", "prefix", "ping", "help", "modules",
+    "external_modules", "companion", "completion", "complete", "skipped",
+}
+
+def valid_prefix(value):
+    return (isinstance(value, str) and 1 <= len(value) <= 4
+            and not any(ch.isspace() or ch.isalpha() or ord(ch) < 32 or ord(ch) == 127
+                        or __import__("unicodedata").category(ch) == "Cf" for ch in value))
+
+def checked_file(candidate):
+    info = os.lstat(candidate)
+    if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+        raise SystemExit("lavis settings file is not a private regular file")
+
+if not valid_prefix(prefix):
+    raise SystemExit("services.lavis.settings.prefix is invalid")
+
+try:
+    checked_file(path)
+except FileNotFoundError:
+    state = {"version": 2, "prefix": prefix, "locale": None, "onboarding": "not_started"}
+else:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            previous = json.load(handle)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SystemExit("could not read existing Lavis settings safely") from error
+    if not isinstance(previous, dict):
+        raise SystemExit("existing Lavis settings are malformed")
+    version = previous.get("version")
+    if version == 1 and set(previous) == {"version", "prefix"} and valid_prefix(previous["prefix"]):
+        state = {"version": 2, "prefix": prefix, "locale": None, "onboarding": "not_started"}
+    elif (version == 2 and set(previous) == {"version", "prefix", "locale", "onboarding"}
+          and valid_prefix(previous["prefix"])
+          and previous["locale"] in (None, "en", "ru", "english", "russian")
+          and previous["onboarding"] in allowed_progress):
+        # Preserve user-owned v2 state. Legacy locale spellings are accepted by
+        # the Rust migration and normalized on its next write.
+        locale = {"english": "en", "russian": "ru"}.get(previous["locale"], previous["locale"])
+        state = {"version": 2, "prefix": prefix, "locale": locale, "onboarding": previous["onboarding"]}
+    else:
+        raise SystemExit("existing Lavis settings have an unsupported schema")
+
+payload = (json.dumps(state, indent=2) + "\n").encode()
+fd, temporary = tempfile.mkstemp(prefix=".settings.json.nixos.", dir=parent)
+try:
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "wb", closefd=True) as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+    directory = os.open(parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+except BaseException:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    raise
+PY
     ''}
 
     ${lib.optionalString (fastfetchProfileFile != null) ''

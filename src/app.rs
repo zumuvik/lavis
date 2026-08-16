@@ -23,7 +23,9 @@ pub mod error;
 pub mod external_modules;
 pub mod fastfetch;
 pub mod help;
+pub mod i18n;
 pub mod modules;
+pub mod onboarding;
 pub mod reboot_receipt;
 pub mod response;
 pub mod runtime;
@@ -198,6 +200,7 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
             .await
             .context("failed to load persistent settings")?;
         let prefix = settings.prefix().to_owned();
+        let locale = settings.locale();
 
         let outcome = match auth::authorize(guard.inner().client(), &config).await {
             Ok(outcome) => outcome,
@@ -258,7 +261,7 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
             );
         }
         if should_show_quick_start(&outcome) {
-            let quick_start = render_quick_start(&prefix);
+            let quick_start = render_quick_start(&prefix, locale);
             if let Err(error) = guard
                 .inner()
                 .client()
@@ -273,7 +276,7 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
                     error = %error,
                     "Failed to send post-auth quick start message"
                 );
-                let fallback = render_quick_start_fallback(&quick_start);
+                let fallback = render_quick_start_fallback(&quick_start, locale);
                 let _ = writeln!(io::stdout().lock(), "{fallback}");
             }
         }
@@ -392,6 +395,17 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
                 .context("failed to determine companion token path")?,
             self_user_id,
         );
+        // Resolve this on every process start, not only while an interactive
+        // setup is active. Until it succeeds RuntimeState fails closed and
+        // suppresses external event projection, preventing BotFather replies
+        // (including token-shaped text) from reaching third-party modules.
+        match setup_telegram::GrammersTelegramSetup::resolve(guard.inner().client()).await {
+            Ok((_transport, peer)) => runtime.set_setup_botfather_peer(peer),
+            Err(_) => tracing::warn!(
+                event = "botfather_peer_resolution_failed",
+                "External event projection is disabled until BotFather can be resolved"
+            ),
+        }
         runtime.configure_module_installation(
             module_root.clone(),
             module_staging_root,
@@ -963,17 +977,21 @@ fn should_show_quick_start(outcome: &AuthorizationOutcome) -> bool {
     outcome.is_just_completed()
 }
 
-fn render_quick_start(prefix: &str) -> String {
-    format!(
-        "✅ Авторизация завершена\n\n\
-        Начало работы:\n  {prefix}help\n  {prefix}modules\n  {prefix}help fastfetch\n  {prefix}help alias"
-    )
+fn render_quick_start(prefix: &str, locale: Option<i18n::Locale>) -> String {
+    match locale {
+        Some(locale) => i18n::text(locale, i18n::Text::PostAuthInvite).replace("{prefix}", prefix),
+        None => i18n::bilingual(i18n::Text::PostAuthInvite, prefix),
+    }
 }
 
-fn render_quick_start_fallback(quick_start: &str) -> String {
+fn render_quick_start_fallback(quick_start: &str, locale: Option<i18n::Locale>) -> String {
     format!(
-        "Не удалось отправить подсказку в Telegram.\n\n\
-        {quick_start}"
+        "{}\n\n{quick_start}",
+        match locale {
+            Some(locale) => i18n::text(locale, i18n::Text::PostAuthFallback),
+            None =>
+                "Could not send the Telegram invitation. / Не удалось отправить приглашение в Telegram.",
+        }
     )
 }
 
@@ -1574,25 +1592,21 @@ mod tests {
 
     #[test]
     fn render_quick_start_uses_non_default_prefix() {
-        let text = render_quick_start("🦀");
-        assert!(text.contains("🦀help"));
-        assert!(text.contains("🦀modules"));
-        assert!(text.contains("🦀help fastfetch"));
-        assert!(text.contains("🦀help alias"));
+        let text = render_quick_start("🦀", Some(crate::i18n::Locale::Russian));
+        assert!(text.contains("🦀start"));
         assert!(!text.contains(",help"));
     }
 
     #[test]
     fn render_quick_start_preserves_russian_and_emoji() {
-        let text = render_quick_start(",");
-        assert!(text.contains("✅"));
+        let text = render_quick_start(",", Some(crate::i18n::Locale::Russian));
         assert!(text.contains("Авторизация завершена"));
-        assert!(text.contains("Начало работы"));
+        assert!(text.contains(",start"));
     }
 
     #[test]
     fn render_quick_start_contains_no_sensitive_data() {
-        let text = render_quick_start(",");
+        let text = render_quick_start(",", Some(crate::i18n::Locale::Russian));
         assert!(!text.contains("/home/"));
         assert!(!text.contains("api_id"));
         assert!(!text.contains("api_hash"));
@@ -1602,11 +1616,10 @@ mod tests {
 
     #[test]
     fn render_quick_start_fallback_is_russian_and_includes_text() {
-        let inner = render_quick_start(",");
-        let fallback = render_quick_start_fallback(&inner);
-        assert!(fallback.starts_with("Не удалось отправить подсказку в Telegram."));
+        let inner = render_quick_start(",", Some(crate::i18n::Locale::Russian));
+        let fallback = render_quick_start_fallback(&inner, Some(crate::i18n::Locale::Russian));
+        assert!(fallback.starts_with("Не удалось отправить приглашение в Telegram."));
         assert!(fallback.contains(inner.as_str()));
-        assert!(fallback.contains("✅"));
         assert!(fallback.contains("Авторизация завершена"));
     }
 }

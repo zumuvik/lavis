@@ -1987,7 +1987,14 @@ sys.exit(0)
         ensure_test_state_base();
 
         let mut module = descriptor();
-        module.id = format!("v6late{}{}", kind, std::process::id());
+        // State directories are keyed by module ID.  A per-fixture ID avoids
+        // concurrent test instances sharing state when the test binary or its
+        // temporary directory is reused by a sandbox runner.
+        module.id = format!(
+            "v6late{kind}-{}-{}",
+            std::process::id(),
+            protocol::request_id()
+        );
         module.module_dir = root.clone();
         module.entrypoint = entrypoint.clone();
         let late_expression = match kind {

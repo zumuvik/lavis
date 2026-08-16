@@ -275,20 +275,45 @@ mod tests {
     use crate::error::{ClientError, LastAuthorizationDiagnostic};
     use std::{
         fs,
+        io::Read,
         os::unix::fs::{PermissionsExt, symlink},
+        process::{Child, Stdio},
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    /// Reap the lock holder even when an assertion panics.
+    struct ChildGuard(Option<Child>);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
 
     fn test_directory(label: &str) -> std::path::PathBuf {
         static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "lavis-session-lock-{label}-{}-{sequence}",
+            "lavis-session-lock-{label}-{}-{}-{sequence}",
+            std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    /// Resolve test-only helper programs before starting the child. This avoids
+    /// relying on the `flock` child's PATH to find a helper in Nix sandboxes.
+    fn test_executable(name: &str) -> std::path::PathBuf {
+        std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+            .map(|directory| directory.join(name))
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| panic!("session-lock tests require {name} in PATH"))
     }
 
     #[test]
@@ -416,21 +441,45 @@ mod tests {
         fs::create_dir(&directory).unwrap();
         let session_path = directory.join("session");
         let lock_path = lock_path(&session_path);
-        let mut child = std::process::Command::new("sh")
+        let ready_path = directory.join("lock-holder-ready");
+        let mut child = std::process::Command::new(test_executable("flock"))
+            .args(["-n", lock_path.to_str().unwrap()])
+            .arg(test_executable("python3"))
             .args([
                 "-c",
-                "exec 9>\"$1\"; flock -n 9; sleep 1",
-                "sh",
-                lock_path.to_str().unwrap(),
+                "import pathlib, sys, time; pathlib.Path(sys.argv[1]).touch(); time.sleep(30)",
+                ready_path.to_str().unwrap(),
             ])
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if ready_path.exists() {
+                break;
+            }
+            match child.try_wait().unwrap() {
+                Some(status) => {
+                    let mut stderr = String::new();
+                    if let Some(mut child_stderr) = child.stderr.take() {
+                        let _ = child_stderr.read_to_string(&mut stderr);
+                    }
+                    panic!("lock holder exited before acquiring the lock ({status}): {stderr}");
+                }
+                None => {}
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "lock holder did not become ready before the deadline"
+            );
+            std::thread::yield_now();
+        }
+        let holder = ChildGuard(Some(child));
         assert!(matches!(
             SessionLock::acquire(&session_path, SessionLockContext::Client),
             Err(ClientError::SessionLocked)
         ));
-        child.wait().unwrap();
+        drop(holder);
         fs::remove_dir_all(directory).unwrap();
     }
 }

@@ -3,6 +3,8 @@ use crate::modules::ModuleId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CommandKind {
+    Start,
+    Language,
     Ping,
     Stats,
     Help,
@@ -39,7 +41,31 @@ pub struct CommandDefinition {
     pub module: ModuleId,
 }
 
-const COMMAND_SPECS: [CommandDefinition; 10] = [
+const COMMAND_SPECS: [CommandDefinition; 12] = [
+    CommandDefinition {
+        kind: CommandKind::Start,
+        name: "start",
+        usage: "start [en|ru|skip|bot]",
+        summary_ru: "Начать обучение",
+        description_ru: "Запускает последовательное обучение Lavis или единый безопасный сценарий настройки companion и приватного workspace.",
+        examples: &["start", "start ru", "start skip", "start bot"],
+        risk: CommandRisk::PersistentStateChange,
+        icon: "👋",
+        aliasable: false,
+        module: ModuleId::Core,
+    },
+    CommandDefinition {
+        kind: CommandKind::Language,
+        name: "language",
+        usage: "language [en|ru]",
+        summary_ru: "Показать или изменить язык",
+        description_ru: "Показывает выбранный язык интерфейса или сохраняет новый без сброса настроек.",
+        examples: &["language", "language en", "language ru"],
+        risk: CommandRisk::PersistentStateChange,
+        icon: "🌐",
+        aliasable: false,
+        module: ModuleId::Core,
+    },
     CommandDefinition {
         kind: CommandKind::Help,
         name: "help",
@@ -221,6 +247,8 @@ pub struct ExternalInvocation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
+    Start(StartRequest),
+    Language(LanguageRequest),
     Ping,
     Stats,
     Help(HelpRequest),
@@ -262,6 +290,8 @@ pub enum PrefixRequest {
 impl Action {
     pub fn name(&self) -> &str {
         match self {
+            Self::Start(_) => "start",
+            Self::Language(_) => "language",
             Self::Ping => "ping",
             Self::Stats => "stats",
             Self::Help(_) => "help",
@@ -285,6 +315,8 @@ impl Action {
 pub fn dispatch(command: &Command) -> Option<Action> {
     let definition = canonical_command(&command.name)?;
     match definition.kind {
+        CommandKind::Start => Some(Action::Start(parse_start_request(&command.args))),
+        CommandKind::Language => Some(Action::Language(parse_language_request(&command.args))),
         CommandKind::Ping => Some(Action::Ping),
         CommandKind::Stats => Some(Action::Stats),
         CommandKind::Help => Some(Action::Help(parse_help_request(&command.args))),
@@ -307,6 +339,50 @@ pub fn definition(kind: CommandKind) -> &'static CommandDefinition {
 pub enum ModulesRequest {
     Overview,
     Invalid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartRequest {
+    Begin,
+    Locale(crate::i18n::Locale),
+    Skip,
+    Bot,
+    Invalid,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LanguageRequest {
+    Show,
+    Set(crate::i18n::Locale),
+    Invalid,
+}
+
+fn parse_start_request(args: &str) -> StartRequest {
+    let mut words = args.split_whitespace();
+    let Some(word) = words.next() else {
+        return StartRequest::Begin;
+    };
+    if words.next().is_some() {
+        return StartRequest::Invalid;
+    }
+    match word.to_ascii_lowercase().as_str() {
+        "skip" => StartRequest::Skip,
+        "bot" => StartRequest::Bot,
+        _ => crate::i18n::Locale::parse(word)
+            .map(StartRequest::Locale)
+            .unwrap_or(StartRequest::Invalid),
+    }
+}
+fn parse_language_request(args: &str) -> LanguageRequest {
+    let mut words = args.split_whitespace();
+    let Some(word) = words.next() else {
+        return LanguageRequest::Show;
+    };
+    if words.next().is_some() {
+        return LanguageRequest::Invalid;
+    }
+    crate::i18n::Locale::parse(word)
+        .map(LanguageRequest::Set)
+        .unwrap_or(LanguageRequest::Invalid)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -498,8 +574,9 @@ fn parse_help_request(args: &str) -> HelpRequest {
 #[cfg(test)]
 mod tests {
     use super::{
-        Action, AliasRequest, CommandKind, CommandRisk, HelpRequest, LmRequest, ModulesRequest,
-        SetupRequest, command_by_kind, command_by_name, commands, dispatch, module_for_command,
+        Action, AliasRequest, CommandKind, CommandRisk, HelpRequest, LanguageRequest, LmRequest,
+        ModulesRequest, SetupRequest, StartRequest, command_by_kind, command_by_name, commands,
+        dispatch, module_for_command,
     };
     use crate::command::Command;
     use crate::modules::{
@@ -515,6 +592,35 @@ mod tests {
         };
 
         assert_eq!(dispatch(&command), Some(Action::Ping));
+    }
+
+    #[test]
+    fn dispatches_start_and_language_with_exact_arguments() {
+        assert_eq!(
+            dispatch(&Command {
+                name: "start".into(),
+                args: "ru".into()
+            }),
+            Some(Action::Start(StartRequest::Locale(
+                crate::i18n::Locale::Russian
+            )))
+        );
+        assert_eq!(
+            dispatch(&Command {
+                name: "start".into(),
+                args: "group".into()
+            }),
+            Some(Action::Start(StartRequest::Invalid))
+        );
+        assert_eq!(
+            dispatch(&Command {
+                name: "language".into(),
+                args: "en".into()
+            }),
+            Some(Action::Language(LanguageRequest::Set(
+                crate::i18n::Locale::English
+            )))
+        );
     }
 
     #[test]
@@ -590,6 +696,8 @@ mod tests {
         assert_eq!(
             names,
             [
+                "start",
+                "language",
                 "help",
                 "reboot",
                 "modules",
@@ -675,7 +783,8 @@ mod tests {
                 .map(|command| command.name)
                 .collect::<Vec<_>>(),
             [
-                "help", "reboot", "modules", "ping", "prefix", "setup", "lm", "stats"
+                "start", "language", "help", "reboot", "modules", "ping", "prefix", "setup", "lm",
+                "stats"
             ]
         );
         assert_eq!(
