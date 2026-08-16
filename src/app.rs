@@ -988,9 +988,8 @@ fn render_quick_start_fallback(quick_start: &str, locale: Option<i18n::Locale>) 
     format!(
         "{}\n\n{quick_start}",
         match locale {
-            Some(locale) => i18n::text(locale, i18n::Text::PostAuthFallback),
-            None =>
-                "Could not send the Telegram invitation. / Не удалось отправить приглашение в Telegram.",
+            Some(locale) => i18n::text(locale, i18n::Text::PostAuthFallback).to_owned(),
+            None => i18n::bilingual(i18n::Text::PostAuthFallback, ""),
         }
     )
 }

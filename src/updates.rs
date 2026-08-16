@@ -11,6 +11,7 @@ use tokio::task::JoinSet;
 use crate::{
     command::parse,
     commands::{Action, dispatch},
+    i18n::{RebootText, reboot_text},
     reboot_receipt::{
         ArmOutcome, PendingRebootReceipt, RebootReceiptCompletion, RebootReceiptCoordinatorError,
         RebootReceiptEditIntent, RebootReceiptEditor, RebootReceiptStore, ReceiptEditOutcome,
@@ -518,17 +519,18 @@ async fn process_update(
         );
     }
     let post_edit = execution.post_edit;
+    let locale = runtime.locale();
     let onboarding_page = execution.onboarding_page;
     let mut shutdown_reason = execution.shutdown;
     let reboot_target = if matches!(post_edit, Some(PostEditAction::ArmRebootReceipt)) {
         match receipt_store.load(&SystemClock).await {
             Ok(crate::reboot_receipt::LoadOutcome::Pending(_)) => {
-                let text = "⚠️ Уже ожидается подтверждение предыдущего перезапуска.".to_owned();
+                let text = reboot_text(locale, RebootText::Pending, None);
                 fallback_reboot_edit(&message, runtime, peer_id, message_id, text).await;
                 return None;
             }
             Err(_) => {
-                let text = "⚠️ Не удалось проверить подтверждение перезапуска.".to_owned();
+                let text = reboot_text(locale, RebootText::ReceiptLookupFailed, None);
                 fallback_reboot_edit(&message, runtime, peer_id, message_id, text).await;
                 return None;
             }
@@ -536,7 +538,7 @@ async fn process_update(
             Ok(_) => match message.peer_ref().await {
                 Ok(Some(peer)) => Some(receipt_target_from_peer_ref(peer)),
                 _ => {
-                    let text = "⚠️ Не удалось подготовить подтверждение перезапуска.".to_owned();
+                    let text = reboot_text(locale, RebootText::ReceiptPreparationFailed, None);
                     fallback_reboot_edit(&message, runtime, peer_id, message_id, text).await;
                     return None;
                 }
@@ -578,7 +580,7 @@ async fn process_update(
     }
     if matches!(post_edit, Some(PostEditAction::ArmRebootReceipt)) {
         if !source_edit_succeeded {
-            let failure = "⚠️ Не удалось начать перезапуск; Lavis продолжает работу.".to_owned();
+            let failure = reboot_text(locale, RebootText::StartFailed, None);
             fallback_reboot_edit(&message, runtime, peer_id, message_id, failure).await;
             return None;
         }
@@ -591,7 +593,7 @@ async fn process_update(
                     runtime,
                     peer_id,
                     message_id,
-                    "⚠️ Не удалось начать перезапуск; Lavis продолжает работу.".to_owned(),
+                    reboot_text(locale, RebootText::StartFailed, None),
                 )
                 .await;
                 return None;
@@ -605,7 +607,7 @@ async fn process_update(
                     runtime,
                     peer_id,
                     message_id,
-                    "⚠️ Не удалось начать перезапуск; Lavis продолжает работу.".to_owned(),
+                    reboot_text(locale, RebootText::StartFailed, None),
                 )
                 .await;
                 return None;
@@ -616,9 +618,7 @@ async fn process_update(
                 shutdown_reason = Some(ShutdownReason::Restart);
             }
             Ok(ArmOutcome::Conflict) | Err(_) => {
-                let failure =
-                    "⚠️ Не удалось сохранить подтверждение перезапуска; Lavis продолжает работу."
-                        .to_owned();
+                let failure = reboot_text(locale, RebootText::ReceiptArmFailed, None);
                 fallback_reboot_edit(&message, runtime, peer_id, message_id, failure).await;
                 shutdown_reason = None;
             }
@@ -667,6 +667,7 @@ async fn consume_pending_reboot_receipt(
     self_user_id: PeerId,
     receipt_store: &RebootReceiptStore,
 ) {
+    let locale = runtime.locale();
     let mut editor = TelegramRebootReceiptEditor {
         client,
         runtime,
@@ -681,6 +682,7 @@ async fn consume_pending_reboot_receipt(
             &mut editor,
             &mut sleeper,
             Default::default(),
+            locale,
         ),
     )
     .await;
@@ -893,63 +895,19 @@ fn provision_completion_text(
     prefix: &str,
     locale: crate::i18n::Locale,
 ) -> String {
-    let english = locale == crate::i18n::Locale::English;
-    match outcome {
-        ProvisionOutcome::Completed => if english {
-            "✅ Companion workspace and official community @lavis_userbot are configured."
-        } else {
-            "✅ Companion workspace и официальное сообщество @lavis_userbot настроены."
-        }
-        .to_owned(),
-        ProvisionOutcome::CompletedWithoutCommunity(_) => {
-            if english {
-                format!(
-                    "⚠️ Companion workspace is ready, but joining @lavis_userbot failed. Retry {prefix}setup repair."
-                )
-            } else {
-                format!(
-                    "⚠️ Companion workspace готов, но присоединиться к @lavis_userbot не удалось. Повторите {prefix}setup repair."
-                )
-            }
-        }
+    use crate::i18n::{SetupText, setup_text};
+    let key = match outcome {
+        ProvisionOutcome::Completed => SetupText::ProvisionCompleted,
+        ProvisionOutcome::CompletedWithoutCommunity(_) => SetupText::ProvisionWithoutCommunity,
         ProvisionOutcome::CompletedWithoutFolder(
             crate::setup_provision::CompletedWithoutFolder::Capacity,
-        ) => {
-            if english {
-                format!(
-                    "⚠️ Companion workspace is configured without a folder: the folder limit was reached. Retry {prefix}setup repair later."
-                )
-            } else {
-                format!(
-                    "⚠️ Companion workspace настроен без папки: достигнут лимит папок. Повторите {prefix}setup repair позже."
-                )
-            }
-        }
+        ) => SetupText::ProvisionWithoutFolderCapacity,
         ProvisionOutcome::CompletedWithoutFolder(
             crate::setup_provision::CompletedWithoutFolder::NameOrOwnershipConflict,
-        ) => {
-            if english {
-                format!(
-                    "⚠️ Companion workspace is configured without a folder: its name or ownership conflicts. Retry {prefix}setup repair after resolving it."
-                )
-            } else {
-                format!(
-                    "⚠️ Companion workspace настроен без папки: папка занята или принадлежит другой настройке. Повторите {prefix}setup repair после устранения конфликта."
-                )
-            }
-        }
-        ProvisionOutcome::Failed(_) => {
-            if english {
-                format!(
-                    "⚠️ Companion workspace repair did not finish. Retry {prefix}setup repair later."
-                )
-            } else {
-                format!(
-                    "⚠️ Восстановление companion workspace не завершено. Повторите {prefix}setup repair позже."
-                )
-            }
-        }
-    }
+        ) => SetupText::ProvisionWithoutFolderConflict,
+        ProvisionOutcome::Failed(_) => SetupText::ProvisionFailed,
+    };
+    setup_text(locale, key).replace("{prefix}", prefix)
 }
 
 fn command_argument_entities(
@@ -1152,7 +1110,7 @@ mod tests {
     #[test]
     fn reboot_completion_text_is_exact() {
         assert_eq!(
-            reboot_completion_text(35_033),
+            reboot_completion_text(crate::i18n::Locale::Russian, 35_033),
             "✅ Lavis перезагрузился\n\nВремя перезагрузки: 35 с"
         );
     }
@@ -1163,7 +1121,7 @@ mod tests {
         let self_user = PeerId::user(1).unwrap();
         let intent = crate::reboot_receipt::RebootReceiptEditIntent {
             receipt: PendingRebootReceipt::new(ReceiptTarget::SelfUser, 42, 1).unwrap(),
-            text: reboot_completion_text(428),
+            text: reboot_completion_text(crate::i18n::Locale::Russian, 428),
         };
 
         register_reboot_completion_suppression(
@@ -1177,6 +1135,14 @@ mod tests {
 
     #[test]
     fn provisioning_completion_uses_only_safe_status_text() {
+        assert_eq!(
+            provision_completion_text(
+                crate::setup_telegram::ProvisionOutcome::Completed,
+                ".",
+                crate::i18n::Locale::English,
+            ),
+            "✅ Companion workspace and official community @lavis_userbot are configured."
+        );
         assert_eq!(
             provision_completion_text(
                 crate::setup_telegram::ProvisionOutcome::Completed,
@@ -1224,6 +1190,16 @@ mod tests {
                 crate::i18n::Locale::Russian,
             ),
             "⚠️ Восстановление companion workspace не завершено. Повторите .setup repair позже."
+        );
+        assert_eq!(
+            provision_completion_text(
+                crate::setup_telegram::ProvisionOutcome::Failed(
+                    crate::setup_grammers::ProvisionError::InviteBot,
+                ),
+                ".",
+                crate::i18n::Locale::English,
+            ),
+            "⚠️ Companion workspace repair did not finish. Retry .setup repair later."
         );
     }
 

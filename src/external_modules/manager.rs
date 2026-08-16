@@ -30,7 +30,15 @@ pub struct ExternalModuleStatus {
     pub author: String,
     pub capabilities: Vec<String>,
     pub command_count: usize,
-    pub status: &'static str,
+    pub status: ExternalModuleRuntimeStatus,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ExternalModuleRuntimeStatus {
+    Running,
+    Failed,
+    Terminated,
+    InstalledDisabled,
 }
 
 pub struct ExternalManager {
@@ -195,20 +203,22 @@ impl ExternalManager {
     pub fn statuses(&self) -> Vec<ExternalModuleStatus> {
         let mut statuses = Vec::new();
         for desc in &self.descriptors {
-            let status_label = if let Some(proc) = self
+            let status = if let Some(proc) = self
                 .processes
                 .get(&desc.id)
                 .and_then(ManagedProcess::status)
             {
                 match proc {
-                    ProcessStatus::Running => "активен",
-                    ProcessStatus::Failed | ProcessStatus::Crashed => "ошибка",
-                    ProcessStatus::Terminated => "остановлен",
+                    ProcessStatus::Running => ExternalModuleRuntimeStatus::Running,
+                    ProcessStatus::Failed | ProcessStatus::Crashed => {
+                        ExternalModuleRuntimeStatus::Failed
+                    }
+                    ProcessStatus::Terminated => ExternalModuleRuntimeStatus::Terminated,
                 }
             } else if self.latest_diagnostics.contains_key(&desc.id) {
-                "ошибка"
+                ExternalModuleRuntimeStatus::Failed
             } else {
-                "установлен, выключен"
+                ExternalModuleRuntimeStatus::InstalledDisabled
             };
             statuses.push(ExternalModuleStatus {
                 id: desc.id.clone(),
@@ -221,7 +231,7 @@ impl ExternalManager {
                     .map(|c| c.as_str().to_owned())
                     .collect(),
                 command_count: desc.commands.len(),
-                status: status_label,
+                status,
             });
         }
         statuses
@@ -612,7 +622,9 @@ impl ExternalManagerHandle {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExternalManager, ProcessStartKind, process_start_kind};
+    use super::{
+        ExternalManager, ExternalModuleRuntimeStatus, ProcessStartKind, process_start_kind,
+    };
     use crate::external_modules::manifest::{ExternalCommandDescriptor, ExternalModuleDescriptor};
     use std::path::PathBuf;
 
@@ -646,7 +658,10 @@ mod tests {
         manager.set_descriptors(vec![descriptor("sample", "1.0")]);
 
         let statuses = manager.statuses();
-        assert_eq!(statuses[0].status, "установлен, выключен");
+        assert_eq!(
+            statuses[0].status,
+            ExternalModuleRuntimeStatus::InstalledDisabled
+        );
         assert_eq!(statuses[0].command_count, 1);
     }
 
@@ -737,7 +752,10 @@ mod tests {
             .startup_enabled(&std::collections::BTreeSet::from(["sample".to_owned()]))
             .await;
         let manager = handle.lock().await;
-        assert_eq!(manager.statuses()[0].status, "ошибка");
+        assert_eq!(
+            manager.statuses()[0].status,
+            ExternalModuleRuntimeStatus::Failed
+        );
         let diagnostic = manager
             .latest_diagnostics
             .get("sample")
@@ -798,7 +816,10 @@ mod tests {
         {
             let manager = handle.lock().await;
             assert!(manager.latest_diagnostics.contains_key("sample"));
-            assert_eq!(manager.statuses()[0].status, "ошибка");
+            assert_eq!(
+                manager.statuses()[0].status,
+                ExternalModuleRuntimeStatus::Failed
+            );
         }
 
         // A healthy later start clears the stale spawn failure. The fixture
@@ -815,7 +836,10 @@ mod tests {
             let manager = handle.lock().await;
             assert!(!manager.latest_diagnostics.contains_key("sample"));
             assert!(manager.has_running_process("sample"));
-            assert_eq!(manager.statuses()[0].status, "активен");
+            assert_eq!(
+                manager.statuses()[0].status,
+                ExternalModuleRuntimeStatus::Running
+            );
         }
         handle.shutdown_all().await;
         let _ = std::fs::remove_dir_all(&root);
@@ -825,7 +849,10 @@ mod tests {
     fn retained_diagnostic_marks_the_module_as_error_without_a_process() {
         let mut manager = ExternalManager::new();
         manager.set_descriptors(vec![descriptor("sample", "1.0")]);
-        assert_eq!(manager.statuses()[0].status, "установлен, выключен");
+        assert_eq!(
+            manager.statuses()[0].status,
+            ExternalModuleRuntimeStatus::InstalledDisabled
+        );
 
         let diagnostic = super::super::process::CrashDiagnostics {
             module_id: "sample".to_owned(),
@@ -844,7 +871,10 @@ mod tests {
         manager
             .latest_diagnostics
             .insert("sample".to_owned(), diagnostic);
-        assert_eq!(manager.statuses()[0].status, "ошибка");
+        assert_eq!(
+            manager.statuses()[0].status,
+            ExternalModuleRuntimeStatus::Failed
+        );
     }
 
     #[test]
@@ -890,6 +920,9 @@ mod tests {
             handle.diagnostic_summary("sample").await.as_deref(),
             Some("stage=initialize category=execution_timeout generation=3")
         );
-        assert_eq!(handle.lock().await.statuses()[0].status, "ошибка");
+        assert_eq!(
+            handle.lock().await.statuses()[0].status,
+            ExternalModuleRuntimeStatus::Failed
+        );
     }
 }

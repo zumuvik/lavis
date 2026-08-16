@@ -13,6 +13,8 @@ use std::{
 };
 use thiserror::Error;
 
+use crate::i18n::{Locale, RebootText, reboot_text};
+
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
@@ -239,6 +241,7 @@ pub async fn complete_pending_reboot_receipt<C, E, S>(
     editor: &mut E,
     sleeper: &mut S,
     policy: RebootReceiptRetryPolicy,
+    locale: Locale,
 ) -> Result<RebootReceiptCompletion, RebootReceiptCoordinatorError>
 where
     C: Clock,
@@ -255,7 +258,7 @@ where
         let elapsed = pending.receipt.elapsed_millis(clock.unix_millis()?)?;
         let intent = RebootReceiptEditIntent {
             receipt: pending.receipt.clone(),
-            text: reboot_completion_text(elapsed),
+            text: reboot_completion_text(locale, elapsed),
         };
         match editor.edit_reboot_receipt(intent).await {
             ReceiptEditOutcome::Applied => {
@@ -281,11 +284,8 @@ where
     unreachable!("retry attempt count is always at least one")
 }
 
-pub fn reboot_completion_text(elapsed_millis: u64) -> String {
-    format!(
-        "✅ Lavis перезагрузился\n\nВремя перезагрузки: {} с",
-        elapsed_millis / 1_000
-    )
+pub fn reboot_completion_text(locale: Locale, elapsed_millis: u64) -> String {
+    reboot_text(locale, RebootText::Completed, Some(elapsed_millis / 1_000))
 }
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
@@ -870,6 +870,7 @@ mod tests {
                 &mut editor,
                 &mut sleeper,
                 RebootReceiptRetryPolicy::default(),
+                Locale::Russian,
             )
             .await
             .unwrap(),
@@ -897,6 +898,7 @@ mod tests {
                 &mut editor,
                 &mut sleeper,
                 RebootReceiptRetryPolicy::default(),
+                Locale::Russian,
             )
             .await
             .unwrap(),
@@ -927,6 +929,7 @@ mod tests {
                 &mut editor,
                 &mut sleeper,
                 RebootReceiptRetryPolicy::default(),
+                Locale::Russian,
             )
             .await
             .unwrap();
@@ -955,6 +958,7 @@ mod tests {
             &mut editor,
             &mut sleeper,
             RebootReceiptRetryPolicy::default(),
+            Locale::Russian,
         )
         .await
         .unwrap();

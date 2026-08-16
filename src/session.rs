@@ -458,15 +458,12 @@ mod tests {
             if ready_path.exists() {
                 break;
             }
-            match child.try_wait().unwrap() {
-                Some(status) => {
-                    let mut stderr = String::new();
-                    if let Some(mut child_stderr) = child.stderr.take() {
-                        let _ = child_stderr.read_to_string(&mut stderr);
-                    }
-                    panic!("lock holder exited before acquiring the lock ({status}): {stderr}");
+            if let Some(status) = child.try_wait().unwrap() {
+                let mut stderr = String::new();
+                if let Some(mut child_stderr) = child.stderr.take() {
+                    let _ = child_stderr.read_to_string(&mut stderr);
                 }
-                None => {}
+                panic!("lock holder exited before acquiring the lock ({status}): {stderr}");
             }
             assert!(
                 std::time::Instant::now() < deadline,

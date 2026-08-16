@@ -1,4 +1,5 @@
 use crate::commands::{CommandDefinition, commands};
+use crate::i18n::Locale;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModuleId {
@@ -31,7 +32,6 @@ pub enum ModuleCapability {
 pub struct ModuleSpec {
     pub id: ModuleId,
     pub name: &'static str,
-    pub description_ru: &'static str,
     pub icon: &'static str,
     pub origin: ModuleOrigin,
     pub capabilities: &'static [ModuleCapability],
@@ -43,7 +43,6 @@ const MODULE_SPECS: [ModuleSpec; 3] = [
     ModuleSpec {
         id: ModuleId::Core,
         name: "core",
-        description_ru: "Основные команды Lavis.",
         icon: "🧩",
         origin: ModuleOrigin::Builtin,
         capabilities: &[
@@ -58,7 +57,6 @@ const MODULE_SPECS: [ModuleSpec; 3] = [
     ModuleSpec {
         id: ModuleId::System,
         name: "system",
-        description_ru: "Безопасно ограниченная системная информация.",
         icon: "🖥",
         origin: ModuleOrigin::Builtin,
         capabilities: &[
@@ -71,7 +69,6 @@ const MODULE_SPECS: [ModuleSpec; 3] = [
     ModuleSpec {
         id: ModuleId::Aliases,
         name: "aliases",
-        description_ru: "Постоянные псевдонимы команд.",
         icon: "🔗",
         origin: ModuleOrigin::Builtin,
         capabilities: &[
@@ -82,6 +79,17 @@ const MODULE_SPECS: [ModuleSpec; 3] = [
         replaceable: false,
     },
 ];
+
+pub fn module_description(id: ModuleId, locale: Locale) -> &'static str {
+    match (id, locale) {
+        (ModuleId::Core, Locale::English) => "Core Lavis commands.",
+        (ModuleId::Core, Locale::Russian) => "Основные команды Lavis.",
+        (ModuleId::System, Locale::English) => "Safely constrained system information.",
+        (ModuleId::System, Locale::Russian) => "Безопасно ограниченная системная информация.",
+        (ModuleId::Aliases, Locale::English) => "Persistent command aliases.",
+        (ModuleId::Aliases, Locale::Russian) => "Постоянные псевдонимы команд.",
+    }
+}
 
 pub fn modules() -> &'static [ModuleSpec] {
     &MODULE_SPECS
@@ -164,17 +172,17 @@ fn is_bidi_control(character: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ModuleCapability, ModuleId, ModuleOrigin, ModuleSpec, module_by_name, modules,
-        validate_external_origin,
+        ModuleCapability, ModuleId, ModuleOrigin, ModuleSpec, module_by_name, module_description,
+        modules, validate_external_origin,
     };
     use crate::commands::{CommandRisk, commands, module_for_command};
+    use crate::i18n::Locale;
     use std::collections::HashSet;
 
     fn external_fixture() -> ModuleSpec {
         ModuleSpec {
             id: ModuleId::Core,
             name: "fixture",
-            description_ru: "Тестовый внешний модуль.",
             icon: "🧪",
             origin: ModuleOrigin::External {
                 author: "Тест",
@@ -215,7 +223,8 @@ mod tests {
             Some(ModuleId::System)
         );
         for module in modules() {
-            assert!(!module.description_ru.is_empty());
+            assert!(!module_description(module.id, Locale::English).is_empty());
+            assert!(!module_description(module.id, Locale::Russian).is_empty());
             assert!(!module.icon.is_empty());
             assert!(matches!(module.origin, ModuleOrigin::Builtin));
             assert!(validate_external_origin(&module.origin));

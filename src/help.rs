@@ -3,14 +3,15 @@ pub use crate::response::Response;
 use crate::{
     aliases::AliasStore,
     commands::{
-        CommandDefinition, CommandRisk, HelpRequest, canonical_command, command_by_name, commands,
-        module_for_command,
+        CommandDefinition, CommandRisk, HelpRequest, canonical_command, command_by_name,
+        command_description as command_text_description, command_summary as command_text_summary,
+        commands, module_for_command,
     },
     external_modules::{manager::ExternalCommandRef, manifest::ExternalModuleDescriptor},
     i18n::Locale,
     modules::{
-        ModuleCapability, ModuleOrigin, ModuleSpec, commands_for_module, module_by_name, modules,
-        validate_external_origin,
+        ModuleCapability, ModuleOrigin, ModuleSpec, commands_for_module, module_by_name,
+        module_description, modules, validate_external_origin,
     },
     response::RenderedResponse,
 };
@@ -67,36 +68,10 @@ pub fn render_with_external_locale(
             external_descriptors,
             locale,
         ),
-        HelpRequest::Invalid => plain(invalid_help_usage(locale, prefix)),
+        HelpRequest::Invalid => plain(locale, invalid_help_usage(locale, prefix)),
     }
 }
 
-fn english_command_summary(kind: crate::commands::CommandKind) -> &'static str {
-    match kind {
-        crate::commands::CommandKind::Start => "Start the tutorial or companion setup",
-        crate::commands::CommandKind::Language => "Show or change the interface language",
-        crate::commands::CommandKind::Ping => "Measure Telegram latency",
-        crate::commands::CommandKind::Stats => "Show runtime statistics",
-        crate::commands::CommandKind::Help => "Show command help",
-        crate::commands::CommandKind::Fastfetch => "Show safe system information",
-        crate::commands::CommandKind::Alias => "Manage command aliases",
-        crate::commands::CommandKind::Prefix => "Show or change the command prefix",
-        crate::commands::CommandKind::Modules => "List built-in modules",
-        crate::commands::CommandKind::Setup => "Configure the companion workspace",
-        crate::commands::CommandKind::Lm => "Inspect and install external modules",
-        crate::commands::CommandKind::Reboot => "Restart Lavis",
-    }
-}
-fn english_command_description(kind: crate::commands::CommandKind) -> &'static str {
-    english_command_summary(kind)
-}
-fn english_module_description(id: crate::modules::ModuleId) -> &'static str {
-    match id {
-        crate::modules::ModuleId::Core => "Core Lavis commands.",
-        crate::modules::ModuleId::System => "Safely constrained system information.",
-        crate::modules::ModuleId::Aliases => "Persistent command aliases.",
-    }
-}
 fn english_risk(risk: CommandRisk) -> &'static str {
     match risk {
         CommandRisk::ReadOnly => "read only",
@@ -109,7 +84,17 @@ fn english_risk(risk: CommandRisk) -> &'static str {
 }
 
 pub fn render_modules_overview(prefix: &str) -> RenderedHelp {
-    render_modules_overview_with_external(prefix, &[], &[])
+    render_modules_overview_with_external_locale(prefix, &[], &[], Locale::Russian)
+}
+
+pub fn render_modules_invalid_usage(prefix: &str, locale: Locale) -> RenderedHelp {
+    plain(
+        locale,
+        match locale {
+            Locale::English => format!("⚠️ Usage: {prefix}modules"),
+            Locale::Russian => format!("⚠️ Использование: {prefix}modules"),
+        },
+    )
 }
 
 pub fn render_modules_overview_with_external(
@@ -117,9 +102,28 @@ pub fn render_modules_overview_with_external(
     external_descriptors: &[ExternalModuleDescriptor],
     external_command_refs: &[ExternalCommandRef],
 ) -> RenderedHelp {
+    render_modules_overview_with_external_locale(
+        prefix,
+        external_descriptors,
+        external_command_refs,
+        Locale::Russian,
+    )
+}
+
+pub fn render_modules_overview_with_external_locale(
+    prefix: &str,
+    external_descriptors: &[ExternalModuleDescriptor],
+    external_command_refs: &[ExternalCommandRef],
+    locale: Locale,
+) -> RenderedHelp {
     let mut module_parts: Vec<String> = Vec::new();
     for module in modules() {
-        module_parts.push(format!("{} {}", module.icon, module.name));
+        module_parts.push(format!(
+            "{} {} — {}",
+            module.icon,
+            module.name,
+            module_description(module.id, locale)
+        ));
     }
     for desc in external_descriptors {
         let has_active = external_command_refs.iter().any(|r| r.module_id == desc.id);
@@ -130,7 +134,11 @@ pub fn render_modules_overview_with_external(
 
     let mut cmd_names: Vec<String> = Vec::new();
     for command in commands() {
-        cmd_names.push(format!("{prefix}{}", command.name));
+        cmd_names.push(format!(
+            "{prefix}{} — {}",
+            command.name,
+            command_summary(command, locale)
+        ));
     }
     for ref_ in external_command_refs {
         cmd_names.push(format!("{prefix}{}.{}", ref_.module_id, ref_.command_name));
@@ -143,14 +151,24 @@ pub fn render_modules_overview_with_external(
             .count();
     let cmd_total = commands().len() + external_command_refs.len();
 
-    let heading = format!("🧩 Модули Lavis: {total}");
-    let primary = format!(
-        "Модули: {}\nКоманды ({cmd_total}): {}\n\nИспользуйте {prefix}help <команда или модуль> для подробностей.",
-        module_parts.join(", "),
-        cmd_names.join(", "),
-    );
+    let heading = match locale {
+        Locale::English => format!("🧩 Lavis modules: {total}"),
+        Locale::Russian => format!("🧩 Модули Lavis: {total}"),
+    };
+    let primary = match locale {
+        Locale::English => format!(
+            "Modules: {}\nCommands ({cmd_total}): {}\n\nUse {prefix}help <command or module> for details.",
+            module_parts.join(", "),
+            cmd_names.join(", "),
+        ),
+        Locale::Russian => format!(
+            "Модули: {}\nКоманды ({cmd_total}): {}\n\nИспользуйте {prefix}help <команда или модуль> для подробностей.",
+            module_parts.join(", "),
+            cmd_names.join(", "),
+        ),
+    };
 
-    documentation(heading, primary, core_provenance(Locale::Russian))
+    documentation(locale, heading, primary, core_provenance(locale))
 }
 
 #[cfg(test)]
@@ -161,6 +179,7 @@ fn render_module_card(module: &ModuleSpec, prefix: &str) -> RenderedHelp {
 fn render_module_card_locale(module: &ModuleSpec, prefix: &str, locale: Locale) -> RenderedHelp {
     if !validate_external_origin(&module.origin) {
         return documentation(
+            locale,
             invalid_module_heading(locale).to_owned(),
             invalid_module_primary(locale).to_owned(),
             invalid_module_provenance(locale).to_owned(),
@@ -178,6 +197,7 @@ fn render_module_card_locale(module: &ModuleSpec, prefix: &str, locale: Locale) 
         .join("\n");
     let primary = module_primary(module, &command_list, locale);
     documentation(
+        locale,
         module_heading(module, locale),
         primary,
         module_provenance(module, locale),
@@ -236,6 +256,7 @@ fn render_overview_with_external(
         + external_command_refs.len()
         + usize::from(locale == Locale::English) * aliases.aliases().len();
     documentation(
+        locale,
         overview_heading(locale, total_modules, total_commands),
         format!(
             "{}\n\n{}",
@@ -289,7 +310,7 @@ fn render_topic(
         return rendered;
     }
     // 6. Unknown
-    plain(unknown_topic(locale, topic, prefix))
+    plain(locale, unknown_topic(locale, topic, prefix))
 }
 
 fn render_external_namespaced_command(
@@ -340,6 +361,7 @@ fn render_external_namespaced_command(
     );
 
     Some(documentation(
+        locale,
         format!("🔌 {prefix}{}", dotted),
         primary,
         external_provenance(locale),
@@ -390,6 +412,7 @@ fn render_external_module_card(
     );
 
     Some(documentation(
+        locale,
         external_module_heading(locale, &desc.display_name),
         primary,
         external_provenance(locale),
@@ -398,7 +421,10 @@ fn render_external_module_card(
 
 fn render_command_card(command: &CommandDefinition, prefix: &str, locale: Locale) -> RenderedHelp {
     let Some(module) = module_for_command(command) else {
-        return plain(command_metadata_unavailable(locale, prefix, command.name));
+        return plain(
+            locale,
+            command_metadata_unavailable(locale, prefix, command.name),
+        );
     };
     let primary = if command.name == "fastfetch" {
         fastfetch_primary(prefix, command, module.name, locale)
@@ -410,6 +436,7 @@ fn render_command_card(command: &CommandDefinition, prefix: &str, locale: Locale
         generic_command_primary(command, prefix, module.name, locale)
     };
     documentation(
+        locale,
         format!("{} {prefix}{}", command.icon, command.usage),
         primary,
         module_provenance(module, locale),
@@ -456,7 +483,7 @@ fn fastfetch_primary(
     }
     format!(
         "{}\n\nИспользование: {prefix}{}\nМодуль: {module_name}\nРиск: {}\n\nПримеры:\n{prefix}fastfetch --logo NixOS\n{prefix}fastfetch --logo-padding-right 3\n{prefix}fastfetch --separator \" -> \"\n{prefix}fastfetch --structure OS:Kernel:CPU\n\nЛоготипы: none, Alpine, Arch, Debian, Fedora, FreeBSD, Linux, MacOS, NixOS, OpenBSD, Ubuntu, Windows.\nСтруктура: title, separator, os, kernel, uptime, cpu, memory, gpu, packages, shell, terminal, terminalsize, host, display, wm, de, theme, icons, font, cursor, disk, swap, localip, battery, poweradapter, locale.\nРазделитель: 1–64 печатных ASCII-символа.\nОтступ логотипа: --logo-padding-left <n>, --logo-padding-right <n>, --logo-padding-top <n>; 0–32.\n\nПоля профиля: logo_padding_left, logo_padding_right, logo_padding_top (0–32, целые числа).\n\n{prefix}fastfetch --no-profile не читает профиль. Профиль: $XDG_CONFIG_HOME/lavis/fastfetch.json или $HOME/.config/lavis/fastfetch.json.\nМинимальный JSON: {{ \"version\": 1 }}\nПриоритет: значения Fastfetch по умолчанию < профиль < параметры команды.\nПсевдоним: {prefix}alias add sys fastfetch --logo arch; затем {prefix}sys.\n\nКавычки группируют аргументы для разбора shell-words; оболочка не запускается, а shell-метасимволы остаются данными. Каждый процесс запускается только с --config none --pipe; нативные конфиги и пресеты Fastfetch запрещены. Вывод может раскрыть данные хоста, сети, дисплея, питания и оборудования.",
-        command.description_ru,
+        command_description(command, locale),
         command.usage,
         risk_label(command.risk, locale)
     )
@@ -478,7 +505,7 @@ fn alias_primary(
     }
     format!(
         "{}\n\nИспользование: {prefix}{}\nМодуль: {module_name}\nРиск: {}\n\nПримеры:\n{prefix}alias list\n{prefix}alias add sys fastfetch --logo arch\n{prefix}alias show sys\n{prefix}alias del sys\n\nПсевдонимы позволяют вызывать канонические команды под другим именем с заранее заданными аргументами. Канонические команды имеют приоритет над псевдонимами: псевдоним не может переопределить встроенную команду с тем же именем. Псевдонимы постоянны и сохраняются между сессиями.",
-        command.description_ru,
+        command_description(command, locale),
         command.usage,
         risk_label(command.risk, locale)
     )
@@ -500,7 +527,7 @@ fn lm_primary(
     }
     format!(
         "{}\n\nИспользование: {prefix}{}\nМодуль: {module_name}\nРиск: {}\n\n{prefix}lm list — список модулей; {prefix}lm info <id> — сведения; {prefix}lm logs <id> — последняя runtime-ошибка; {prefix}lm doctor [<id>] — диагностика состояния модулей. В Saved Messages прикрепите .lmod и отправьте {prefix}lm install: код не запускается, показывается inspection-план.\nПроверьте план. Подтвердите полный ApprovalId: {prefix}lm confirm <approval-id>; отмена: {prefix}lm cancel <approval-id>.\n\n{prefix}lm enable <id> и {prefix}lm disable <id> изменяют состояние только для следующего перезапуска.\n\nApprovalId — одноразовый Crockford Base32 идентификатор XXXX-XXXX-XXXX-XXXX, действует ровно 10 минут и не может быть использовано повторно.\n\nПосле установки модуль остаётся disabled и не запускается автоматически. ⚠️ Внешний модуль — исполняемый код без системной песочницы.",
-        command.description_ru,
+        command_description(command, locale),
         command.usage,
         risk_label(command.risk, locale)
     )
@@ -521,6 +548,7 @@ fn render_alias(
         shell_words::join(&alias.args)
     };
     Some(documentation(
+        locale,
         format!("🔗 {prefix}{topic}"),
         alias_primary_for_topic(topic, prefix, command, module.name, &stored, locale),
         module_provenance(module, locale),
@@ -562,30 +590,24 @@ fn unknown_topic(locale: Locale, topic: &str, prefix: &str) -> String {
 }
 
 fn command_summary(command: &CommandDefinition, locale: Locale) -> &'static str {
-    match locale {
-        Locale::English => english_command_summary(command.kind),
-        Locale::Russian => command.summary_ru,
-    }
+    command_text_summary(command.kind, locale)
 }
 
 fn command_description(command: &CommandDefinition, locale: Locale) -> &'static str {
-    match locale {
-        Locale::English => english_command_description(command.kind),
-        Locale::Russian => command.description_ru,
-    }
+    command_text_description(command.kind, locale)
 }
 
 fn module_primary(module: &ModuleSpec, commands: &str, locale: Locale) -> String {
     match locale {
         Locale::English => format!(
             "{}\n\nCommands:\n{commands}\n\nCapabilities: {}\nPolicy: {}",
-            english_module_description(module.id),
+            module_description(module.id, locale),
             capability_labels(module.capabilities, locale),
             module_policy(module, locale)
         ),
         Locale::Russian => format!(
             "{}\n\nКоманды:\n{commands}\n\nВозможности: {}\nПолитика: {}",
-            module.description_ru,
+            module_description(module.id, locale),
             capability_labels(module.capabilities, locale),
             module_policy(module, locale)
         ),
@@ -855,27 +877,35 @@ fn risk_label(risk: CommandRisk, locale: Locale) -> &'static str {
     }
 }
 
-fn documentation(heading: String, primary: String, provenance: String) -> RenderedHelp {
+fn documentation(
+    locale: Locale,
+    heading: String,
+    primary: String,
+    provenance: String,
+) -> RenderedHelp {
     let RenderedResponse {
         response,
         entity_fallback,
-    } = Response::documentation_card(heading, primary, provenance);
+    } = Response::documentation_card(locale, heading, primary, provenance);
     RenderedHelp {
         response,
         entity_fallback,
     }
 }
 
-fn plain(text: String) -> RenderedHelp {
+fn plain(locale: Locale, text: String) -> RenderedHelp {
     RenderedHelp {
-        response: Response::plain(text),
+        response: Response::plain_with_locale(locale, text),
         entity_fallback: false,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{render, render_module_card, render_modules_overview, render_with_external_locale};
+    use super::{
+        render, render_module_card, render_modules_invalid_usage, render_modules_overview,
+        render_modules_overview_with_external_locale, render_with_external_locale,
+    };
     use crate::{
         aliases::{Alias, AliasStore},
         commands::HelpRequest,
@@ -1027,6 +1057,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn modules_overview_and_invalid_usage_are_localized() {
+        let (descriptor, reference) = external_fixture();
+        let english = render_modules_overview_with_external_locale(
+            "!",
+            std::slice::from_ref(&descriptor),
+            std::slice::from_ref(&reference),
+            crate::i18n::Locale::English,
+        )
+        .response;
+        let russian = render_modules_overview_with_external_locale(
+            "!",
+            std::slice::from_ref(&descriptor),
+            std::slice::from_ref(&reference),
+            crate::i18n::Locale::Russian,
+        )
+        .response;
+        assert!(english.text.starts_with("🧩 Lavis modules: 4"));
+        assert!(english.text.contains("Core Lavis commands."));
+        assert!(english.text.contains("!ping — Measure Telegram latency"));
+        assert!(english.text.contains("📦 Fixture module (fixture)"));
+        assert!(russian.text.starts_with("🧩 Модули Lavis: 4"));
+        assert!(russian.text.contains("Основные команды Lavis."));
+        assert!(russian.text.contains("!ping — Измерить задержку Telegram"));
+        assert_eq!(
+            render_modules_invalid_usage("!", crate::i18n::Locale::English)
+                .response
+                .text,
+            "⚠️ Usage: !modules"
+        );
+        assert_eq!(
+            render_modules_invalid_usage("!", crate::i18n::Locale::Russian)
+                .response
+                .text,
+            "⚠️ Использование: !modules"
+        );
+    }
+
+    #[tokio::test]
     async fn english_alias_and_external_help_keep_details_and_provenance() {
         let (aliases, directory) = aliases_with_core_alias().await;
         let (descriptor, reference) = external_fixture();
@@ -1066,6 +1134,25 @@ mod tests {
         ));
         assert_eq!(external.entities.len(), 2);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn english_builtin_help_contains_no_cyrillic() {
+        let response = render_with_external_locale(
+            &HelpRequest::Topic("fastfetch".to_owned()),
+            "!",
+            &aliases().await,
+            &[],
+            &[],
+            crate::i18n::Locale::English,
+        )
+        .response;
+        assert!(
+            !response
+                .text
+                .chars()
+                .any(|character| ('А'..='я').contains(&character))
+        );
     }
 
     #[tokio::test]
@@ -1158,7 +1245,6 @@ mod tests {
         let fixture = ModuleSpec {
             id: ModuleId::Core,
             name: "fixture",
-            description_ru: "Тестовый модуль.",
             icon: "🧪",
             origin: ModuleOrigin::External {
                 author: "Автор",
@@ -1184,7 +1270,6 @@ mod tests {
         let fixture = ModuleSpec {
             id: ModuleId::Core,
             name: "invalid",
-            description_ru: "Тестовый модуль.",
             icon: "🧪",
             origin: ModuleOrigin::External {
                 author: "Автор\n",
