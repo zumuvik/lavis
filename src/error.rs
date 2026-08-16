@@ -321,6 +321,16 @@ impl LastAuthorizationDiagnostic {
         }
     }
 
+    /// Whether this diagnostic means the local session cannot recover by
+    /// retrying and requires interactive manual recovery (reauthorization or
+    /// session reset). Transient transport/RPC failures are not terminal.
+    pub fn requires_manual_recovery(self) -> bool {
+        matches!(
+            self,
+            Self::AuthKeyDuplicated | Self::MalformedLocalSession
+        )
+    }
+
     pub fn from_category(category: &str) -> Option<Self> {
         match category {
             "auth_key_duplicated" => Some(Self::AuthKeyDuplicated),

@@ -84,14 +84,22 @@ pub async fn run() -> anyhow::Result<()> {
         CliCommand::ModulesEnable { id } => modules_enable(id).await,
         CliCommand::ModulesDisable { id } => modules_disable(id).await,
         CliCommand::ModulesStatus => modules_status().await,
+        CliCommand::ValidatePrefix { prefix } => validate_prefix_command(&prefix),
     }
 }
 
-pub fn requires_reauthorization(error: &anyhow::Error) -> bool {
+/// Whether the failure is terminal for the current local session and requires
+/// interactive manual recovery (reauthorization or a session reset). Retrying
+/// cannot recover these cases, so the service must not restart-loop on them.
+/// Transient transport/RPC failures are deliberately not classified here.
+pub fn requires_manual_recovery(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
+        if let Some(AuthError::AuthorizationCheck(failure)) = cause.downcast_ref::<AuthError>() {
+            return failure.is_auth_key_duplicated();
+        }
         matches!(
-            cause.downcast_ref::<AuthError>(),
-            Some(AuthError::AuthorizationCheck(failure)) if failure.is_auth_key_duplicated()
+            cause.downcast_ref::<ClientError>(),
+            Some(ClientError::MalformedSession)
         )
     })
 }
@@ -109,6 +117,7 @@ enum CliCommand {
     ModulesEnable { id: String },
     ModulesDisable { id: String },
     ModulesStatus,
+    ValidatePrefix { prefix: String },
 }
 
 const NONINTERACTIVE_MISSING_CREDENTIALS: &str =
@@ -148,10 +157,20 @@ fn parse_cli(arguments: impl IntoIterator<Item = OsString>) -> anyhow::Result<Cl
                 path: PathBuf::from(path),
             })
         }
+        [validate, prefix] if validate == "validate-prefix" => Ok(CliCommand::ValidatePrefix {
+            prefix: prefix.to_string_lossy().into_owned(),
+        }),
         _ => anyhow::bail!(
-            "usage: lavis [run|auth [doctor|reset --backup]|credentials [reset]|logout|modules [validate <path>|enable <id>|disable <id>|status]]"
+            "usage: lavis [run|auth [doctor|reset --backup]|credentials [reset]|logout|modules [validate <path>|enable <id>|disable <id>|status]|validate-prefix <prefix>]"
         ),
     }
+}
+
+/// Scripting interface used by the NixOS module activation script so the
+/// declarative `services.lavis.settings.prefix` is validated by the exact same
+/// Rust validator that the runtime uses. Exits non-zero on an invalid prefix.
+fn validate_prefix_command(prefix: &str) -> anyhow::Result<()> {
+    settings::validate_prefix(prefix).map_err(|error| anyhow::anyhow!("invalid prefix: {error}"))
 }
 
 async fn run_command(auth_only: bool) -> anyhow::Result<()> {
@@ -700,10 +719,12 @@ fn session_doctor_report(session_path: &Path) -> Result<String, ClientError> {
     } else {
         "interactive"
     };
-    let reauthorization = matches!(
-        diagnostic.as_str(),
-        "auth_key_duplicated" | "malformed_local_session"
-    );
+    let reauthorization = match session::read_last_authorization_diagnostic(session_path) {
+        Ok(session::StoredAuthorizationDiagnostic::Present(diagnostic)) => {
+            diagnostic.requires_manual_recovery()
+        }
+        _ => false,
+    };
     Ok(format!(
         "session path: {}\nlock state: {lock_state}\nsession file: type={}, mode={}, readable={}, owner={}\nsession sidecars: {sidecars}\nlast authorization diagnostic: {diagnostic}\nreauthorization required: {reauthorization}\nexecution context: {execution}",
         session_path.display(),
@@ -880,6 +901,11 @@ fn recover_staged_session_backups(parent: &Path, session_path: &Path) -> Result<
     let session_name = session_path
         .file_name()
         .ok_or(ClientError::MissingSessionDirectory)?;
+    // Preflight phase: fully validate every staging directory and every child
+    // before any mutation. A conflicting target or an unexpected entry must
+    // abort recovery with nothing moved, so a deterministic partial state can
+    // never be produced by this function.
+    let mut staged = Vec::new();
     for entry in fs::read_dir(parent).map_err(|_| ClientError::BackupSessionFile)? {
         let entry = entry.map_err(|_| ClientError::BackupSessionFile)?;
         let name = entry.file_name();
@@ -893,6 +919,7 @@ fn recover_staged_session_backups(parent: &Path, session_path: &Path) -> Result<
         if !metadata.is_dir() {
             return Err(ClientError::BackupSessionFile);
         }
+        let mut children = Vec::new();
         for child in fs::read_dir(entry.path()).map_err(|_| ClientError::BackupSessionFile)? {
             let child = child.map_err(|_| ClientError::BackupSessionFile)?;
             let child_name = child.file_name();
@@ -910,12 +937,29 @@ fn recover_staged_session_backups(parent: &Path, session_path: &Path) -> Result<
                 return Err(ClientError::BackupSessionFile);
             }
             let target = parent.join(&child_name);
-            if target.exists() {
+            // `symlink_metadata` also detects dangling symlinks, which
+            // `Path::exists()` would miss.
+            if fs::symlink_metadata(&target).is_ok() {
                 return Err(ClientError::BackupSessionFile);
             }
-            fs::rename(child.path(), target).map_err(|_| ClientError::BackupSessionFile)?;
+            children.push((child.path(), target));
         }
-        fs::remove_dir(entry.path()).map_err(|_| ClientError::BackupSessionFile)?;
+        staged.push((entry.path(), children));
+    }
+    // Mutation phase: move children, rolling back already-moved files if a
+    // non-deterministic rename failure occurs mid-way.
+    for (staging_dir, children) in staged {
+        let mut moved = Vec::new();
+        for (source, target) in children {
+            if fs::rename(&source, &target).is_err() {
+                for (source, target) in moved.into_iter().rev() {
+                    fs::rename(target, source).map_err(|_| ClientError::BackupSessionFile)?;
+                }
+                return Err(ClientError::BackupSessionFile);
+            }
+            moved.push((source, target));
+        }
+        fs::remove_dir(&staging_dir).map_err(|_| ClientError::BackupSessionFile)?;
         sync_directory(parent)?;
     }
     Ok(())
@@ -1200,7 +1244,8 @@ mod tests {
         NONINTERACTIVE_MISSING_CREDENTIALS, authorization_failure,
         combine_application_and_shutdown, logout_confirmed, parse_cli, remove_session_files,
         render_quick_start, render_quick_start_fallback, require_interactive_session_reset,
-        reset_session_with_backup, session_doctor_report, should_show_quick_start,
+        requires_manual_recovery, reset_session_with_backup, session_doctor_report,
+        should_show_quick_start,
     };
     use crate::error::AuthorizationCheckFailure;
     use std::{
@@ -1376,6 +1421,43 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    #[test]
+    fn staged_recovery_preflights_all_targets_before_any_mutation() {
+        let directory = std::env::temp_dir().join(format!(
+            "lavis-auth-reset-preflight-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let session = directory.join("session");
+        // The staging directory holds several session sidecars, but one target
+        // already exists in the parent. Recovery must detect the conflict
+        // during preflight and move nothing: no partial recovery.
+        let staging = directory.join(".session-backup-interrupted.staging");
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("session"), "staged session").unwrap();
+        fs::write(staging.join("session-wal"), "staged wal").unwrap();
+        fs::write(staging.join("session-shm"), "staged shm").unwrap();
+        fs::write(directory.join("session-wal"), "live wal").unwrap();
+
+        assert!(matches!(
+            reset_session_with_backup(&session),
+            Err(ClientError::BackupSessionFile)
+        ));
+        assert!(!directory.join("session").exists(), "session was moved");
+        assert_eq!(
+            fs::read_to_string(directory.join("session-wal")).unwrap(),
+            "live wal",
+            "conflicting target was overwritten"
+        );
+        assert!(!directory.join("session-shm").exists(), "shm was moved");
+        assert!(staging.join("session").exists(), "staged session was moved");
+        assert!(staging.join("session-shm").exists(), "staged shm was moved");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn reset_refuses_a_contended_session_without_mutation() {
@@ -1501,6 +1583,42 @@ mod tests {
                 .chain()
                 .any(|cause| cause.to_string().contains("category: auth_key_duplicated"))
         );
+    }
+
+    #[test]
+    fn requires_manual_recovery_classifies_terminal_session_failures() {
+        let duplicated = anyhow::Error::new(crate::error::AuthError::AuthorizationCheck(
+            AuthorizationCheckFailure::AuthKeyDuplicated {
+                code: 500,
+                symbolic_name: "AUTH_KEY_DUPLICATED".to_owned(),
+            },
+        ));
+        assert!(requires_manual_recovery(&duplicated));
+
+        let malformed = anyhow::Error::new(ClientError::MalformedSession)
+            .context("failed to open the Telegram session");
+        assert!(requires_manual_recovery(&malformed));
+
+        let transient = anyhow::Error::new(crate::error::AuthError::AuthorizationCheck(
+            AuthorizationCheckFailure::Rpc {
+                code: 500,
+                symbolic_name: "INTERNAL".to_owned(),
+            },
+        ));
+        assert!(!requires_manual_recovery(&transient));
+
+        let timeout = anyhow::Error::new(crate::error::AuthError::AuthorizationCheck(
+            AuthorizationCheckFailure::Timeout,
+        ));
+        assert!(!requires_manual_recovery(&timeout));
+
+        let transport = anyhow::Error::new(crate::error::AuthError::AuthorizationCheck(
+            AuthorizationCheckFailure::Transport,
+        ));
+        assert!(!requires_manual_recovery(&transport));
+
+        let unrelated = anyhow::Error::new(ClientError::RunnerTask);
+        assert!(!requires_manual_recovery(&unrelated));
     }
 
     #[test]

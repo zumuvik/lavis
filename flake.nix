@@ -95,6 +95,17 @@
             chmod 700 "$out/bin/fixture"
           '';
           authFixture = pkgs.writeShellScriptBin "lavis" ''
+            if [ "$1" = "validate-prefix" ]; then
+              test "$#" -eq 2
+              # Mirror the Rust validator's visible-non-alphabetic rule so the
+              # eval test proves the preStart wiring rejects invalid prefixes.
+              case "$2" in
+                "⚙️"|"a"|"ab"|" "|"")
+                  exit 1
+                  ;;
+              esac
+              exit 0
+            fi
             test "$#" -eq 1
             test "$1" = auth
             printf '%s\n' "$HOME" > "$HOME/auth-home"
@@ -247,12 +258,29 @@ PY
           test -f '/build/lavis-test home/.local/state/lavis/modules/fixture/state.json'
           grep -q '"word":"nix"' '/build/lavis-test home/.local/state/lavis/modules/fixture/state.json'
           test ! -f '/build/lavis-test home/.local/share/lavis/modules/fixture/state.json'
-          printf '%s\n' '{"enabled":true,"next_id":3,"triggers":[{"id":2,"word":"runtime","reactions":[{"type":"emoji","emoji":"✅"}],"enabled":true}],"active":{}}' \
-            > '/build/lavis-test home/.local/state/lavis/modules/fixture/state.json'
+printf '%s\n' '{"enabled":true,"next_id":3,"triggers":[{"id":2,"word":"runtime","reactions":[{"type":"emoji","emoji":"✅"}],"enabled":true}],"active":{}}' \
+            > '/build/lavis-test home/.local/share/lavis/modules/fixture/state.json'
           "$preStartScript"
           test -f '/build/lavis-test home/.local/state/lavis/modules/fixture/state.json'
           grep -q '"word":"runtime"' '/build/lavis-test home/.local/state/lavis/modules/fixture/state.json'
           test ! -f '/build/lavis-test home/.local/share/lavis/modules/fixture/state.json'
+
+          # The preStart delegates prefix validation to `lavis validate-prefix`;
+          # an invalid declarative prefix must abort activation without touching
+          # the existing settings file.
+          printf '%s\n' '{"version":2,"prefix":"⚙️","locale":"en","onboarding":"companion"}' \
+            > '/build/lavis-test home/.local/state/lavis/settings.json'
+          chmod 600 '/build/lavis-test home/.local/state/lavis/settings.json'
+          if "$preStartScript" 2>prefix-invalid.log; then
+            echo "preStart accepted an invalid declarative prefix" >&2
+            exit 1
+          fi
+          grep -q 'services.lavis.settings.prefix is invalid' prefix-invalid.log
+          grep -q '"prefix":"⚙️"' '/build/lavis-test home/.local/state/lavis/settings.json'
+          printf '%s\n' '{"version":2,"prefix":"!","locale":"en","onboarding":"companion"}' \
+            > '/build/lavis-test home/.local/state/lavis/settings.json'
+          chmod 600 '/build/lavis-test home/.local/state/lavis/settings.json'
+          "$preStartScript"
 
           touch "$out"
         '';
@@ -289,6 +317,33 @@ if os.path.exists(os.path.join(work, ".external-modules.json.nixos.tmp")):
 PY
         touch "$out"
       '';
+      prefixValidatorCheck = pkgs.runCommand "lavis-prefix-validator-check" { } ''
+        set -euo pipefail
+        # The NixOS module delegates prefix validation to this exact binary, so
+        # the fixtures below must match the Rust validator's behavior. These
+        # are the known drift cases: variation selectors (U+FE0F, "⚙️"),
+        # zero-width/invisible characters, and ordinary visible emoji.
+        ${package}/bin/lavis validate-prefix "🦀"
+        ${package}/bin/lavis validate-prefix "!"
+        ${package}/bin/lavis validate-prefix ","
+        for prefix in \
+          "⚙️" \
+          "$(printf '\u200b')" \
+          "$(printf '\ufeff')" \
+          "$(printf '\u200d')" \
+          "$(printf '\u2060')" \
+          "$(printf '\ufe0f')" \
+          "a" \
+          "ab" \
+          " " \
+          "$(printf '\u00ad')"; do
+          if ${package}/bin/lavis validate-prefix "$prefix"; then
+            echo "invalid prefix accepted by the Rust validator: $prefix" >&2
+            exit 1
+          fi
+        done
+        touch "$out"
+      '';
     in
     {
       lib.${system} = extensionLib;
@@ -318,6 +373,7 @@ PY
         default = package;
         merge-enabled-extensions = mergeEnabledCheck;
         nixos-module = moduleEvalCheck;
+        prefix-validator = prefixValidatorCheck;
       };
     };
 }

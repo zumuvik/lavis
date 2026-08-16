@@ -43,15 +43,24 @@ sent v6 frames; compatible clarifications require a `contract_revision` bump.
 
 ## Conformance runner
 
-`lavis-v6-conformance <executable> [arguments...]` embeds the frozen alpha
-contract, launches the supplied module with piped stdin/stdout, drives
-initialize/health/shutdown, and validates every received frame through Lavis'
-production v6 parser. During lifecycle waits it deterministically services
-module-initiated curated and `raw.invoke` calls with contract-shaped results.
-The mandatory lifecycle transcript is initialize, execute, event, health, then
-shutdown; every lifecycle response must carry the matching request ID, and the
-initialized response must echo module ID `conformance`. Each response read has a
-five-second deadline; malformed or uncorrelated frames fail conformance.
+`lavis-v6-conformance [--profile base|full] <executable> [arguments...]` embeds
+the frozen alpha contract, launches the supplied module with piped stdin/stdout,
+drives the mandatory lifecycle transcript initialize, execute, event, health,
+then shutdown, and validates every received frame through Lavis' production v6
+parser. During lifecycle waits it deterministically services module-initiated
+`telegram.invoke` calls with contract-shaped results. Every lifecycle response
+must carry the matching request ID, and the initialized response must echo
+module ID `conformance`. Each response read has a five-second deadline;
+malformed or uncorrelated frames fail conformance.
+
+The default `base` profile validates protocol and lifecycle conformance only: a
+correct v6 module passes regardless of which Telegram methods it calls, and a
+module that never calls `raw.invoke` passes, because `telegram.raw` is an
+opt-in high-risk capability. The `full` RPC capability profile additionally
+requires the module to exercise at least one curated helper and at least one
+`raw.invoke` call during the transcript. After the shutdown frame the runner
+waits at most five seconds for the module to exit; a module that does not exit
+within the deadline fails conformance.
 
 Lifecycle frames use decimal `request_id` values of 1-64 ASCII digits. A
 lifecycle request has exactly one matching response; mismatched or duplicate
@@ -136,14 +145,40 @@ or a sanitized error:
   "ok": false,
   "error": {
     "kind": "rpc",
-    "message": "Telegram RPC request failed"
+    "message": "Telegram RPC request failed",
+    "code": null,
+    "name": null,
+    "retry_after_seconds": null
   }
 }
 ```
 
-RPC errors are not retried by the module protocol. V6 alpha error frames contain
-only the sanitized `kind` and `message` fields; no retry delay or retryability
-metadata is promised. Modules must not infer a retry policy from error text.
+The `error` object always carries `kind` and `message`, plus the optional
+structured metadata fields `code`, `name`, and `retry_after_seconds`. When a
+field is not applicable it is serialized as `null`; when applicable it carries
+the Telegram RPC error code, the Telegram RPC error name, and the retry delay
+for rate-limited calls respectively. For example, a rate-limited call is
+reported as:
+
+```json
+{
+  "protocol_version": 6,
+  "type": "telegram.result",
+  "call_id": "rpc-1",
+  "ok": false,
+  "error": {
+    "kind": "rpc",
+    "message": "Telegram RPC request failed",
+    "code": 420,
+    "name": "FLOOD_WAIT",
+    "retry_after_seconds": 7
+  }
+}
+```
+
+RPC errors are not retried by the module protocol. Modules must not infer a
+retry policy from error text; `retry_after_seconds` is advisory and may be
+`null`.
 
 Call IDs must be unique while a call is active. Duplicate active call IDs are a
 protocol violation.

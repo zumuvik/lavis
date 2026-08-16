@@ -236,9 +236,10 @@ fn render_overview_with_external(
             ));
         }
     }
-    if locale == Locale::English && !aliases.aliases().is_empty() {
+    if !aliases.aliases().is_empty() {
         body.push(format!(
-            "🔗 Aliases: {}",
+            "{}{}",
+            aliases_overview_label(locale),
             aliases
                 .aliases()
                 .keys()
@@ -252,9 +253,7 @@ fn render_overview_with_external(
             .iter()
             .filter(|d| external_command_refs.iter().any(|r| r.module_id == d.id))
             .count();
-    let total_commands = commands().len()
-        + external_command_refs.len()
-        + usize::from(locale == Locale::English) * aliases.aliases().len();
+    let total_commands = commands().len() + external_command_refs.len() + aliases.aliases().len();
     documentation(
         locale,
         overview_heading(locale, total_modules, total_commands),
@@ -566,6 +565,16 @@ fn overview_heading(locale: Locale, modules: usize, commands: usize) -> String {
     match locale {
         Locale::English => format!("🛠 Lavis help: {modules} modules, {commands} commands"),
         Locale::Russian => format!("🛠 Справка Lavis: {modules} модулей, {commands} команд"),
+    }
+}
+
+/// The alias overview label is localized, but the alias list itself and the
+/// command count are locale-independent: the same runtime state must report
+/// the same semantic counts in every locale.
+fn aliases_overview_label(locale: Locale) -> &'static str {
+    match locale {
+        Locale::English => "🔗 Aliases: ",
+        Locale::Russian => "🔗 Псевдонимы: ",
     }
 }
 
@@ -1053,6 +1062,38 @@ mod tests {
                 .ends_with("This is a built-in Lavis module. It cannot be unloaded or replaced.")
         );
         assert_eq!(response.entities.len(), 2);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn overview_counts_are_locale_invariant_with_aliases() {
+        let (aliases, directory) = aliases_with_core_alias().await;
+        let (descriptor, reference) = external_fixture();
+        let english = render_with_external_locale(
+            &HelpRequest::Overview,
+            "!",
+            &aliases,
+            &[reference.clone()],
+            &[descriptor.clone()],
+            crate::i18n::Locale::English,
+        )
+        .response;
+        let russian = render_with_external_locale(
+            &HelpRequest::Overview,
+            "!",
+            &aliases,
+            &[reference],
+            &[descriptor],
+            crate::i18n::Locale::Russian,
+        )
+        .response;
+        // Regression: the same runtime state must report the same semantic
+        // module/command counts in every locale; only the localized text may
+        // differ. Aliases used to be counted and listed only for English.
+        assert!(english.text.starts_with("🛠 Lavis help: 4 modules, 14 commands"));
+        assert!(russian.text.starts_with("🛠 Справка Lavis: 4 модулей, 14 команд"));
+        assert!(english.text.contains("🔗 Aliases: !core"));
+        assert!(russian.text.contains("🔗 Псевдонимы: !core"));
         fs::remove_dir_all(directory).unwrap();
     }
 

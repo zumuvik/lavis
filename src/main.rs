@@ -12,7 +12,7 @@ async fn main() -> anyhow::Result<()> {
 
     match lavis::run().await {
         Ok(()) => Ok(()),
-        Err(error) if lavis::requires_reauthorization(&error) => {
+        Err(error) if lavis::requires_manual_recovery(&error) => {
             eprintln!("{error:#}");
             std::process::exit(78);
         }

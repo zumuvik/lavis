@@ -10,6 +10,8 @@ use tokio::{
 };
 
 const CONTRACT: &str = include_str!("../../protocol/v6/alpha-contract.json");
+const RESPONSE_DEADLINE: Duration = Duration::from_secs(5);
+const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 struct ObservedCalls {
@@ -17,11 +19,40 @@ struct ObservedCalls {
     raw: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Profile {
+    /// Protocol and lifecycle conformance only. A correct v6 module passes
+    /// regardless of which Telegram methods it calls; `raw.invoke` is not
+    /// required because `telegram.raw` is an opt-in high-risk capability.
+    Base,
+    /// Full RPC capability profile: additionally requires the module to
+    /// exercise at least one curated helper and at least one `raw.invoke`
+    /// call during the transcript.
+    Full,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut arguments = env::args_os().skip(1);
-    let Some(program) = arguments.next() else {
-        anyhow::bail!("usage: lavis-v6-conformance <executable> [arguments...]");
+    let mut profile = Profile::Base;
+    let program = loop {
+        let Some(argument) = arguments.next() else {
+            anyhow::bail!(
+                "usage: lavis-v6-conformance [--profile base|full] <executable> [arguments...]"
+            );
+        };
+        if argument == "--profile" {
+            let value = arguments
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("--profile requires a value"))?;
+            profile = match value.to_str() {
+                Some("base") => Profile::Base,
+                Some("full") => Profile::Full,
+                _ => anyhow::bail!("--profile must be base or full"),
+            };
+        } else {
+            break argument;
+        }
     };
     let contract: serde_json::Value = serde_json::from_str(CONTRACT)?;
     if contract["schema_version"] != 1 || contract["protocol_version"] != 6 {
@@ -46,6 +77,8 @@ async fn main() -> anyhow::Result<()> {
     let mut reader = BufReader::new(stdout).lines();
     let mut observed = ObservedCalls::default();
 
+    // The mandatory lifecycle transcript is initialize, execute, event,
+    // health, then shutdown (docs/module-api-v6.md).
     drive_lifecycle(
         &mut writer,
         &mut reader,
@@ -55,6 +88,20 @@ async fn main() -> anyhow::Result<()> {
         },
         "initialized",
         "1",
+        &mut observed,
+    )
+    .await?;
+    drive_lifecycle(
+        &mut writer,
+        &mut reader,
+        V6OutboundCoreFrame::Execute {
+            request_id: "2".to_owned(),
+            command: "conformance".to_owned(),
+            arguments: String::new(),
+            argument_entities: vec![],
+        },
+        "result",
+        "2",
         &mut observed,
     )
     .await?;
@@ -82,20 +129,6 @@ async fn main() -> anyhow::Result<()> {
     drive_lifecycle(
         &mut writer,
         &mut reader,
-        V6OutboundCoreFrame::Execute {
-            request_id: "2".to_owned(),
-            command: "conformance".to_owned(),
-            arguments: String::new(),
-            argument_entities: vec![],
-        },
-        "result",
-        "2",
-        &mut observed,
-    )
-    .await?;
-    drive_lifecycle(
-        &mut writer,
-        &mut reader,
         V6OutboundCoreFrame::Health {
             request_id: "4".to_owned(),
         },
@@ -104,8 +137,8 @@ async fn main() -> anyhow::Result<()> {
         &mut observed,
     )
     .await?;
-    if !observed.curated || !observed.raw {
-        anyhow::bail!("conformance profile requires curated and raw.invoke calls");
+    if profile == Profile::Full && (!observed.curated || !observed.raw) {
+        anyhow::bail!("full RPC capability profile requires curated and raw.invoke calls");
     }
     let shutdown = V6OutboundCoreFrame::Shutdown {
         request_id: "5".to_owned(),
@@ -114,7 +147,16 @@ async fn main() -> anyhow::Result<()> {
     writer.write_all(shutdown.as_bytes()).await?;
     writer.write_all(b"\n").await?;
     writer.flush().await?;
-    let status = child.wait().await?;
+    let status = match tokio::time::timeout(SHUTDOWN_DEADLINE, child.wait()).await {
+        Ok(status) => status?,
+        Err(_) => {
+            // `kill()` is async: it sends SIGKILL and reaps the child. The
+            // child must be killed before bailing so the runner never hangs
+            // on a module that ignores the shutdown frame.
+            let _ = child.kill().await;
+            anyhow::bail!("module did not exit within the shutdown deadline");
+        }
+    };
     if !status.success() {
         anyhow::bail!("module exited unsuccessfully during shutdown");
     }
@@ -135,7 +177,7 @@ async fn drive_lifecycle(
     writer.write_all(b"\n").await?;
     writer.flush().await?;
     loop {
-        let line = tokio::time::timeout(Duration::from_secs(5), reader.next_line())
+        let line = tokio::time::timeout(RESPONSE_DEADLINE, reader.next_line())
             .await
             .map_err(|_| anyhow::anyhow!("module response deadline exceeded"))??
             .ok_or_else(|| anyhow::anyhow!("module closed stdout"))?;

@@ -146,14 +146,15 @@ let
       ${lib.escapeShellArg moduleStagingDir}
 
     ${lib.optionalString (cfg.settings.prefix != null) ''
-      ${pkgs.python3}/bin/python3 - ${lib.escapeShellArg "${lavisStateDir}/settings.json"} ${lib.escapeShellArg cfg.settings.prefix} <<'PY'
+      ${pkgs.python3}/bin/python3 - ${lib.escapeShellArg "${lavisStateDir}/settings.json"} ${lib.escapeShellArg cfg.settings.prefix} ${lib.escapeShellArg "${cfg.package}/bin/lavis"} <<'PY'
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 
-path, prefix = sys.argv[1:]
+path, prefix, validator = sys.argv[1:4]
 parent = os.path.dirname(path)
 allowed_progress = {
     "not_started", "intro", "prefix", "ping", "help", "modules",
@@ -161,9 +162,11 @@ allowed_progress = {
 }
 
 def valid_prefix(value):
-    return (isinstance(value, str) and 1 <= len(value) <= 4
-            and not any(ch.isspace() or ch.isalpha() or ord(ch) < 32 or ord(ch) == 127
-                        or __import__("unicodedata").category(ch) == "Cf" for ch in value))
+    # Delegate to the Rust runtime validator so the declarative prefix is
+    # accepted or rejected by exactly the same logic the service uses at
+    # runtime. A Python reimplementation would drift (e.g. variation
+    # selectors such as U+FE0F are not category Cf and slipped through).
+    return subprocess.run([validator, "validate-prefix", value], check=False).returncode == 0
 
 def checked_file(candidate):
     info = os.lstat(candidate)

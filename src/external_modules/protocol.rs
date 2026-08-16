@@ -12,7 +12,7 @@ pub const MAX_REACTIONS_PER_ACTION: usize = 3;
 pub const V6_MAX_JSON_DEPTH: usize = 8;
 pub const V6_MAX_JSON_STRING_BYTES: usize = 8 * 1024;
 pub const V6_MAX_JSON_COLLECTION_ITEMS: usize = 64;
-pub const V6_ALPHA_CONTRACT_REVISION: u32 = 1;
+pub const V6_ALPHA_CONTRACT_REVISION: u32 = 2;
 pub const V6_TIMEOUT_START: &str = "after_write_flush";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1061,9 +1061,18 @@ mod tests {
                 Some(error) => Err(V6CallError {
                     kind: error["kind"].as_str().unwrap().to_owned(),
                     message: error["message"].as_str().unwrap().to_owned(),
-                    code: None,
-                    name: None,
-                    retry_after_seconds: None,
+                    code: error
+                        .get("code")
+                        .and_then(serde_json::Value::as_i64)
+                        .and_then(|value| i32::try_from(value).ok()),
+                    name: error
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    retry_after_seconds: error
+                        .get("retry_after_seconds")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|value| u32::try_from(value).ok()),
                 }),
                 None => Ok(case["result"].clone()),
             };
@@ -1085,6 +1094,48 @@ mod tests {
             fixture["race_semantics"]["shutdown"],
             "discard_late_telegram_result"
         );
+    }
+
+    #[test]
+    fn v6_alpha_contract_fixture_conforms_to_its_schema_invariants() {
+        // The frozen artifact must stay structurally consistent with
+        // protocol/v6/alpha-contract.schema.json. The schema requires the
+        // outbound error object to carry kind, message, code, name, and
+        // retry_after_seconds (each optional metadata field integer/string or
+        // null), and the contract revision to be at least 2.
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../protocol/v6/alpha-contract.json")).unwrap();
+        for required in [
+            "schema_version",
+            "protocol_version",
+            "contract_revision",
+            "timeout_start",
+            "compatibility",
+            "inbound",
+            "outbound",
+            "race_semantics",
+        ] {
+            assert!(fixture.get(required).is_some(), "missing {required}");
+        }
+        assert!(fixture["contract_revision"].as_u64().unwrap() >= 2);
+        for case in fixture["outbound"].as_array().unwrap() {
+            let Some(error) = case.get("error") else { continue };
+            for required in ["kind", "message", "code", "name", "retry_after_seconds"] {
+                assert!(
+                    error.get(required).is_some(),
+                    "outbound case {} error is missing {required}",
+                    case["name"]
+                );
+            }
+            assert!(error["kind"].is_string());
+            assert!(error["message"].is_string());
+            assert!(error["code"].is_null() || error["code"].is_i64());
+            assert!(error["name"].is_null() || error["name"].is_string());
+            assert!(
+                error["retry_after_seconds"].is_null()
+                    || error["retry_after_seconds"].as_u64().is_some()
+            );
+        }
     }
 
     #[test]
@@ -1465,6 +1516,44 @@ mod tests {
         assert_eq!(edited_value["event"], "message.edited");
         assert_eq!(edited_value["payload"]["event_id"], "evt-edited");
         assert!(edited_value["payload"].get("peer_id").is_none());
+    }
+
+    #[test]
+    fn v6_error_wire_contract_includes_optional_metadata() {
+        // Regression: docs/protocol must agree that error carries kind, message,
+        // plus optional code/name/retry_after_seconds.
+        let error = V6CallError {
+            kind: "rpc".to_owned(),
+            message: "Telegram RPC request failed".to_owned(),
+            code: Some(420),
+            name: Some("FLOOD_WAIT".to_owned()),
+            retry_after_seconds: Some(7),
+        };
+        let line = serialize_v6_core_result("rpc-1", Err(error)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["protocol_version"], 6);
+        assert_eq!(value["type"], "telegram.result");
+        assert_eq!(value["call_id"], "rpc-1");
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"]["kind"], "rpc");
+        assert_eq!(value["error"]["message"], "Telegram RPC request failed");
+        assert_eq!(value["error"]["code"], 420);
+        assert_eq!(value["error"]["name"], "FLOOD_WAIT");
+        assert_eq!(value["error"]["retry_after_seconds"], 7);
+
+        // When optional fields are None, they must serialize as null.
+        let error = V6CallError {
+            kind: "validation".to_owned(),
+            message: "bad params".to_owned(),
+            code: None,
+            name: None,
+            retry_after_seconds: None,
+        };
+        let line = serialize_v6_core_result("rpc-2", Err(error)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["error"]["code"], serde_json::Value::Null);
+        assert_eq!(value["error"]["name"], serde_json::Value::Null);
+        assert_eq!(value["error"]["retry_after_seconds"], serde_json::Value::Null);
     }
 
     #[test]
