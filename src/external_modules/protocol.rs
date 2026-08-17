@@ -1119,7 +1119,9 @@ mod tests {
         }
         assert!(fixture["contract_revision"].as_u64().unwrap() >= 2);
         for case in fixture["outbound"].as_array().unwrap() {
-            let Some(error) = case.get("error") else { continue };
+            let Some(error) = case.get("error") else {
+                continue;
+            };
             for required in ["kind", "message", "code", "name", "retry_after_seconds"] {
                 assert!(
                     error.get(required).is_some(),
@@ -1553,7 +1555,10 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(value["error"]["code"], serde_json::Value::Null);
         assert_eq!(value["error"]["name"], serde_json::Value::Null);
-        assert_eq!(value["error"]["retry_after_seconds"], serde_json::Value::Null);
+        assert_eq!(
+            value["error"]["retry_after_seconds"],
+            serde_json::Value::Null
+        );
     }
 
     #[test]

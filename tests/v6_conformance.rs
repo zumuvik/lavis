@@ -5,13 +5,13 @@
 //! every frame with the production parser. These tests pin the transcript
 //! order, the base/full profile split (a module without `raw.invoke` must pass
 //! base conformance), and the bounded shutdown wait.
+//!
+//! The fixture modules are spawned through an explicit `python3` interpreter
+//! rather than their `#!/usr/bin/env python3` shebang: the Nix build sandbox
+//! has no `/usr/bin/env`, so shebang-based spawns fail there. `python3` is on
+//! PATH in both the dev shell and the sandbox (flake `nativeBuildInputs`).
 
-use std::{
-    fs,
-    os::unix::fs::PermissionsExt,
-    path::PathBuf,
-    time::Duration,
-};
+use std::{fs, os::unix::fs::PermissionsExt, path::Path, path::PathBuf, time::Duration};
 
 use tokio::process::Command;
 
@@ -111,7 +111,7 @@ fn fixture_dir(label: &str) -> PathBuf {
     directory
 }
 
-fn write_module(directory: &PathBuf, body: &str) -> PathBuf {
+fn write_module(directory: &Path, body: &str) -> PathBuf {
     let entrypoint = directory.join("run");
     fs::write(&entrypoint, body).unwrap();
     fs::set_permissions(&entrypoint, fs::Permissions::from_mode(0o700)).unwrap();
@@ -132,7 +132,11 @@ async fn run_runner(arguments: &[&str], deadline: Duration) -> (bool, String) {
 async fn base_profile_passes_a_curated_only_module_in_documented_order() {
     let directory = fixture_dir("curated");
     let module = write_module(&directory, CURATED_ONLY_SCRIPT);
-    let (ok, output) = run_runner(&[module.to_str().unwrap()], Duration::from_secs(30)).await;
+    let (ok, output) = run_runner(
+        &["python3", module.to_str().unwrap()],
+        Duration::from_secs(30),
+    )
+    .await;
     assert!(ok, "base profile rejected a curated-only module: {output}");
     assert!(output.contains("v6 alpha conformance: passed"));
     let _ = fs::remove_dir_all(&directory);
@@ -143,7 +147,7 @@ async fn full_profile_requires_raw_invoke() {
     let directory = fixture_dir("curated");
     let module = write_module(&directory, CURATED_ONLY_SCRIPT);
     let (ok, output) = run_runner(
-        &["--profile", "full", module.to_str().unwrap()],
+        &["--profile", "full", "python3", module.to_str().unwrap()],
         Duration::from_secs(30),
     )
     .await;
@@ -163,7 +167,7 @@ async fn full_profile_passes_a_module_with_curated_and_raw_calls() {
     let directory = fixture_dir("full");
     let module = write_module(&directory, FULL_SCRIPT);
     let (ok, output) = run_runner(
-        &["--profile", "full", module.to_str().unwrap()],
+        &["--profile", "full", "python3", module.to_str().unwrap()],
         Duration::from_secs(30),
     )
     .await;
@@ -179,7 +183,11 @@ async fn full_profile_passes_a_module_with_curated_and_raw_calls() {
 async fn shutdown_wait_is_bounded_for_a_hanging_module() {
     let directory = fixture_dir("hang");
     let module = write_module(&directory, HANG_ON_SHUTDOWN_SCRIPT);
-    let (ok, output) = run_runner(&[module.to_str().unwrap()], Duration::from_secs(30)).await;
+    let (ok, output) = run_runner(
+        &["python3", module.to_str().unwrap()],
+        Duration::from_secs(30),
+    )
+    .await;
     assert!(!ok, "hanging module unexpectedly passed: {output}");
     assert!(
         output.contains("did not exit within the shutdown deadline"),

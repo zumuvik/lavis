@@ -325,10 +325,7 @@ impl LastAuthorizationDiagnostic {
     /// retrying and requires interactive manual recovery (reauthorization or
     /// session reset). Transient transport/RPC failures are not terminal.
     pub fn requires_manual_recovery(self) -> bool {
-        matches!(
-            self,
-            Self::AuthKeyDuplicated | Self::MalformedLocalSession
-        )
+        matches!(self, Self::AuthKeyDuplicated | Self::MalformedLocalSession)
     }
 
     pub fn from_category(category: &str) -> Option<Self> {

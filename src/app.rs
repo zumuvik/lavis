@@ -1351,6 +1351,54 @@ mod tests {
     }
 
     #[test]
+    fn doctor_report_uses_real_newlines_with_exact_line_structure() {
+        let directory = std::env::temp_dir().join(format!(
+            "lavis-auth-doctor-newlines-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let session = directory.join("session");
+
+        let report = session_doctor_report(&session).unwrap();
+        let lines: Vec<&str> = report.split('\n').collect();
+        assert_eq!(
+            lines.len(),
+            7,
+            "doctor report must be exactly 7 newline-separated lines"
+        );
+        assert_eq!(lines[0], format!("session path: {}", session.display()));
+        assert_eq!(lines[1], "lock state: unlocked");
+        assert_eq!(
+            lines[2],
+            "session file: type=absent, mode=not-applicable, readable=not-applicable, owner=not-applicable"
+        );
+        assert_eq!(
+            lines[3],
+            "session sidecars: -journal=absent, -wal=absent, -shm=absent"
+        );
+        assert_eq!(lines[4], "last authorization diagnostic: absent");
+        assert_eq!(lines[5], "reauthorization required: false");
+        let execution = if std::env::var_os("LAVIS_SERVICE").is_some() {
+            "service"
+        } else {
+            "interactive"
+        };
+        assert_eq!(lines[6], format!("execution context: {execution}"));
+        assert!(
+            !report.contains("\\n"),
+            "literal backslash-n must never appear in doctor output"
+        );
+        assert!(
+            !report.ends_with('\n'),
+            "doctor report must not end with a trailing newline"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn reset_requires_an_interactive_terminal() {
         assert!(matches!(
             require_interactive_session_reset(false, true),
@@ -1738,5 +1786,32 @@ mod tests {
         assert!(fallback.starts_with("Не удалось отправить приглашение в Telegram."));
         assert!(fallback.contains(inner.as_str()));
         assert!(fallback.contains("Авторизация завершена"));
+    }
+
+    #[test]
+    fn quick_start_fallback_separates_fallback_and_invite_with_exactly_two_newlines() {
+        let inner = render_quick_start(",", Some(crate::i18n::Locale::Russian));
+        let fallback = render_quick_start_fallback(&inner, Some(crate::i18n::Locale::Russian));
+        let expected = format!("Не удалось отправить приглашение в Telegram.\n\n{inner}");
+        assert_eq!(fallback, expected);
+        assert!(
+            !fallback.contains("\\n"),
+            "literal backslash-n must never appear in quick start output"
+        );
+        assert!(
+            !fallback.ends_with('\n'),
+            "quick start fallback must not end with a trailing newline"
+        );
+    }
+
+    #[test]
+    fn quick_start_fallback_bilingual_uses_two_newlines() {
+        let inner = render_quick_start("!", None);
+        let fallback = render_quick_start_fallback(&inner, None);
+        let expected = format!(
+            "{}\n\n{inner}",
+            crate::i18n::bilingual(crate::i18n::Text::PostAuthFallback, "")
+        );
+        assert_eq!(fallback, expected);
     }
 }

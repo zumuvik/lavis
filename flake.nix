@@ -258,24 +258,27 @@ PY
           test -f '/build/lavis-test home/.local/state/lavis/modules/fixture/state.json'
           grep -q '"word":"nix"' '/build/lavis-test home/.local/state/lavis/modules/fixture/state.json'
           test ! -f '/build/lavis-test home/.local/share/lavis/modules/fixture/state.json'
-printf '%s\n' '{"enabled":true,"next_id":3,"triggers":[{"id":2,"word":"runtime","reactions":[{"type":"emoji","emoji":"✅"}],"enabled":true}],"active":{}}' \
+          # A later activation must not clobber already-migrated module state:
+          # the persistent state directory wins over a newly bundled state.json.
+          printf '%s\n' '{"enabled":true,"next_id":3,"triggers":[{"id":2,"word":"runtime","reactions":[{"type":"emoji","emoji":"✅"}],"enabled":true}],"active":{}}' \
             > '/build/lavis-test home/.local/share/lavis/modules/fixture/state.json'
           "$preStartScript"
           test -f '/build/lavis-test home/.local/state/lavis/modules/fixture/state.json'
-          grep -q '"word":"runtime"' '/build/lavis-test home/.local/state/lavis/modules/fixture/state.json'
+          grep -q '"word":"nix"' '/build/lavis-test home/.local/state/lavis/modules/fixture/state.json'
           test ! -f '/build/lavis-test home/.local/share/lavis/modules/fixture/state.json'
 
-          # The preStart delegates prefix validation to `lavis validate-prefix`;
-          # an invalid declarative prefix must abort activation without touching
-          # the existing settings file.
+          # The preStart delegates prefix validation to `lavis validate-prefix`.
+          # An existing settings file carrying an invalid prefix (written before
+          # prefix validation existed) must abort activation without being
+          # rewritten, so the bad state is never silently canonicalized.
           printf '%s\n' '{"version":2,"prefix":"⚙️","locale":"en","onboarding":"companion"}' \
             > '/build/lavis-test home/.local/state/lavis/settings.json'
           chmod 600 '/build/lavis-test home/.local/state/lavis/settings.json'
           if "$preStartScript" 2>prefix-invalid.log; then
-            echo "preStart accepted an invalid declarative prefix" >&2
+            echo "preStart accepted an existing settings file with an invalid prefix" >&2
             exit 1
           fi
-          grep -q 'services.lavis.settings.prefix is invalid' prefix-invalid.log
+          grep -q 'existing Lavis settings have an unsupported schema' prefix-invalid.log
           grep -q '"prefix":"⚙️"' '/build/lavis-test home/.local/state/lavis/settings.json'
           printf '%s\n' '{"version":2,"prefix":"!","locale":"en","onboarding":"companion"}' \
             > '/build/lavis-test home/.local/state/lavis/settings.json'

@@ -1073,8 +1073,8 @@ mod tests {
             &HelpRequest::Overview,
             "!",
             &aliases,
-            &[reference.clone()],
-            &[descriptor.clone()],
+            std::slice::from_ref(&reference),
+            std::slice::from_ref(&descriptor),
             crate::i18n::Locale::English,
         )
         .response;
@@ -1090,8 +1090,16 @@ mod tests {
         // Regression: the same runtime state must report the same semantic
         // module/command counts in every locale; only the localized text may
         // differ. Aliases used to be counted and listed only for English.
-        assert!(english.text.starts_with("🛠 Lavis help: 4 modules, 14 commands"));
-        assert!(russian.text.starts_with("🛠 Справка Lavis: 4 модулей, 14 команд"));
+        assert!(
+            english
+                .text
+                .starts_with("🛠 Lavis help: 4 modules, 14 commands")
+        );
+        assert!(
+            russian
+                .text
+                .starts_with("🛠 Справка Lavis: 4 модулей, 14 команд")
+        );
         assert!(english.text.contains("🔗 Aliases: !core"));
         assert!(russian.text.contains("🔗 Псевдонимы: !core"));
         fs::remove_dir_all(directory).unwrap();
