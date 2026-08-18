@@ -12,6 +12,8 @@ pub const MAX_REACTIONS_PER_ACTION: usize = 3;
 pub const V6_MAX_JSON_DEPTH: usize = 8;
 pub const V6_MAX_JSON_STRING_BYTES: usize = 8 * 1024;
 pub const V6_MAX_JSON_COLLECTION_ITEMS: usize = 64;
+pub const V6_ALPHA_CONTRACT_REVISION: u32 = 2;
+pub const V6_TIMEOUT_START: &str = "after_write_flush";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CustomEmojiEntity {
@@ -116,6 +118,9 @@ pub enum V6ModuleFrame {
 pub struct V6CallError {
     pub kind: String,
     pub message: String,
+    pub code: Option<i32>,
+    pub name: Option<String>,
+    pub retry_after_seconds: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -375,6 +380,12 @@ struct V6WireFailure {
 struct V6WireError {
     kind: String,
     message: String,
+    #[serde(default)]
+    code: Option<i32>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    retry_after_seconds: Option<u32>,
 }
 
 pub fn parse_v6_inbound_frame(line: &str) -> Result<V6InboundFrame, ExternalError> {
@@ -504,6 +515,9 @@ pub fn parse_v6_core_frame(line: &str) -> Result<V6CoreFrame, ExternalError> {
         result: Err(V6CallError {
             kind: failure.error.kind,
             message: failure.error.message,
+            code: failure.error.code,
+            name: failure.error.name,
+            retry_after_seconds: failure.error.retry_after_seconds,
         }),
     })
 }
@@ -528,7 +542,7 @@ pub fn serialize_v6_core_result(
             "type": "telegram.result",
             "call_id": call_id,
             "ok": false,
-            "error": {"kind": error.kind, "message": error.message},
+            "error": {"kind": error.kind, "message": error.message, "code": error.code, "name": error.name, "retry_after_seconds": error.retry_after_seconds},
         }),
         Err(_) => return Err(ExternalError::ProtocolEncode),
     };
@@ -1008,6 +1022,125 @@ pub fn request_id() -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn v6_alpha_contract_fixture_matches_parser_semantics() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../protocol/v6/alpha-contract.json")).unwrap();
+        assert_eq!(fixture["schema_version"], 1);
+        assert_eq!(fixture["protocol_version"], 6);
+        assert_eq!(fixture["contract_revision"], V6_ALPHA_CONTRACT_REVISION);
+        assert_eq!(fixture["timeout_start"], V6_TIMEOUT_START);
+
+        for case in fixture["inbound"].as_array().unwrap() {
+            let frame = case.get("frame").unwrap();
+            let line = serde_json::to_string(frame).unwrap();
+            if let Some(accepted) = case.get("accepted").and_then(serde_json::Value::as_bool) {
+                assert_eq!(
+                    parse_v6_inbound_frame(&line).is_ok(),
+                    accepted,
+                    "{}",
+                    case["name"]
+                );
+            }
+            if case
+                .get("module_accepted")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                assert!(parse_v6_module_frame(&line).is_ok(), "{}", case["name"]);
+            }
+            if case
+                .get("core_accepted")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                assert!(parse_v6_core_frame(&line).is_ok(), "{}", case["name"]);
+            }
+        }
+        for case in fixture["outbound"].as_array().unwrap() {
+            let result = match case.get("error") {
+                Some(error) => Err(V6CallError {
+                    kind: error["kind"].as_str().unwrap().to_owned(),
+                    message: error["message"].as_str().unwrap().to_owned(),
+                    code: error
+                        .get("code")
+                        .and_then(serde_json::Value::as_i64)
+                        .and_then(|value| i32::try_from(value).ok()),
+                    name: error
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    retry_after_seconds: error
+                        .get("retry_after_seconds")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|value| u32::try_from(value).ok()),
+                }),
+                None => Ok(case["result"].clone()),
+            };
+            let line = serialize_v6_core_result(case["call_id"].as_str().unwrap(), result).unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&line).unwrap(),
+                case["expected"]
+            );
+        }
+        assert_eq!(
+            fixture["race_semantics"]["duplicate_active_call_id"],
+            "protocol_violation"
+        );
+        assert_eq!(
+            fixture["race_semantics"]["cancellation"],
+            "drain_active_lifecycle_log"
+        );
+        assert_eq!(
+            fixture["race_semantics"]["shutdown"],
+            "discard_late_telegram_result"
+        );
+    }
+
+    #[test]
+    fn v6_alpha_contract_fixture_conforms_to_its_schema_invariants() {
+        // The frozen artifact must stay structurally consistent with
+        // protocol/v6/alpha-contract.schema.json. The schema requires the
+        // outbound error object to carry kind, message, code, name, and
+        // retry_after_seconds (each optional metadata field integer/string or
+        // null), and the contract revision to be at least 2.
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../protocol/v6/alpha-contract.json")).unwrap();
+        for required in [
+            "schema_version",
+            "protocol_version",
+            "contract_revision",
+            "timeout_start",
+            "compatibility",
+            "inbound",
+            "outbound",
+            "race_semantics",
+        ] {
+            assert!(fixture.get(required).is_some(), "missing {required}");
+        }
+        assert!(fixture["contract_revision"].as_u64().unwrap() >= 2);
+        for case in fixture["outbound"].as_array().unwrap() {
+            let Some(error) = case.get("error") else {
+                continue;
+            };
+            for required in ["kind", "message", "code", "name", "retry_after_seconds"] {
+                assert!(
+                    error.get(required).is_some(),
+                    "outbound case {} error is missing {required}",
+                    case["name"]
+                );
+            }
+            assert!(error["kind"].is_string());
+            assert!(error["message"].is_string());
+            assert!(error["code"].is_null() || error["code"].is_i64());
+            assert!(error["name"].is_null() || error["name"].is_string());
+            assert!(
+                error["retry_after_seconds"].is_null()
+                    || error["retry_after_seconds"].as_u64().is_some()
+            );
+        }
+    }
+
+    #[test]
     fn outbound_lifecycle_allows_strings_above_untrusted_input_guard() {
         let frame = V6OutboundCoreFrame::Event {
             request_id: "12".to_owned(),
@@ -1230,6 +1363,9 @@ mod tests {
                 Err(V6CallError {
                     kind: "validation".to_owned(),
                     message: "x".repeat(V6_MAX_JSON_STRING_BYTES + 1),
+                    code: None,
+                    name: None,
+                    retry_after_seconds: None,
                 })
             ),
             Err(ExternalError::ProtocolEncode)
@@ -1385,12 +1521,56 @@ mod tests {
     }
 
     #[test]
+    fn v6_error_wire_contract_includes_optional_metadata() {
+        // Regression: docs/protocol must agree that error carries kind, message,
+        // plus optional code/name/retry_after_seconds.
+        let error = V6CallError {
+            kind: "rpc".to_owned(),
+            message: "Telegram RPC request failed".to_owned(),
+            code: Some(420),
+            name: Some("FLOOD_WAIT".to_owned()),
+            retry_after_seconds: Some(7),
+        };
+        let line = serialize_v6_core_result("rpc-1", Err(error)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["protocol_version"], 6);
+        assert_eq!(value["type"], "telegram.result");
+        assert_eq!(value["call_id"], "rpc-1");
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"]["kind"], "rpc");
+        assert_eq!(value["error"]["message"], "Telegram RPC request failed");
+        assert_eq!(value["error"]["code"], 420);
+        assert_eq!(value["error"]["name"], "FLOOD_WAIT");
+        assert_eq!(value["error"]["retry_after_seconds"], 7);
+
+        // When optional fields are None, they must serialize as null.
+        let error = V6CallError {
+            kind: "validation".to_owned(),
+            message: "bad params".to_owned(),
+            code: None,
+            name: None,
+            retry_after_seconds: None,
+        };
+        let line = serialize_v6_core_result("rpc-2", Err(error)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["error"]["code"], serde_json::Value::Null);
+        assert_eq!(value["error"]["name"], serde_json::Value::Null);
+        assert_eq!(
+            value["error"]["retry_after_seconds"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
     fn v6_core_result_has_only_call_correlation() {
         let line = V6OutboundCoreFrame::TelegramResult {
             call_id: "call".to_owned(),
             result: Err(V6CallError {
                 kind: "validation".to_owned(),
                 message: "bad params".to_owned(),
+                code: None,
+                name: None,
+                retry_after_seconds: None,
             }),
         }
         .serialize()

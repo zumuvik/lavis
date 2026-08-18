@@ -10,5 +10,12 @@ async fn main() -> anyhow::Result<()> {
         .try_init()
         .map_err(|error| anyhow::anyhow!("failed to initialize structured logging: {error}"))?;
 
-    lavis::run().await
+    match lavis::run().await {
+        Ok(()) => Ok(()),
+        Err(error) if lavis::requires_manual_recovery(&error) => {
+            eprintln!("{error:#}");
+            std::process::exit(78);
+        }
+        Err(error) => Err(error),
+    }
 }

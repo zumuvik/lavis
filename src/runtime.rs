@@ -14,8 +14,8 @@ use crate::{
     bot_api::{BotApi, HttpBotApi},
     command::Command,
     commands::{
-        Action, AliasRequest, ExternalInvocation, LmRequest, ModulesRequest, PrefixRequest,
-        SetupRequest, dispatch,
+        Action, AliasRequest, ExternalInvocation, LanguageRequest, LmRequest, ModulesRequest,
+        PrefixRequest, SetupRequest, StartRequest, dispatch,
     },
     error::ExternalError,
     external_modules::{
@@ -38,8 +38,21 @@ use crate::{
         state::ExternalStateStore,
     },
     fastfetch::{self, FastfetchInputError, FastfetchProfileError, FastfetchResult},
-    help::{render_modules_overview_with_external, render_with_external},
-    response::Response,
+    help::{
+        render_modules_invalid_usage, render_modules_overview_with_external_locale,
+        render_with_external_locale,
+    },
+    i18n::{
+        AliasText, ExternalCommandText, FastfetchText, LmInfoResponse, LmInstallPlanText, LmLabel,
+        LmText, Locale, PingText, PrefixText, RuntimeText, SensitiveText, SetupText, StatsText,
+        Text, alias_text, external_command_text, fastfetch_text, inspection_warning_text,
+        lm_format, lm_label, lm_runtime_status, lm_state_text, lm_text, ping_text, prefix_text,
+        render_lm_doctor_missing_catalog, render_lm_doctor_module, render_lm_doctor_report,
+        render_lm_info, render_lm_install_plan, render_stats_text, runtime_text, sensitive_text,
+        setup_text, stats_text, text,
+    },
+    onboarding::OnboardingProgress,
+    response::{Response, sanitize_external_output},
     settings::{DEFAULT_PREFIX, SettingsStore},
     setup::{self, UsernameCandidate},
     setup_store::SetupStore,
@@ -58,6 +71,9 @@ pub struct RuntimeState {
     setup_notification_ids: VecDeque<(PeerId, i32)>,
     setup_edit_fallback_sources: VecDeque<(PeerId, i32)>,
     setup: Option<SetupCoordinator>,
+    // Projection is held closed after setup is configured until BotFather's
+    // authoritative peer identity has been resolved for this process.
+    external_projection_permitted: bool,
     module_installation: Option<ModuleInstallation>,
     module_control: Option<ModuleControlConfig>,
     module_approvals: ApprovalStore<SystemClock, OsRandom>,
@@ -78,10 +94,6 @@ struct ModuleControlConfig {
 
 const MODULE_APPROVAL_LIMIT: usize = 8;
 const MODULE_APPROVAL_BYTES: u64 = 128 * 1024 * 1024;
-const MODULE_MUTATION_DENIED: &str =
-    "⚠️ Эта операция с модулями доступна только из нового собственного сообщения в Saved Messages.";
-const REBOOT_DENIED: &str = "⚠️ Перезапуск доступен только из нового сообщения.";
-
 const MAX_EXPECTED_SELF_EDITS: usize = 128;
 const SETUP_STAGE_TIMEOUT: Duration = Duration::from_secs(90);
 
@@ -212,6 +224,7 @@ pub(crate) struct RuntimeExecution {
     pub provision: Option<ProvisionRequest>,
     pub shutdown: Option<ShutdownReason>,
     pub post_edit: Option<PostEditAction>,
+    pub onboarding_page: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,6 +252,7 @@ impl From<Response> for RuntimeExecution {
             provision: None,
             shutdown: None,
             post_edit: None,
+            onboarding_page: false,
         }
     }
 }
@@ -278,6 +292,7 @@ impl RuntimeState {
             setup_notification_ids: VecDeque::new(),
             setup_edit_fallback_sources: VecDeque::new(),
             setup: None,
+            external_projection_permitted: true,
             module_installation: None,
             module_control: None,
             module_approvals: ApprovalStore::new(
@@ -305,6 +320,7 @@ impl RuntimeState {
             botfather_peer: None,
             phase: SetupPhase::Idle,
         });
+        self.external_projection_permitted = false;
     }
 
     /// Marks a resolved BotFather peer as setup-private. Resolution is kept in
@@ -313,7 +329,13 @@ impl RuntimeState {
     pub fn set_setup_botfather_peer(&mut self, peer: PeerId) {
         if let Some(setup) = &mut self.setup {
             setup.botfather_peer = Some(peer);
+            self.external_projection_permitted = true;
         }
+    }
+
+    #[cfg(test)]
+    fn external_projection_permitted_for_tests(&self) -> bool {
+        self.external_projection_permitted
     }
 
     pub fn setup_protects_message(&self, peer: PeerId, authored_by_self: bool) -> bool {
@@ -335,6 +357,7 @@ impl RuntimeState {
     }
 
     pub(crate) fn handle_setup_timeout(&mut self) -> Option<Response> {
+        let locale = self.locale();
         let setup = self.setup.as_mut()?;
         let expired = matches!(
             setup.phase,
@@ -349,9 +372,7 @@ impl RuntimeState {
         // Only the ephemeral conversation ends. Persisted bot data remains
         // available to the repair path.
         setup.phase = SetupPhase::Idle;
-        Some(Response::plain(
-            "⌛ Настройка остановлена по таймауту. Постоянные данные сохранены; повторите setup или setup repair.".to_owned(),
-        ))
+        Some(Response::plain(setup_text(locale, SetupText::TimedOut)))
     }
 
     pub(crate) async fn handle_setup_input(
@@ -363,6 +384,7 @@ impl RuntimeState {
         edited: bool,
         text: &str,
     ) -> SetupInput {
+        let locale = self.locale();
         let Some(setup) = &mut self.setup else {
             return SetupInput::Ignored;
         };
@@ -373,7 +395,11 @@ impl RuntimeState {
                     provision: None,
                 };
             }
-            let outcome = setup.handle_botfather_reply(client, text).await;
+            let outcome = setup.handle_botfather_reply(client, text, locale).await;
+            let resolved = setup.botfather_peer.is_some();
+            if resolved {
+                self.external_projection_permitted = true;
+            }
             return SetupInput::Consumed {
                 response: outcome.response,
                 provision: outcome.provision,
@@ -383,7 +409,7 @@ impl RuntimeState {
             return SetupInput::Ignored;
         }
         SetupInput::Consumed {
-            response: Some(setup.handle_input(client, text).await),
+            response: Some(setup.handle_input(client, text, locale).await),
             provision: None,
         }
     }
@@ -460,6 +486,9 @@ impl RuntimeState {
         outgoing: bool,
         entities: Vec<crate::external_modules::protocol::CustomEmojiEntity>,
     ) -> Option<CreatedEventDispatch> {
+        if !self.external_projection_permitted {
+            return None;
+        }
         let handle = self.external_manager.clone()?;
         let mut requests = Vec::new();
         for descriptor in self
@@ -512,6 +541,10 @@ impl RuntimeState {
 
     pub fn prefix(&self) -> &str {
         self.settings.prefix()
+    }
+
+    pub(crate) fn locale(&self) -> Locale {
+        self.settings.locale().unwrap_or(Locale::Russian)
     }
 
     pub fn register_expected_self_edit(&mut self, peer_id: PeerId, message_id: i32, text: String) {
@@ -646,9 +679,20 @@ impl RuntimeState {
     }
 
     async fn execute_external(&mut self, invocation: &ExternalInvocation) -> Response {
+        let locale = self.locale();
         let handle = match self.external_manager.clone() {
             Some(h) => h,
-            None => return Response::plain("⚠️ Внешние модули не доступны.".to_owned()),
+            None => {
+                return Response::plain_with_locale(
+                    self.locale(),
+                    external_command_text(
+                        locale,
+                        ExternalCommandText::RuntimeUnavailable,
+                        "",
+                        None,
+                    ),
+                );
+            }
         };
         let result = handle
             .execute(
@@ -666,39 +710,70 @@ impl RuntimeState {
                     .iter()
                     .find(|d| d.id == invocation.module_id);
                 match found {
-                    Some(desc) => {
-                        Response::external_result(text, &desc.display_name, &desc.id, &desc.version)
-                    }
-                    None => Response::plain(format!(
-                        "{text}\n\n⚠️ Модуль «{}» не найден в описаниях.",
-                        invocation.module_id
-                    )),
+                    Some(desc) => Response::external_result(
+                        self.locale(),
+                        text,
+                        &desc.display_name,
+                        &desc.id,
+                        &desc.version,
+                    ),
+                    None => missing_descriptor_response(locale, text, &invocation.module_id),
                 }
             }
-            Err(ExternalError::Unavailable) => Response::plain(format!(
-                "⚠️ Модуль «{}» недоступен или завершился с ошибкой.",
-                invocation.module_id
-            )),
-            Err(ExternalError::ExecutionTimeout) => Response::plain(format!(
-                "⚠️ Модуль «{}» не ответил вовремя.",
-                invocation.module_id
-            )),
-            Err(ExternalError::ProtocolDecode) => Response::plain(format!(
-                "⚠️ Модуль «{}» прислал некорректный ответ.",
-                invocation.module_id
-            )),
-            Err(ExternalError::WrongRequestId) => Response::plain(format!(
-                "⚠️ Модуль «{}» прислал ответ с неверным идентификатором.",
-                invocation.module_id
-            )),
-            Err(ExternalError::ModuleError) => Response::plain(format!(
-                "⚠️ Модуль «{}» сообщил об ошибке выполнения.",
-                invocation.module_id
-            )),
-            Err(ExternalError::ResultTooLarge) => Response::plain(format!(
-                "⚠️ Результат модуля «{}» слишком большой.",
-                invocation.module_id
-            )),
+            Err(ExternalError::Unavailable) => Response::plain_with_locale(
+                self.locale(),
+                external_command_text(
+                    locale,
+                    ExternalCommandText::Unavailable,
+                    &invocation.module_id,
+                    None,
+                ),
+            ),
+            Err(ExternalError::ExecutionTimeout) => Response::plain_with_locale(
+                self.locale(),
+                external_command_text(
+                    locale,
+                    ExternalCommandText::Timeout,
+                    &invocation.module_id,
+                    None,
+                ),
+            ),
+            Err(ExternalError::ProtocolDecode) => Response::plain_with_locale(
+                self.locale(),
+                external_command_text(
+                    locale,
+                    ExternalCommandText::ProtocolDecode,
+                    &invocation.module_id,
+                    None,
+                ),
+            ),
+            Err(ExternalError::WrongRequestId) => Response::plain_with_locale(
+                self.locale(),
+                external_command_text(
+                    locale,
+                    ExternalCommandText::WrongRequestId,
+                    &invocation.module_id,
+                    None,
+                ),
+            ),
+            Err(ExternalError::ModuleError) => Response::plain_with_locale(
+                self.locale(),
+                external_command_text(
+                    locale,
+                    ExternalCommandText::ModuleError,
+                    &invocation.module_id,
+                    None,
+                ),
+            ),
+            Err(ExternalError::ResultTooLarge) => Response::plain_with_locale(
+                self.locale(),
+                external_command_text(
+                    locale,
+                    ExternalCommandText::ResultTooLarge,
+                    &invocation.module_id,
+                    None,
+                ),
+            ),
             Err(error) => {
                 tracing::warn!(
                     event = "external_command_error",
@@ -707,10 +782,15 @@ impl RuntimeState {
                     error = %error,
                     "External command failed"
                 );
-                Response::plain(format!(
-                    "⚠️ Ошибка модуля «{}»: {}",
-                    invocation.module_id, error
-                ))
+                Response::plain_with_locale(
+                    self.locale(),
+                    external_command_text(
+                        locale,
+                        ExternalCommandText::GenericError,
+                        &invocation.module_id,
+                        Some(&error.to_string()),
+                    ),
+                )
             }
         };
         if result.is_err() {
@@ -729,15 +809,25 @@ impl RuntimeState {
     ) -> RuntimeExecution {
         self.recognized_commands = self.recognized_commands.saturating_add(1);
         let prefix = self.prefix().to_owned();
+        if let Action::Start(request) = action {
+            return self.execute_start(client, request, peer_id).await;
+        }
         if let Action::Setup(request) = action {
             return self.execute_setup(client, request, peer_id).await;
         }
         match action {
+            Action::Language(request) => self.execute_language(request).await,
             Action::Ping => match telegram_ping(client, message_id).await {
-                Ok(latency) => Response::plain(format!("🏓 Pong: {}", format_latency(latency))),
+                Ok(latency) => Response::plain_with_locale(
+                    self.locale(),
+                    ping_text(self.locale(), PingText::Success, &format_latency(latency)),
+                ),
                 Err(error) => {
                     log_ping_failure(action, message_id, &error);
-                    Response::plain("⚠️ Telegram ping failed")
+                    Response::plain_with_locale(
+                        self.locale(),
+                        runtime_text(self.locale(), RuntimeText::PingFailed),
+                    )
                 }
             },
             Action::Stats => {
@@ -745,25 +835,30 @@ impl RuntimeState {
                     Ok(latency) => format_latency(latency),
                     Err(error) => {
                         log_ping_failure(action, message_id, &error);
-                        "unavailable".to_owned()
+                        stats_text(self.locale(), StatsText::Unavailable).to_owned()
                     }
                 };
                 let proc_stats = read_proc_stats().await;
                 log_unavailable_proc_stats(&proc_stats);
-                Response::plain(format_stats(
-                    &telegram,
-                    self.started_at.elapsed(),
-                    &proc_stats,
-                    self.recognized_commands,
-                ))
+                Response::plain_with_locale(
+                    self.locale(),
+                    format_stats(
+                        self.locale(),
+                        &telegram,
+                        self.started_at.elapsed(),
+                        &proc_stats,
+                        self.recognized_commands,
+                    ),
+                )
             }
             Action::Help(request) => {
-                let rendered = render_with_external(
+                let rendered = render_with_external_locale(
                     request,
                     &prefix,
                     &self.aliases,
                     self.external_command_refs(),
                     self.external_descriptors(),
+                    self.locale(),
                 );
                 if rendered.entity_fallback {
                     tracing::warn!(
@@ -774,7 +869,8 @@ impl RuntimeState {
                 rendered.response
             }
             Action::Fastfetch(arguments) => fastfetch_response(
-                fastfetch::run(arguments, &self.fastfetch_profile_path).await,
+                fastfetch::run(self.locale(), arguments, &self.fastfetch_profile_path).await,
+                self.locale(),
                 &prefix,
                 &self.fastfetch_profile_path,
             ),
@@ -784,9 +880,160 @@ impl RuntimeState {
             Action::Lm(request) => self.execute_lm(client, message_context, request).await,
             Action::Reboot => return self.execute_reboot(message_context),
             Action::Setup(_) => unreachable!("setup actions return before response dispatch"),
+            Action::Start(_) => unreachable!("start actions return before response dispatch"),
             Action::External(invocation) => self.execute_external(invocation).await,
         }
         .into()
+    }
+
+    async fn execute_language(&mut self, request: &LanguageRequest) -> Response {
+        match request {
+            LanguageRequest::Show => match self.settings.locale() {
+                Some(locale) => Response::plain_with_locale(
+                    self.locale(),
+                    format!(
+                        "🌐 {}: {}",
+                        text(locale, Text::LanguageCurrent),
+                        locale.code()
+                    ),
+                ),
+                None => Response::plain_with_locale(
+                    self.locale(),
+                    crate::i18n::bilingual(Text::LanguageChoose, self.prefix()),
+                ),
+            },
+            LanguageRequest::Set(locale) => match self.settings.set_locale(Some(*locale)).await {
+                Ok(()) => Response::plain_with_locale(
+                    self.locale(),
+                    format!(
+                        "🌐 {}: {}",
+                        text(*locale, Text::LanguageChanged),
+                        locale.code()
+                    ),
+                ),
+                Err(_) => Response::plain_with_locale(
+                    self.locale(),
+                    text(*locale, Text::LanguageSaveFailed),
+                ),
+            },
+            LanguageRequest::Invalid => Response::plain_with_locale(
+                self.locale(),
+                format!("⚠️ {}", text(self.locale(), Text::LanguageUsage)),
+            ),
+        }
+    }
+
+    async fn execute_start(
+        &mut self,
+        client: &Client,
+        request: &StartRequest,
+        peer: PeerId,
+    ) -> RuntimeExecution {
+        if self.settings.locale().is_none()
+            && matches!(request, StartRequest::Bot | StartRequest::Skip)
+        {
+            return Response::plain_with_locale(
+                self.locale(),
+                crate::i18n::bilingual(Text::OnboardingSelect, self.prefix()),
+            )
+            .into();
+        }
+        let progress = match request {
+            StartRequest::Bot => {
+                return self.execute_setup(client, &SetupRequest::Start, peer).await;
+            }
+            // Repair is the existing idempotent provisioning path. It verifies the
+            // stored bot/token before creating or repairing the private group.
+            StartRequest::Invalid => {
+                return Response::plain_with_locale(
+                    self.locale(),
+                    format!(
+                        "⚠️ {}",
+                        text(self.locale(), Text::StartUsage).replace("{prefix}", self.prefix())
+                    ),
+                )
+                .into();
+            }
+            StartRequest::Skip => {
+                if self.settings.locale().is_none() {
+                    return Response::plain_with_locale(
+                        self.locale(),
+                        crate::i18n::bilingual(Text::OnboardingSelect, self.prefix()),
+                    )
+                    .into();
+                }
+                let locale = self.locale();
+                return match self
+                    .settings
+                    .set_onboarding(OnboardingProgress::skip())
+                    .await
+                {
+                    Ok(()) => Response::plain_with_locale(
+                        self.locale(),
+                        OnboardingProgress::Skipped.message(locale, self.prefix()),
+                    )
+                    .into(),
+                    Err(_) => Response::plain_with_locale(
+                        self.locale(),
+                        text(locale, Text::OnboardingSaveFailed),
+                    )
+                    .into(),
+                };
+            }
+            StartRequest::Locale(locale) => {
+                if self.settings.set_locale(Some(*locale)).await.is_err() {
+                    return Response::plain_with_locale(
+                        self.locale(),
+                        text(*locale, Text::LanguageSaveFailed),
+                    )
+                    .into();
+                }
+                OnboardingProgress::restart()
+            }
+            StartRequest::Begin => {
+                let Some(_) = self.settings.locale() else {
+                    return Response::plain_with_locale(
+                        self.locale(),
+                        crate::i18n::bilingual(Text::OnboardingSelect, self.prefix()),
+                    )
+                    .into();
+                };
+                match self.settings.onboarding() {
+                    OnboardingProgress::NotStarted
+                    | OnboardingProgress::Complete
+                    | OnboardingProgress::Skipped => OnboardingProgress::restart(),
+                    progress => progress,
+                }
+            }
+        };
+        let locale = self.locale();
+        let response = format!(
+            "{}\n\n{}",
+            progress.message(locale, self.prefix()),
+            text(locale, Text::StartUsage).replace("{prefix}", self.prefix())
+        );
+        // Keep the rendered page as the durable cursor. This makes a failed
+        // delivery retry the same page rather than silently skipping it.
+        match self.settings.set_onboarding(progress).await {
+            Ok(()) => RuntimeExecution {
+                response: Response::plain_with_locale(self.locale(), response),
+                provision: None,
+                shutdown: None,
+                post_edit: None,
+                onboarding_page: true,
+            },
+            Err(_) => {
+                Response::plain_with_locale(self.locale(), text(locale, Text::OnboardingSaveFailed))
+                    .into()
+            }
+        }
+    }
+
+    pub(crate) async fn mark_onboarding_delivered(&mut self) {
+        let next = self.settings.onboarding().mark_delivered();
+        if let Err(error) = self.settings.set_onboarding(next).await {
+            tracing::warn!(event = "onboarding_progress_save_failed", error = %error, "Could not advance delivered tutorial page");
+        }
     }
 
     async fn execute_lm(
@@ -817,7 +1064,7 @@ impl RuntimeState {
             LmRequest::Info { id } => self.lm_info(id).await,
             LmRequest::Logs { id } => self.lm_logs(id).await,
             LmRequest::Doctor { id } => self.lm_doctor(id.as_deref()).await,
-            LmRequest::Invalid => Response::plain(lm_usage(self.prefix())),
+            LmRequest::Invalid => self.lm_invalid_usage_response(),
             LmRequest::Install => {
                 self.inspect_module_install(client, message_context.message)
                     .await
@@ -831,20 +1078,27 @@ impl RuntimeState {
 
     async fn render_lm_list(&self) -> Response {
         let Some(config) = &self.module_control else {
-            return Response::plain("⚠️ Управление внешними модулями недоступно.".to_owned());
+            return Response::plain_with_locale(
+                self.locale(),
+                lm_text(self.locale(), LmText::Unavailable),
+            );
         };
         let state = match ExternalStateStore::load(config.state_path.clone()).await {
             Ok(state) => state,
             Err(_) => {
-                return Response::plain("⚠️ Состояние внешних модулей недоступно.".to_owned());
+                return Response::plain_with_locale(
+                    self.locale(),
+                    lm_text(self.locale(), LmText::StateUnavailable),
+                );
             }
         };
         let list = match control::list_modules(&config.root, &config.declarative_state_path, &state)
         {
             Ok(list) => list,
             Err(_) => {
-                return Response::plain(
-                    "⚠️ Не удалось прочитать список внешних модулей.".to_owned(),
+                return Response::plain_with_locale(
+                    self.locale(),
+                    lm_text(self.locale(), LmText::ListUnavailable),
                 );
             }
         };
@@ -852,27 +1106,75 @@ impl RuntimeState {
             Some(handle) => handle.snapshot().await,
             None => self.external_snapshot.clone(),
         };
-        let mut statuses = list.modules.iter().map(|entry| match &entry.module {
-            Some(module) => format!("• {}\n  ID: {}\n  Версия: {}\n  Состояние: {}\n  Источник: {}\n  Runtime: {}\n  Автор: {}\n  Команд: {}", module.display_name, module.id, module.version, enabled_label(module.enabled), management_label(module.management), runtime_status_from_snapshot(&fresh_snapshot, &module.id), module.author, module.commands.len()),
-            None => format!("• {}\n  Диагностика: {}\n  Состояние: {}\n  Источник: {}", entry.id.as_deref().unwrap_or("некорректный ID"), diagnostic_label(entry.diagnostic.as_ref()), enabled_label(entry.enabled), management_label(entry.management)),
-        }).collect::<Vec<_>>();
+        let mut statuses = list
+            .modules
+            .iter()
+            .map(|entry| match &entry.module {
+                Some(module) => format!(
+                    "• {}\n  {}: {}\n  {}: {}\n  {}: {}\n  {}: {}\n  {}: {}\n  {}: {}\n  {}: {}",
+                    module.display_name,
+                    lm_label(self.locale(), LmLabel::Id),
+                    module.id,
+                    lm_label(self.locale(), LmLabel::Version),
+                    module.version,
+                    lm_label(self.locale(), LmLabel::Status),
+                    enabled_label(self.locale(), module.enabled),
+                    lm_label(self.locale(), LmLabel::Source),
+                    management_label(self.locale(), module.management),
+                    lm_label(self.locale(), LmLabel::Runtime),
+                    runtime_status_from_snapshot(self.locale(), &fresh_snapshot, &module.id),
+                    lm_label(self.locale(), LmLabel::Author),
+                    module.author,
+                    lm_label(self.locale(), LmLabel::Commands),
+                    module.commands.len()
+                ),
+                None => format!(
+                    "• {}\n  {}: {}\n  {}: {}\n  {}: {}",
+                    entry
+                        .id
+                        .as_deref()
+                        .unwrap_or(lm_label(self.locale(), LmLabel::InvalidId)),
+                    lm_label(self.locale(), LmLabel::Diagnostic),
+                    diagnostic_label(self.locale(), entry.diagnostic.as_ref()),
+                    lm_label(self.locale(), LmLabel::Status),
+                    enabled_label(self.locale(), entry.enabled),
+                    lm_label(self.locale(), LmLabel::Source),
+                    management_label(self.locale(), entry.management)
+                ),
+            })
+            .collect::<Vec<_>>();
         for id in state.enabled_ids() {
             if !list
                 .modules
                 .iter()
                 .any(|entry| entry.id.as_deref() == Some(id))
             {
-                statuses.push(format!("• {id}\n  Статус: включён, но каталог отсутствует"));
+                statuses.push(format!(
+                    "• {id}\n  {}: {}",
+                    lm_label(self.locale(), LmLabel::Status),
+                    lm_label(self.locale(), LmLabel::MissingCatalog)
+                ));
             }
         }
         if statuses.is_empty() {
-            Response::plain(format!(
-                "📦 Внешние модули не установлены.\n\nЧтобы установить модуль, прикрепите .lmod к сообщению:\n{}lm install",
-                self.prefix()
-            ))
+            Response::plain_with_locale(
+                self.locale(),
+                lm_format(self.locale(), LmText::Empty, "", self.prefix()),
+            )
         } else {
-            Response::plain(format!("📦 Внешние модули\n\n{}", statuses.join("\n\n")))
+            Response::plain_with_locale(
+                self.locale(),
+                format!(
+                    "{}\n\n{}",
+                    lm_text(self.locale(), LmText::ListHeading),
+                    statuses.join("\n\n")
+                ),
+            )
         }
+    }
+
+    fn lm_invalid_usage_response(&self) -> Response {
+        Response::plain_with_locale(self.locale(), lm_usage(self.locale(), self.prefix()))
     }
 
     fn lm_mutation_policy(&self, context: MessageExecutionContext<'_>) -> Result<(), Response> {
@@ -887,17 +1189,20 @@ impl RuntimeState {
 
     async fn lm_logs(&self, id: &str) -> Response {
         let Some(handle) = &self.external_manager else {
-            return Response::plain("⚠️ Runtime внешних модулей недоступен.".to_owned());
+            return Response::plain_with_locale(
+                self.locale(),
+                lm_text(self.locale(), LmText::RuntimeUnavailable),
+            );
         };
         match handle.diagnostic_text(id).await {
-            Some(diagnostic) => Response::plain(format!(
-                "📋 Последняя ошибка модуля {id}
-
-{diagnostic}"
-            )),
-            None => Response::plain(format!(
-                "ℹ️ Для модуля {id} нет сохранённой runtime-ошибки."
-            )),
+            Some(diagnostic) => Response::plain_with_locale(
+                self.locale(),
+                lm_format(self.locale(), LmText::LastModuleError, id, &diagnostic),
+            ),
+            None => Response::plain_with_locale(
+                self.locale(),
+                lm_format(self.locale(), LmText::NoRuntimeError, id, ""),
+            ),
         }
     }
 
@@ -907,20 +1212,27 @@ impl RuntimeState {
     /// report is narrowed to one module; without one it covers all modules.
     async fn lm_doctor(&self, id: Option<&str>) -> Response {
         let Some(config) = &self.module_control else {
-            return Response::plain("⚠️ Управление внешними модулями недоступно.".to_owned());
+            return Response::plain_with_locale(
+                self.locale(),
+                lm_text(self.locale(), LmText::Unavailable),
+            );
         };
         let state = match ExternalStateStore::load(config.state_path.clone()).await {
             Ok(state) => state,
             Err(_) => {
-                return Response::plain("⚠️ Состояние внешних модулей недоступно.".to_owned());
+                return Response::plain_with_locale(
+                    self.locale(),
+                    lm_text(self.locale(), LmText::StateUnavailable),
+                );
             }
         };
         let list = match control::list_modules(&config.root, &config.declarative_state_path, &state)
         {
             Ok(list) => list,
             Err(_) => {
-                return Response::plain(
-                    "⚠️ Не удалось прочитать список внешних модулей.".to_owned(),
+                return Response::plain_with_locale(
+                    self.locale(),
+                    lm_text(self.locale(), LmText::ListUnavailable),
                 );
             }
         };
@@ -933,27 +1245,25 @@ impl RuntimeState {
                     continue;
                 }
                 let runtime = fresh_runtime_status(
+                    self.locale(),
                     self.external_manager.as_ref(),
                     &self.external_snapshot,
                     &module.id,
                 )
                 .await;
                 let diagnostic = if let Some(handle) = &self.external_manager {
-                    handle
-                        .diagnostic_summary(&module.id)
-                        .await
-                        .map(|summary| format!("\n  Последний сбой: {summary}"))
+                    handle.diagnostic_summary(&module.id).await
                 } else {
                     None
                 };
-                lines.push(format!(
-                    "• {}\n  ID: {}\n  Состояние: {}\n  Runtime: {}\n  Управление: {}{}",
-                    module.display_name,
-                    module.id,
-                    enabled_label(module.enabled),
-                    runtime,
-                    management_label(module.management),
-                    diagnostic.unwrap_or_default(),
+                lines.push(render_lm_doctor_module(
+                    self.locale(),
+                    &module.display_name,
+                    &module.id,
+                    enabled_label(self.locale(), module.enabled),
+                    &runtime,
+                    management_label(self.locale(), module.management),
+                    diagnostic.as_deref(),
                 ));
             }
         }
@@ -968,37 +1278,40 @@ impl RuntimeState {
             {
                 continue;
             }
-            lines.push(format!(
-                "• {enabled}\n  Статус: включён, но каталог отсутствует"
-            ));
+            lines.push(render_lm_doctor_missing_catalog(self.locale(), enabled));
         }
         let Some(target) = id else {
-            return Response::plain(format!(
-                "🩺 Диагностика внешних модулей\n\n{}",
-                if lines.is_empty() {
-                    "Внешние модули не установлены.".to_owned()
-                } else {
-                    lines.join("\n\n")
-                }
-            ));
+            return Response::plain_with_locale(
+                self.locale(),
+                render_lm_doctor_report(self.locale(), None, &lines),
+            );
         };
         if lines.is_empty() {
-            return Response::plain(format!("ℹ️ Модуль {target} не найден."));
+            return Response::plain_with_locale(
+                self.locale(),
+                lm_format(self.locale(), LmText::NotFound, target, ""),
+            );
         }
-        Response::plain(format!(
-            "🩺 Диагностика модуля {target}\n\n{}",
-            lines.join("\n\n")
-        ))
+        Response::plain_with_locale(
+            self.locale(),
+            render_lm_doctor_report(self.locale(), Some(target), &lines),
+        )
     }
 
     async fn lm_info(&self, id: &str) -> Response {
         let Some(config) = &self.module_control else {
-            return Response::plain("⚠️ Управление внешними модулями недоступно.".to_owned());
+            return Response::plain_with_locale(
+                self.locale(),
+                lm_text(self.locale(), LmText::Unavailable),
+            );
         };
         let state = match ExternalStateStore::load(config.state_path.clone()).await {
             Ok(state) => state,
             Err(_) => {
-                return Response::plain("⚠️ Состояние внешних модулей недоступно.".to_owned());
+                return Response::plain_with_locale(
+                    self.locale(),
+                    lm_text(self.locale(), LmText::StateUnavailable),
+                );
             }
         };
         let diagnostic = if let Some(handle) = &self.external_manager {
@@ -1007,44 +1320,69 @@ impl RuntimeState {
             None
         };
         match control::module_info(&config.root, &config.declarative_state_path, &state, id) {
-            Ok(module) => Response::plain(format!(
-                "📦 {}\nID: {}\nВерсия: {}\nАвтор: {}\nСостояние: {}\nИсточник: {}\nТочка входа: {}\nSchema/API protocol: v{}\nВозможности: {}\nПредоставляемые команды: {}\nRuntime: {}\nПоследняя ошибка: {}",
-                module.display_name,
-                module.id,
-                module.version,
-                module.author,
-                enabled_label(module.enabled),
-                management_label(module.management),
-                module.entrypoint,
-                module.protocol_version,
-                capabilities_label(&module.capabilities),
-                commands_label(&module.commands),
-                fresh_runtime_status(
+            Ok(module) => {
+                let locale = self.locale();
+                let capabilities = capabilities_label(locale, &module.capabilities);
+                let commands = commands_label(locale, &module.commands);
+                let runtime = fresh_runtime_status(
+                    locale,
                     self.external_manager.as_ref(),
                     &self.external_snapshot,
-                    &module.id
+                    &module.id,
                 )
-                .await,
-                diagnostic.as_deref().unwrap_or("нет")
-            )),
+                .await;
+                Response::plain_with_locale(
+                    self.locale(),
+                    render_lm_info(
+                        locale,
+                        LmInfoResponse {
+                            display_name: &module.display_name,
+                            id: &module.id,
+                            version: &module.version,
+                            author: &module.author,
+                            enabled: enabled_label(locale, module.enabled),
+                            management: management_label(locale, module.management),
+                            entrypoint: &module.entrypoint,
+                            protocol_version: module.protocol_version,
+                            capabilities: &capabilities,
+                            commands: &commands,
+                            runtime: &runtime,
+                            diagnostic: diagnostic.as_deref(),
+                        },
+                    ),
+                )
+            }
             Err(control::ModuleControlError::InvalidInstalledModule) => {
-                Response::plain("⚠️ Манифест установленного модуля некорректен.".to_owned())
+                Response::plain_with_locale(
+                    self.locale(),
+                    lm_text(self.locale(), LmText::InvalidManifest),
+                )
             }
-            Err(control::ModuleControlError::ModuleNotInstalled) => {
-                Response::plain("⚠️ Модуль не установлен.".to_owned())
-            }
-            Err(_) => Response::plain("⚠️ Модуль не установлен или недоступен.".to_owned()),
+            Err(control::ModuleControlError::ModuleNotInstalled) => Response::plain_with_locale(
+                self.locale(),
+                lm_text(self.locale(), LmText::NotInstalled),
+            ),
+            Err(_) => Response::plain_with_locale(
+                self.locale(),
+                lm_text(self.locale(), LmText::NotInstalledOrUnavailable),
+            ),
         }
     }
 
     async fn lm_set_enabled(&self, id: &str, enabled: bool) -> Response {
         let Some(config) = &self.module_control else {
-            return Response::plain("⚠️ Управление внешними модулями недоступно.".to_owned());
+            return Response::plain_with_locale(
+                self.locale(),
+                lm_text(self.locale(), LmText::Unavailable),
+            );
         };
         let mut state = match ExternalStateStore::load(config.state_path.clone()).await {
             Ok(state) => state,
             Err(_) => {
-                return Response::plain("⚠️ Состояние внешних модулей недоступно.".to_owned());
+                return Response::plain_with_locale(
+                    self.locale(),
+                    lm_text(self.locale(), LmText::StateUnavailable),
+                );
             }
         };
         let result = if enabled {
@@ -1055,25 +1393,48 @@ impl RuntimeState {
                 .await
         };
         match result {
-            Ok(operation) if operation.changed => Response::plain(format!(
-                "✅ Модуль «{}» {}.\n\nДля применения изменений выполните:\n{}reboot",
-                operation.module.display_name,
-                if enabled { "включён" } else { "отключён" },
-                self.prefix(),
-            )),
-            Ok(operation) => Response::plain(format!("ℹ️ Модуль «{}» уже {}.", operation.module.display_name, if enabled { "включён" } else { "отключён" })),
-            Err(control::ModuleControlError::DeclarativelyManaged) => Response::plain("⚠️ Модуль управляется декларативно через NixOS. Измените services.lavis.extensions и выполните nh os switch.".to_owned()),
-            Err(_) => Response::plain("⚠️ Не удалось изменить состояние модуля.".to_owned()),
+            Ok(operation) if operation.changed => Response::plain_with_locale(
+                self.locale(),
+                lm_state_text(
+                    self.locale(),
+                    LmText::StateChanged,
+                    &operation.module.display_name,
+                    enabled_label(self.locale(), enabled),
+                    self.prefix(),
+                ),
+            ),
+            Ok(operation) => Response::plain_with_locale(
+                self.locale(),
+                lm_state_text(
+                    self.locale(),
+                    LmText::StateUnchanged,
+                    &operation.module.display_name,
+                    enabled_label(self.locale(), enabled),
+                    self.prefix(),
+                ),
+            ),
+            Err(control::ModuleControlError::DeclarativelyManaged) => Response::plain_with_locale(
+                self.locale(),
+                lm_text(self.locale(), LmText::Declarative),
+            ),
+            Err(_) => Response::plain_with_locale(
+                self.locale(),
+                lm_text(self.locale(), LmText::StateChangeFailed),
+            ),
         }
     }
 
     fn execute_reboot(&self, context: MessageExecutionContext<'_>) -> RuntimeExecution {
         match self.authorize_sensitive_command(SensitiveCommandPolicy::Reboot, context, None) {
             Ok(()) => RuntimeExecution {
-                response: Response::plain("♻️ Lavis перезапускается…".to_owned()),
+                response: Response::plain_with_locale(
+                    self.locale(),
+                    runtime_text(self.locale(), RuntimeText::Rebooting),
+                ),
                 provision: None,
                 shutdown: None,
                 post_edit: Some(PostEditAction::ArmRebootReceipt),
+                onboarding_page: false,
             },
             Err(response) => response.into(),
         }
@@ -1093,12 +1454,23 @@ impl RuntimeState {
             context.message.id(),
             saved_messages_peer,
         )
-        .map_err(|reason| Response::plain(reason.response(policy).to_owned()))
+        .map_err(|reason| {
+            let text = match policy {
+                SensitiveCommandPolicy::ModuleMutation => {
+                    sensitive_text(self.locale(), SensitiveText::ModuleMutationDenied)
+                }
+                SensitiveCommandPolicy::Reboot => reason.response(self.locale(), policy),
+            };
+            Response::plain_with_locale(self.locale(), text)
+        })
     }
 
     async fn inspect_module_install(&mut self, client: &Client, message: &Message) -> Response {
         let Some(installation) = &self.module_installation else {
-            return Response::plain("⚠️ Установка внешних модулей недоступна.".to_owned());
+            return Response::plain_with_locale(
+                self.locale(),
+                lm_text(self.locale(), LmText::InstallUnavailable),
+            );
         };
         let acquired = match ModuleSourceAcquirer::new(
             client,
@@ -1109,10 +1481,12 @@ impl RuntimeState {
         .await
         {
             Ok(acquired) => acquired,
-            Err(_) => return Response::plain(
-                "⚠️ Прикрепите документ .lmod к новому собственному сообщению в Saved Messages."
-                    .to_owned(),
-            ),
+            Err(_) => {
+                return Response::plain_with_locale(
+                    self.locale(),
+                    lm_text(self.locale(), LmText::AttachPackage),
+                );
+            }
         };
         let config = InspectionConfig {
             staging_root: installation.staging_root.clone(),
@@ -1126,57 +1500,93 @@ impl RuntimeState {
         ) {
             Ok(pending) => pending,
             Err(_) => {
-                return Response::plain("⚠️ Пакет .lmod не прошёл безопасную проверку.".to_owned());
+                return Response::plain_with_locale(
+                    self.locale(),
+                    lm_text(self.locale(), LmText::UnsafePackage),
+                );
             }
         };
         let prefix = self.prefix().to_owned();
+        let locale = self.locale();
         match self.module_approvals.issue(pending) {
             Ok((id, _)) => match self.module_approvals.get(id) {
-                Ok(plan) => Response::plain(render_install_plan(plan, id, &prefix)),
+                Ok(plan) => Response::plain_with_locale(
+                    locale,
+                    render_install_plan(locale, plan, id, &prefix),
+                ),
                 Err(error) => {
                     tracing::warn!(
                         event = "external_module_approval_plan_unavailable",
                         error = %error,
                         "Issued external module approval could not be read back"
                     );
-                    Response::plain("⚠️ Невозможно сохранить план установки.".to_owned())
+                    Response::plain_with_locale(locale, lm_text(locale, LmText::PlanUnavailable))
                 }
             },
-            Err(_) => Response::plain("⚠️ Невозможно сохранить план установки.".to_owned()),
+            Err(_) => Response::plain_with_locale(
+                self.locale(),
+                lm_text(self.locale(), LmText::PlanUnavailable),
+            ),
         }
     }
 
     async fn confirm_module_install(&mut self, supplied: &crate::commands::ApprovalId) -> Response {
         let Ok(id) = ApprovalId::parse(supplied.as_str()) else {
-            return Response::plain("⚠️ ApprovalId недействителен или истёк.".to_owned());
+            return Response::plain_with_locale(
+                self.locale(),
+                lm_text(self.locale(), LmText::ApprovalInvalid),
+            );
         };
         let Some(installation) = &self.module_installation else {
-            return Response::plain("⚠️ Установка внешних модулей недоступна.".to_owned());
+            return Response::plain_with_locale(
+                self.locale(),
+                lm_text(self.locale(), LmText::InstallUnavailable),
+            );
         };
         let module_id = match self.module_approvals.get(id) {
             Ok(plan) => plan.module_id.clone(),
             Err(ApprovalError::Unavailable | ApprovalError::InvalidId) => {
-                return Response::plain("⚠️ ApprovalId недействителен или истёк.".to_owned());
+                return Response::plain_with_locale(
+                    self.locale(),
+                    lm_text(self.locale(), LmText::ApprovalInvalid),
+                );
             }
-            Err(_) => return Response::plain("⚠️ План установки недоступен.".to_owned()),
+            Err(_) => {
+                return Response::plain_with_locale(
+                    self.locale(),
+                    lm_text(self.locale(), LmText::PlanUnavailable),
+                );
+            }
         };
         if let Some(handle) = &self.external_manager {
             let manager = handle.lock().await;
             if manager.descriptor_by_id(&module_id).is_some() {
-                return Response::plain(format!(
-                    "⚠️ Модуль «{module_id}» уже зарегистрирован; установка не начата."
-                ));
+                return Response::plain_with_locale(
+                    self.locale(),
+                    lm_format(self.locale(), LmText::AlreadyRegistered, &module_id, ""),
+                );
             }
         }
         let pending = match self.module_approvals.redeem(id) {
             Ok(pending) => pending,
             Err(ApprovalError::Unavailable | ApprovalError::InvalidId) => {
-                return Response::plain("⚠️ ApprovalId недействителен или истёк.".to_owned());
+                return Response::plain_with_locale(
+                    self.locale(),
+                    lm_text(self.locale(), LmText::ApprovalInvalid),
+                );
             }
-            Err(_) => return Response::plain("⚠️ План установки недоступен.".to_owned()),
+            Err(_) => {
+                return Response::plain_with_locale(
+                    self.locale(),
+                    lm_text(self.locale(), LmText::PlanUnavailable),
+                );
+            }
         };
         let Some(wrapper) = pending.stage.take_wrapper() else {
-            return Response::plain("⚠️ Проверенный пакет недоступен.".to_owned());
+            return Response::plain_with_locale(
+                self.locale(),
+                lm_text(self.locale(), LmText::VerifiedPackageUnavailable),
+            );
         };
         let installed = match crate::external_modules::installer::install_staged_module(
             &wrapper,
@@ -1197,12 +1607,12 @@ impl RuntimeState {
                 }
                 return match error {
                     crate::external_modules::installer::InstallError::TargetCleanup(_) => {
-                        Response::plain("⚠️ Установка не завершена: откат цели не удался; проверьте каталог модулей вручную.".to_owned())
+                        Response::plain_with_locale(self.locale(), lm_text(self.locale(), LmText::InstallRollbackFailed))
                     }
                     crate::external_modules::installer::InstallError::PostInstallValidationFailed { .. } => {
-                        Response::plain("⚠️ Установка не выполнена: финальная проверка не пройдена, цель удалена.".to_owned())
+                        Response::plain_with_locale(self.locale(), lm_text(self.locale(), LmText::InstallValidationFailed))
                     }
-                    _ => Response::plain("⚠️ Установка не выполнена.".to_owned()),
+                    _ => Response::plain_with_locale(self.locale(), lm_text(self.locale(), LmText::InstallFailed)),
                 };
             }
         };
@@ -1218,23 +1628,39 @@ impl RuntimeState {
                     "Installed external module already has a registered descriptor"
                 );
                 self.refresh_snapshot().await;
-                return Response::plain(format!(
-                    "⚠️ Модуль «{module_id}» установлен, но не зарегистрирован из-за конфликтующего описания."
-                ));
+                return Response::plain_with_locale(
+                    self.locale(),
+                    lm_format(self.locale(), LmText::RegistrationConflict, &module_id, ""),
+                );
             }
         }
         self.refresh_snapshot().await;
-        Response::plain(format!("✅ Модуль «{module_id}» установлен и выключен."))
+        Response::plain_with_locale(
+            self.locale(),
+            lm_format(self.locale(), LmText::InstalledDisabled, &module_id, ""),
+        )
     }
 
     fn cancel_module_install(&mut self, supplied: &crate::commands::ApprovalId) -> Response {
         match ApprovalId::parse(supplied.as_str()) {
             Ok(id) => match self.module_approvals.revoke(id) {
-                Ok(true) => Response::plain("✅ План установки отменён.".to_owned()),
-                Ok(false) => Response::plain("⚠️ ApprovalId недействителен или истёк.".to_owned()),
-                Err(_) => Response::plain("⚠️ План установки недоступен.".to_owned()),
+                Ok(true) => Response::plain_with_locale(
+                    self.locale(),
+                    lm_text(self.locale(), LmText::Cancelled),
+                ),
+                Ok(false) => Response::plain_with_locale(
+                    self.locale(),
+                    lm_text(self.locale(), LmText::ApprovalInvalid),
+                ),
+                Err(_) => Response::plain_with_locale(
+                    self.locale(),
+                    lm_text(self.locale(), LmText::PlanUnavailable),
+                ),
             },
-            Err(_) => Response::plain("⚠️ ApprovalId недействителен или истёк.".to_owned()),
+            Err(_) => Response::plain_with_locale(
+                self.locale(),
+                lm_text(self.locale(), LmText::ApprovalInvalid),
+            ),
         }
     }
 
@@ -1244,16 +1670,29 @@ impl RuntimeState {
         request: &SetupRequest,
         peer: PeerId,
     ) -> RuntimeExecution {
+        let locale = self.locale();
         let Some(setup) = &mut self.setup else {
-            return Response::plain("⚠️ Setup storage is unavailable.".to_owned()).into();
+            return Response::plain_with_locale(
+                self.locale(),
+                setup_text(locale, SetupText::Unavailable),
+            )
+            .into();
         };
         if peer != setup.saved_messages_peer {
-            return Response::plain(
-                "⚠️ Setup is available only in Saved Messages. Start it there with the active prefix."
-                    .to_owned(),
-            ).into();
+            return Response::plain_with_locale(
+                self.locale(),
+                setup_text(locale, SetupText::SavedMessagesOnly),
+            )
+            .into();
         }
-        setup.handle_command(client, request).await
+        let execution = setup.handle_command(client, request, locale).await;
+        // Starting setup resolves BotFather as part of the confirmed flow. That
+        // authoritative peer is also sufficient to re-open external projection
+        // after a startup resolution failure.
+        if setup.botfather_peer.is_some() {
+            self.external_projection_permitted = true;
+        }
+        execution
     }
 
     fn execute_modules(&self, request: &ModulesRequest, prefix: &str) -> Response {
@@ -1265,10 +1704,11 @@ impl RuntimeState {
                     command_count = crate::commands::commands().len(),
                     "Rendered module overview"
                 );
-                let rendered = render_modules_overview_with_external(
+                let rendered = render_modules_overview_with_external_locale(
                     prefix,
                     self.external_descriptors(),
                     self.external_command_refs(),
+                    self.locale(),
                 );
                 if rendered.entity_fallback {
                     tracing::warn!(
@@ -1278,53 +1718,76 @@ impl RuntimeState {
                 }
                 rendered.response
             }
-            ModulesRequest::Invalid => {
-                Response::plain(format!("⚠️ Использование: {prefix}modules"))
-            }
+            ModulesRequest::Invalid => render_modules_invalid_usage(prefix, self.locale()).response,
         }
     }
 
     pub(crate) async fn execute_prefix(&mut self, request: &PrefixRequest) -> Response {
+        let locale = self.locale();
         match request {
-            PrefixRequest::Show => Response::plain(format!("⚙️ Active prefix: {}", self.prefix())),
+            PrefixRequest::Show => Response::plain_with_locale(
+                self.locale(),
+                prefix_text(locale, PrefixText::Current).replace("{prefix}", self.prefix()),
+            ),
             PrefixRequest::Set(prefix) => match self.settings.set_prefix(prefix.clone()).await {
-                Ok(()) => Response::plain(format!("⚙️ Command prefix set to: {}", self.prefix())),
-                Err(error) => Response::plain(format!("⚠️ Could not change prefix: {error}")),
+                Ok(()) => Response::plain_with_locale(
+                    self.locale(),
+                    prefix_text(locale, PrefixText::Changed).replace("{prefix}", self.prefix()),
+                ),
+                Err(_) => Response::plain_with_locale(
+                    self.locale(),
+                    prefix_text(locale, PrefixText::ChangeFailed),
+                ),
             },
             PrefixRequest::Reset => match self.settings.set_prefix(DEFAULT_PREFIX.to_owned()).await
             {
-                Ok(()) => Response::plain(format!("⚙️ Command prefix reset to: {}", self.prefix())),
-                Err(error) => Response::plain(format!("⚠️ Could not reset prefix: {error}")),
+                Ok(()) => Response::plain_with_locale(
+                    self.locale(),
+                    prefix_text(locale, PrefixText::Reset).replace("{prefix}", self.prefix()),
+                ),
+                Err(_) => Response::plain_with_locale(
+                    self.locale(),
+                    prefix_text(locale, PrefixText::ResetFailed),
+                ),
             },
-            PrefixRequest::Invalid => Response::plain(format!(
-                "⚠️ Usage: {}prefix [new-prefix|reset]",
-                self.prefix()
-            )),
+            PrefixRequest::Invalid => Response::plain_with_locale(
+                self.locale(),
+                prefix_text(locale, PrefixText::Usage).replace("{prefix}", self.prefix()),
+            ),
         }
     }
 
     async fn execute_alias(&mut self, request: &AliasRequest, prefix: &str) -> Response {
+        let locale = self.locale();
         match request {
             AliasRequest::List => {
                 let aliases = self.aliases.aliases();
                 if aliases.is_empty() {
-                    return Response::plain("🔗 No aliases configured");
+                    return Response::plain_with_locale(
+                        self.locale(),
+                        alias_text(locale, AliasText::Empty),
+                    );
                 }
-                Response::plain(format!(
-                    "🔗 Aliases\n\n{}",
-                    aliases
-                        .iter()
-                        .map(|(name, alias)| {
-                            let args = if alias.args.is_empty() {
-                                String::new()
-                            } else {
-                                format!(" {}", shell_words::join(&alias.args))
-                            };
-                            format!("{prefix}{name} → {prefix}{}{args}", alias.target)
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                ))
+                let items = aliases
+                    .iter()
+                    .map(|(name, alias)| {
+                        let args = if alias.args.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" {}", shell_words::join(&alias.args))
+                        };
+                        alias_text(locale, AliasText::ListItem)
+                            .replace("{prefix}", prefix)
+                            .replace("{name}", name)
+                            .replace("{target}", &alias.target)
+                            .replace("{args}", &args)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Response::plain_with_locale(
+                    self.locale(),
+                    alias_text(locale, AliasText::List).replace("{items}", &items),
+                )
             }
             AliasRequest::Add { name, target, args } => match self
                 .aliases
@@ -1337,41 +1800,82 @@ impl RuntimeState {
                 )
                 .await
             {
-                Ok(_) => Response::plain(format!("🔗 Added alias: {prefix}{name}")),
-                Err(error) => Response::plain(format!("⚠️ Could not add alias: {error}")),
+                Ok(_) => Response::plain_with_locale(
+                    self.locale(),
+                    alias_text(locale, AliasText::Added)
+                        .replace("{prefix}", prefix)
+                        .replace("{name}", name),
+                ),
+                Err(_) => Response::plain_with_locale(
+                    self.locale(),
+                    alias_text(locale, AliasText::AddFailed),
+                ),
             },
             AliasRequest::Delete { name } => match self.aliases.delete(name).await {
-                Ok(DeleteResult::Deleted) => {
-                    Response::plain(format!("🔗 Deleted alias: {prefix}{name}"))
-                }
-                Ok(DeleteResult::NotFound) => {
-                    Response::plain(format!("❓ Alias not found: {name}"))
-                }
-                Err(error) => Response::plain(format!("⚠️ Could not delete alias: {error}")),
+                Ok(DeleteResult::Deleted) => Response::plain_with_locale(
+                    self.locale(),
+                    alias_text(locale, AliasText::Deleted)
+                        .replace("{prefix}", prefix)
+                        .replace("{name}", name),
+                ),
+                Ok(DeleteResult::NotFound) => Response::plain_with_locale(
+                    self.locale(),
+                    alias_text(locale, AliasText::NotFound).replace("{name}", name),
+                ),
+                Err(_) => Response::plain_with_locale(
+                    self.locale(),
+                    alias_text(locale, AliasText::DeleteFailed),
+                ),
             },
             AliasRequest::Show { name } => {
                 let normalized_name = name.to_ascii_lowercase();
                 let Some(alias) = self.aliases.lookup(name) else {
-                    return Response::plain(format!(
-                        "⚠️ Alias {prefix}{normalized_name} does not exist"
-                    ));
+                    return Response::plain_with_locale(
+                        self.locale(),
+                        alias_text(locale, AliasText::DoesNotExist)
+                            .replace("{prefix}", prefix)
+                            .replace("{name}", &normalized_name),
+                    );
                 };
                 let args = if alias.args.is_empty() {
                     String::new()
                 } else {
                     format!(" {}", shell_words::join(&alias.args))
                 };
-                Response::collapsed(
-                    format!("🔗 {prefix}{normalized_name}"),
-                    format!("Alias for:\n{prefix}{}{args}", alias.target),
+                Response::collapsed_with_locale(
+                    locale,
+                    alias_text(locale, AliasText::ShowHeading)
+                        .replace("{prefix}", prefix)
+                        .replace("{name}", &normalized_name),
+                    alias_text(locale, AliasText::Target)
+                        .replace("{prefix}", prefix)
+                        .replace("{target}", &alias.target)
+                        .replace("{args}", &args),
                 )
                 .response
             }
-            AliasRequest::Invalid => Response::plain(format!(
-                "⚠️ Usage: {prefix}alias [list|add <name> <command> [arguments...]|show <name>|del <name>]"
-            )),
+            AliasRequest::Invalid => Response::plain_with_locale(
+                locale,
+                alias_text(locale, AliasText::Usage).replace("{prefix}", prefix),
+            ),
         }
     }
+}
+
+fn missing_descriptor_response(locale: Locale, module_text: &str, module_id: &str) -> Response {
+    Response::plain_with_locale(
+        locale,
+        format!(
+            "{}\n\n{}",
+            sanitize_external_output(module_text),
+            external_command_text(
+                locale,
+                ExternalCommandText::MissingDescriptor,
+                module_id,
+                None
+            )
+        ),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1389,10 +1893,14 @@ enum SensitiveCommandDenial {
 }
 
 impl SensitiveCommandDenial {
-    fn response(self, policy: SensitiveCommandPolicy) -> &'static str {
+    fn response(self, locale: Locale, policy: SensitiveCommandPolicy) -> &'static str {
         match (policy, self) {
-            (SensitiveCommandPolicy::ModuleMutation, _) => MODULE_MUTATION_DENIED,
-            (SensitiveCommandPolicy::Reboot, _) => REBOOT_DENIED,
+            (SensitiveCommandPolicy::ModuleMutation, _) => {
+                sensitive_text(locale, SensitiveText::ModuleMutationDenied)
+            }
+            (SensitiveCommandPolicy::Reboot, _) => {
+                sensitive_text(locale, SensitiveText::RebootDenied)
+            }
         }
     }
 }
@@ -1431,52 +1939,65 @@ fn lm_request_mutates(request: &LmRequest) -> bool {
     )
 }
 
-fn enabled_label(enabled: bool) -> &'static str {
-    if enabled {
-        "включён"
-    } else {
-        "отключён"
-    }
+fn enabled_label(locale: Locale, enabled: bool) -> &'static str {
+    lm_label(
+        locale,
+        if enabled {
+            LmLabel::Enabled
+        } else {
+            LmLabel::Disabled
+        },
+    )
 }
 
-fn management_label(management: control::ModuleManagement) -> &'static str {
+fn management_label(locale: Locale, management: control::ModuleManagement) -> &'static str {
     match management {
-        control::ModuleManagement::Manual => "вручную",
-        control::ModuleManagement::DeclarativeNixOs => "NixOS (декларативно)",
+        control::ModuleManagement::Manual => lm_label(locale, LmLabel::Manual),
+        control::ModuleManagement::DeclarativeNixOs => lm_label(locale, LmLabel::Declarative),
     }
 }
 
-fn diagnostic_label(diagnostic: Option<&control::ModuleDiagnostic>) -> &'static str {
+fn diagnostic_label(
+    locale: Locale,
+    diagnostic: Option<&control::ModuleDiagnostic>,
+) -> &'static str {
     match diagnostic {
-        Some(control::ModuleDiagnostic::InvalidModuleId) => "некорректный ID каталога",
-        Some(control::ModuleDiagnostic::InvalidManifest) => "некорректный манифест",
-        None => "нет",
+        Some(control::ModuleDiagnostic::InvalidModuleId) => lm_label(locale, LmLabel::InvalidId),
+        Some(control::ModuleDiagnostic::InvalidManifest) => {
+            lm_label(locale, LmLabel::InvalidManifest)
+        }
+        None => lm_label(locale, LmLabel::None),
     }
 }
 
-fn runtime_status_from_snapshot<'a>(snapshot: &'a ExternalRuntimeSnapshot, id: &str) -> &'a str {
+fn runtime_status_from_snapshot(
+    locale: Locale,
+    snapshot: &ExternalRuntimeSnapshot,
+    id: &str,
+) -> String {
     snapshot
         .module_statuses
         .iter()
         .find(|status| status.id == id)
-        .map(|status| status.status)
-        .unwrap_or("не запущен")
+        .map(|status| lm_runtime_status(locale, status.status).to_owned())
+        .unwrap_or_else(|| lm_label(locale, LmLabel::NotRunning).to_owned())
 }
 
 async fn fresh_runtime_status(
+    locale: Locale,
     handle: Option<&ExternalManagerHandle>,
     cached: &ExternalRuntimeSnapshot,
     id: &str,
 ) -> String {
     match handle {
-        Some(handle) => runtime_status_from_snapshot(&handle.snapshot().await, id).to_owned(),
-        None => runtime_status_from_snapshot(cached, id).to_owned(),
+        Some(handle) => runtime_status_from_snapshot(locale, &handle.snapshot().await, id),
+        None => runtime_status_from_snapshot(locale, cached, id),
     }
 }
 
-fn capabilities_label(capabilities: &[ExternalCapability]) -> String {
+fn capabilities_label(locale: Locale, capabilities: &[ExternalCapability]) -> String {
     if capabilities.is_empty() {
-        "нет".to_owned()
+        lm_label(locale, LmLabel::None).to_owned()
     } else {
         capabilities
             .iter()
@@ -1487,10 +2008,11 @@ fn capabilities_label(capabilities: &[ExternalCapability]) -> String {
 }
 
 fn commands_label(
+    locale: Locale,
     commands: &[crate::external_modules::manifest::ExternalCommandDescriptor],
 ) -> String {
     if commands.is_empty() {
-        "нет".to_owned()
+        lm_label(locale, LmLabel::None).to_owned()
     } else {
         commands
             .iter()
@@ -1500,17 +2022,15 @@ fn commands_label(
     }
 }
 
-fn lm_usage(prefix: &str) -> String {
-    format!(
-        "⚠️ Использование:\n{prefix}lm\n{prefix}lm list\n{prefix}lm info <id>\n{prefix}lm logs <id>\n{prefix}lm doctor [<id>]\n{prefix}lm install\n{prefix}lm confirm <ApprovalId>\n{prefix}lm cancel <ApprovalId>\n{prefix}lm enable <id>\n{prefix}lm disable <id>"
-    )
+fn lm_usage(locale: Locale, prefix: &str) -> String {
+    lm_text(locale, LmText::Usage).replace("{prefix}", prefix)
 }
 
-fn bounded_list(values: &[String]) -> String {
+fn bounded_list(locale: Locale, values: &[String]) -> String {
     const MAX_ITEMS: usize = 8;
     const MAX_VALUE_CHARS: usize = 96;
     if values.is_empty() {
-        return "нет".to_owned();
+        return lm_label(locale, LmLabel::None).to_owned();
     }
     let mut rendered = values
         .iter()
@@ -1518,54 +2038,74 @@ fn bounded_list(values: &[String]) -> String {
         .map(|value| value.chars().take(MAX_VALUE_CHARS).collect::<String>())
         .collect::<Vec<_>>();
     if values.len() > MAX_ITEMS {
-        rendered.push(format!("ещё {}", values.len() - MAX_ITEMS));
+        let remaining = values.len() - MAX_ITEMS;
+        rendered.push(match locale {
+            Locale::English => format!("+{remaining}"),
+            Locale::Russian => format!("ещё {remaining}"),
+        });
     }
     rendered.join(", ")
 }
 
 fn render_install_plan(
+    locale: Locale,
     plan: &crate::external_modules::source_inspection::ModuleInstallPlan,
     approval_id: ApprovalId,
     prefix: &str,
 ) -> String {
     let source = match &plan.source_identity {
         crate::external_modules::source_inspection::SourceIdentity::Archive => {
-            "архив .lmod".to_owned()
+            lm_label(locale, LmLabel::Archive).to_owned()
         }
         crate::external_modules::source_inspection::SourceIdentity::PinnedRepository(
             repository,
         ) => {
             format!(
-                "репозиторий {} @ {}",
+                "{} {} @ {}",
+                lm_label(locale, LmLabel::Repository),
                 repository.repository(),
                 repository.revision()
             )
         }
     };
-    format!(
-        "📋 План установки\n\nИсточник: {source}\nМодуль: {} v{}\nПротокол: {}\nТочка входа: {}\nКоманда по умолчанию: {}\nSHA-256: {}\nОтпечаток: {}\nАрхив: {} Байт, файлов: {}, сжато: {} Байт, распаковано: {} Байт\nВозможности: {}\nПодписки: {}\nМетоды Telegram V6: {}\nДействия: {}\nПредупреждения: {}\n\nApprovalId: {approval_id}\nПодтвердите: {prefix}lm confirm {approval_id}\nОтменить: {prefix}lm cancel {approval_id}\nСрок действия: 10 минут.",
-        plan.module_id,
-        plan.module_version,
-        plan.protocol_version,
-        plan.entrypoint,
-        plan.default_command.as_deref().unwrap_or("нет"),
-        plan.archive_digest.as_hex(),
-        plan.fingerprint,
-        plan.archive.archive_bytes,
-        plan.archive.file_count,
-        plan.archive.compressed_bytes,
-        plan.archive.expanded_bytes,
-        bounded_list(&plan.capabilities),
-        bounded_list(&plan.subscriptions),
-        bounded_list(&plan.telegram_methods),
-        bounded_list(&plan.actions),
-        bounded_list(
-            &plan
-                .warnings
-                .iter()
-                .map(|warning| format!("{warning:?}"))
-                .collect::<Vec<_>>()
-        ),
+    let capabilities = bounded_list(locale, &plan.capabilities);
+    let subscriptions = bounded_list(locale, &plan.subscriptions);
+    let methods = bounded_list(locale, &plan.telegram_methods);
+    let actions = bounded_list(locale, &plan.actions);
+    let warnings = bounded_list(
+        locale,
+        &plan
+            .warnings
+            .iter()
+            .map(|warning| inspection_warning_text(locale, warning).to_owned())
+            .collect::<Vec<_>>(),
+    );
+    render_lm_install_plan(
+        locale,
+        LmInstallPlanText {
+            source: &source,
+            module: &plan.module_id,
+            version: &plan.module_version,
+            protocol: plan.protocol_version,
+            entrypoint: &plan.entrypoint,
+            default_command: plan
+                .default_command
+                .as_deref()
+                .unwrap_or(lm_label(locale, LmLabel::None)),
+            sha256: &plan.archive_digest.as_hex(),
+            fingerprint: &plan.fingerprint,
+            archive_bytes: plan.archive.archive_bytes,
+            file_count: plan.archive.file_count as usize,
+            compressed_bytes: plan.archive.compressed_bytes,
+            expanded_bytes: plan.archive.expanded_bytes,
+            capabilities: &capabilities,
+            subscriptions: &subscriptions,
+            methods: &methods,
+            actions: &actions,
+            warnings: &warnings,
+            approval_id: &approval_id.to_string(),
+            prefix,
+        },
     )
 }
 
@@ -1578,60 +2118,48 @@ impl SetupCoordinator {
         &mut self,
         client: &Client,
         request: &SetupRequest,
+        locale: Locale,
     ) -> RuntimeExecution {
         if matches!(
             request,
             SetupRequest::Start | SetupRequest::Auto | SetupRequest::Username(_)
         ) {
             if self.is_active() {
-                return Response::plain(
-                    "⚠️ Настройка уже выполняется. Напишите cancel для отмены.".to_owned(),
-                )
-                .into();
+                return Response::plain(setup_text(locale, SetupText::AlreadyActive)).into();
             }
             if self.has_created_bot().await {
-                return Response::plain(
-                    "ℹ️ Бот уже создан. Используйте setup repair для восстановления workspace."
-                        .to_owned(),
-                )
-                .into();
+                return Response::plain(setup_text(locale, SetupText::ExistingBot)).into();
             }
         }
         if matches!(request, SetupRequest::Repair) {
-            return self.repair(client).await;
+            return self.repair(client, locale).await;
         }
         match request {
-            SetupRequest::Status => self.status().await,
+            SetupRequest::Status => self.status(locale).await,
             SetupRequest::Cancel => {
                 if !self.is_active() {
-                    return Response::plain("ℹ️ Нет активной настройки для отмены.".to_owned())
-                        .into();
+                    return Response::plain(setup_text(locale, SetupText::NoActiveSetup)).into();
                 }
                 self.phase = SetupPhase::Idle;
-                Response::plain("✅ Настройка отменена.".to_owned())
+                Response::plain(setup_text(locale, SetupText::Cancelled))
             }
             SetupRequest::Start => {
                 self.phase = SetupPhase::AwaitingUsername {
                     automatic: false,
                     deadline: Instant::now() + SETUP_STAGE_TIMEOUT,
                 };
-                Response::plain("🤖 Введите желаемое имя бота, оканчивающееся на _bot.".to_owned())
+                Response::plain(setup_text(locale, SetupText::UsernamePrompt))
             }
             SetupRequest::Auto => match setup::generate_candidate() {
-                Ok(username) => self.confirm_or_start(username, true, 1).await,
-                Err(_) => Response::plain("⚠️ Не удалось сгенерировать имя бота.".to_owned()),
+                Ok(username) => self.confirm_or_start(username, true, 1, locale).await,
+                Err(_) => Response::plain(setup_text(locale, SetupText::UsernameGenerationFailed)),
             },
             SetupRequest::Username(value) => match setup::validate_username(value) {
-                Ok(username) => self.confirm_or_start(username, false, 1).await,
-                Err(_) => Response::plain(
-                    "⚠️ Имя должно содержать 5–32 ASCII-букв, цифр или _ и оканчиваться на _bot."
-                        .to_owned(),
-                ),
+                Ok(username) => self.confirm_or_start(username, false, 1, locale).await,
+                Err(_) => Response::plain(setup_text(locale, SetupText::UsernameInvalid)),
             },
             SetupRequest::Repair => unreachable!("repair returns a provisioning request"),
-            SetupRequest::Invalid => Response::plain(
-                "⚠️ Использование: setup [auto|<username_bot>|status|repair|cancel]".to_owned(),
-            ),
+            SetupRequest::Invalid => Response::plain(setup_text(locale, SetupText::Usage)),
         }
         .into()
     }
@@ -1641,6 +2169,7 @@ impl SetupCoordinator {
         username: UsernameCandidate,
         automatic: bool,
         attempts: u8,
+        locale: Locale,
     ) -> Response {
         self.phase = SetupPhase::AwaitingConfirmation {
             username: username.clone(),
@@ -1648,23 +2177,22 @@ impl SetupCoordinator {
             attempts,
             deadline: Instant::now() + SETUP_STAGE_TIMEOUT,
         };
-        Response::plain(format!(
-            "📋 План настройки\n\n• Создать companion-бота @{} с именем «{}».\n• Создать или восстановить приватный Lavis workspace.\n• Присоединить ваш Telegram-аккаунт к официальному публичному сообществу @lavis_userbot.\n• Добавить workspace, бота и сообщество в папку Lavis.\n\nНапишите confirm для подтверждения или cancel для отмены.",
-            username.display(),
-            crate::setup_telegram::DISPLAY_NAME
-        ))
+        let plan = setup_text(locale, SetupText::Plan)
+            .replace("{username}", username.display())
+            .replace("{display_name}", crate::setup_telegram::DISPLAY_NAME);
+        Response::plain(plan)
     }
 
-    async fn handle_input(&mut self, client: &Client, text: &str) -> Response {
+    async fn handle_input(&mut self, client: &Client, text: &str, locale: Locale) -> Response {
         if matches!(
             setup::parse_confirmation(text),
             Some(setup::Confirmation::Cancelled)
         ) {
             self.phase = SetupPhase::Idle;
-            return Response::plain("✅ Настройка отменена.".to_owned());
+            return Response::plain(setup_text(locale, SetupText::Cancelled));
         }
         match &self.phase {
-            SetupPhase::AwaitingUsername { .. } => self.handle_username_input(text).await,
+            SetupPhase::AwaitingUsername { .. } => self.handle_username_input(text, locale).await,
             SetupPhase::AwaitingConfirmation {
                 username,
                 automatic,
@@ -1675,20 +2203,20 @@ impl SetupCoordinator {
                     setup::parse_confirmation(text),
                     Some(setup::Confirmation::Confirmed)
                 ) {
-                    self.start_flow(client, username.clone(), *automatic, *attempts)
+                    self.start_flow(client, username.clone(), *automatic, *attempts, locale)
                         .await
                 } else {
-                    Response::plain("⚠️ Напишите confirm или cancel.".to_owned())
+                    Response::plain(setup_text(locale, SetupText::ConfirmOrCancel))
                 }
             }
-            _ => Response::plain("ℹ️ Настройка ожидает ответ BotFather.".to_owned()),
+            _ => Response::plain(setup_text(locale, SetupText::WaitingBotFather)),
         }
     }
 
-    async fn handle_username_input(&mut self, text: &str) -> Response {
+    async fn handle_username_input(&mut self, text: &str, locale: Locale) -> Response {
         let automatic = match &self.phase {
             SetupPhase::AwaitingUsername { automatic, .. } => *automatic,
-            _ => return Response::plain("ℹ️ Настройка ожидает ответ BotFather.".to_owned()),
+            _ => return Response::plain(setup_text(locale, SetupText::WaitingBotFather)),
         };
         let generated = matches!(text.trim().to_ascii_lowercase().as_str(), "-" | "auto");
         let username = match generated {
@@ -1698,12 +2226,10 @@ impl SetupCoordinator {
         };
         match username {
             Ok(username) => {
-                self.confirm_or_start(username, automatic || generated, 1)
+                self.confirm_or_start(username, automatic || generated, 1, locale)
                     .await
             }
-            Err(_) => {
-                Response::plain("⚠️ Некорректное имя. Оно должно оканчиваться на _bot.".to_owned())
-            }
+            Err(_) => Response::plain(setup_text(locale, SetupText::UsernameInvalid)),
         }
     }
 
@@ -1713,14 +2239,15 @@ impl SetupCoordinator {
         username: UsernameCandidate,
         automatic: bool,
         attempts: u8,
+        locale: Locale,
     ) -> Response {
         let Ok((transport, peer)) = GrammersTelegramSetup::resolve(client).await else {
-            return Response::plain("⚠️ Не удалось связаться с BotFather.".to_owned());
+            return Response::plain(setup_text(locale, SetupText::BotFatherUnavailable));
         };
         let mut flow =
             CompanionSetup::new(username, self.state_path.clone(), self.token_path.clone());
         if flow.start(&transport).await.is_err() {
-            return Response::plain("⚠️ Не удалось начать диалог с BotFather.".to_owned());
+            return Response::plain(setup_text(locale, SetupText::BotFatherStartFailed));
         }
         self.botfather_peer = Some(peer);
         self.phase = SetupPhase::Running {
@@ -1730,10 +2257,15 @@ impl SetupCoordinator {
             attempts,
             deadline: Instant::now() + SETUP_STAGE_TIMEOUT,
         };
-        Response::plain("⏳ Настройка начата. Ожидается ответ BotFather.".to_owned())
+        Response::plain(setup_text(locale, SetupText::Started))
     }
 
-    async fn handle_botfather_reply(&mut self, client: &Client, text: &str) -> BotFatherOutcome {
+    async fn handle_botfather_reply(
+        &mut self,
+        client: &Client,
+        text: &str,
+        locale: Locale,
+    ) -> BotFatherOutcome {
         let SetupPhase::Running {
             flow,
             transport,
@@ -1752,7 +2284,10 @@ impl SetupCoordinator {
             Err(_) => {
                 self.phase = SetupPhase::Idle;
                 return BotFatherOutcome {
-                    response: Some(Response::plain("⚠️ Проверка бота недоступна.".to_owned())),
+                    response: Some(Response::plain(setup_text(
+                        locale,
+                        SetupText::BotCheckUnavailable,
+                    ))),
                     provision: None,
                 };
             }
@@ -1778,16 +2313,19 @@ impl SetupCoordinator {
                 self.phase = SetupPhase::Idle;
                 match setup::generate_candidate() {
                     Ok(username) => {
-                        let response = self.start_flow(client, username, true, next_attempt).await;
+                        let response = self
+                            .start_flow(client, username, true, next_attempt, locale)
+                            .await;
                         BotFatherOutcome {
                             response: Some(response),
                             provision: None,
                         }
                     }
                     Err(_) => BotFatherOutcome {
-                        response: Some(Response::plain(
-                            "⚠️ Не удалось сгенерировать новое имя бота.".to_owned(),
-                        )),
+                        response: Some(Response::plain(setup_text(
+                            locale,
+                            SetupText::UsernameGenerationFailed,
+                        ))),
                         provision: None,
                     },
                 }
@@ -1798,73 +2336,74 @@ impl SetupCoordinator {
                     deadline: Instant::now() + SETUP_STAGE_TIMEOUT,
                 };
                 BotFatherOutcome {
-                    response: Some(Response::plain(
-                        "⚠️ BotFather отклонил имя. Введите другое имя, оканчивающееся на _bot."
-                            .to_owned(),
-                    )),
+                    response: Some(Response::plain(setup_text(
+                        locale,
+                        SetupText::BotUsernameRejected,
+                    ))),
                     provision: None,
                 }
             }
             Ok(BotFatherProgress::LimitReached) => {
                 self.phase = SetupPhase::Idle;
                 BotFatherOutcome {
-                    response: Some(Response::plain(
-                        "⚠️ BotFather сообщил о достигнутом лимите ботов.".to_owned(),
-                    )),
+                    response: Some(Response::plain(setup_text(
+                        locale,
+                        SetupText::BotLimitReached,
+                    ))),
                     provision: None,
                 }
             }
             Ok(BotFatherProgress::FloodWait) => {
                 self.phase = SetupPhase::Idle;
                 BotFatherOutcome {
-                    response: Some(Response::plain(
-                        "⚠️ BotFather просит повторить попытку позже.".to_owned(),
-                    )),
+                    response: Some(Response::plain(setup_text(
+                        locale,
+                        SetupText::BotRetryLater,
+                    ))),
                     provision: None,
                 }
             }
             Ok(BotFatherProgress::Unexpected) => {
                 self.phase = SetupPhase::Idle;
                 BotFatherOutcome {
-                    response: Some(Response::plain(
-                        "⚠️ Диалог с BotFather завершился из-за неожиданного ответа.".to_owned(),
-                    )),
+                    response: Some(Response::plain(setup_text(
+                        locale,
+                        SetupText::BotUnexpected,
+                    ))),
                     provision: None,
                 }
             }
             Err(crate::setup_telegram::SetupTelegramError::Storage) => {
                 self.phase = SetupPhase::Idle;
                 BotFatherOutcome {
-                    response: Some(Response::plain(
-                        "⚠️ Данные бота не удалось безопасно сохранить. Настройка остановлена."
-                            .to_owned(),
-                    )),
+                    response: Some(Response::plain(setup_text(
+                        locale,
+                        SetupText::BotStorageFailed,
+                    ))),
                     provision: None,
                 }
             }
             Err(crate::setup_telegram::SetupTelegramError::Timeout) => {
                 self.phase = SetupPhase::Idle;
                 BotFatherOutcome {
-                    response: Some(Response::plain(
-                        "⚠️ BotFather не ответил вовремя. Настройка остановлена.".to_owned(),
-                    )),
+                    response: Some(Response::plain(setup_text(locale, SetupText::BotTimedOut))),
                     provision: None,
                 }
             }
             Err(_) => {
                 self.phase = SetupPhase::Idle;
                 BotFatherOutcome {
-                    response: Some(Response::plain(
-                        "⚠️ Проверка или сохранение бота завершились ошибкой. Настройка остановлена."
-                            .to_owned(),
-                    )),
+                    response: Some(Response::plain(setup_text(
+                        locale,
+                        SetupText::BotVerificationFailed,
+                    ))),
                     provision: None,
                 }
             }
         }
     }
 
-    async fn status(&self) -> Response {
+    async fn status(&self, locale: Locale) -> Response {
         let state_path = self.state_path.clone();
         let token_path = self.token_path.clone();
         match tokio::task::spawn_blocking(move || {
@@ -1872,22 +2411,17 @@ impl SetupCoordinator {
         })
         .await
         {
-            Ok(Ok(state)) => Response::plain(format!(
-                "⚙️ Setup status: {}\nBot: {}",
-                state.status,
-                state
-                    .identities
-                    .bot_username
-                    .as_deref()
-                    .unwrap_or("not configured")
-            )),
-            Ok(Err(crate::error::SetupStoreError::NotFound)) => {
-                Response::plain("⚙️ Setup status: idle".to_owned())
-            }
-            Ok(Err(_)) | Err(_) => Response::plain(
-                "⚠️ Setup status is unavailable because local state could not be read safely."
-                    .to_owned(),
+            Ok(Ok(state)) => setup_status_response(
+                locale,
+                &state.status,
+                state.identities.bot_username.as_deref(),
             ),
+            Ok(Err(crate::error::SetupStoreError::NotFound)) => {
+                Response::plain(setup_text(locale, SetupText::StatusIdle))
+            }
+            Ok(Err(_)) | Err(_) => {
+                Response::plain(setup_text(locale, SetupText::StatusUnavailable))
+            }
         }
     }
 
@@ -1902,23 +2436,26 @@ impl SetupCoordinator {
         )
     }
 
-    async fn repair(&self, client: &Client) -> RuntimeExecution {
+    async fn repair(&self, client: &Client, locale: Locale) -> RuntimeExecution {
         let api = match HttpBotApi::new() {
             Ok(api) => api,
             Err(_) => {
-                return Response::plain("⚠️ Проверка сохранённого бота недоступна.".to_owned())
+                return Response::plain(setup_text(locale, SetupText::RepairCheckUnavailable))
                     .into();
             }
         };
-        self.repair_with_api(client, &api).await
+        self.repair_with_api(client, &api, locale).await
     }
 
-    async fn repair_with_api(&self, client: &Client, bot_api: &impl BotApi) -> RuntimeExecution {
-        match self.repair_preflight(bot_api).await {
+    async fn repair_with_api(
+        &self,
+        client: &Client,
+        bot_api: &impl BotApi,
+        locale: Locale,
+    ) -> RuntimeExecution {
+        match self.repair_preflight(bot_api, locale).await {
             Ok(username) => RuntimeExecution {
-                response: Response::plain(
-                    "⏳ Восстановление companion workspace начато.".to_owned(),
-                ),
+                response: Response::plain(setup_text(locale, SetupText::RepairStarted)),
                 provision: Some(ProvisionRequest::new(
                     client.clone(),
                     self.state_path.clone(),
@@ -1927,12 +2464,17 @@ impl SetupCoordinator {
                 )),
                 shutdown: None,
                 post_edit: None,
+                onboarding_page: false,
             },
             Err(response) => response.into(),
         }
     }
 
-    async fn repair_preflight(&self, bot_api: &impl BotApi) -> Result<String, Response> {
+    async fn repair_preflight(
+        &self,
+        bot_api: &impl BotApi,
+        locale: Locale,
+    ) -> Result<String, Response> {
         let state_path = self.state_path.clone();
         let token_path = self.token_path.clone();
         let loaded = tokio::task::spawn_blocking({
@@ -1947,48 +2489,47 @@ impl SetupCoordinator {
         let (state, token) = match loaded {
             Ok(Ok(loaded)) => loaded,
             Ok(Err(crate::error::SetupStoreError::NotFound)) => {
-                return Err(Response::plain(
-                    "⚠️ Нет безопасных данных для восстановления.".to_owned(),
-                ));
+                return Err(Response::plain(setup_text(locale, SetupText::RepairNoData)));
             }
             Ok(Err(_)) | Err(_) => {
-                return Err(Response::plain(
-                    "⚠️ Сохранённые данные нельзя безопасно проверить.".to_owned(),
-                ));
+                return Err(Response::plain(setup_text(
+                    locale,
+                    SetupText::RepairDataUnsafe,
+                )));
             }
         };
         let username = match state.identities.bot_username.as_deref() {
             Some(username) if setup::validate_username(username).is_ok() => username.to_owned(),
             _ => {
-                return Err(Response::plain(
-                    "⚠️ Сохранённая идентификация бота неполна или небезопасна.".to_owned(),
-                ));
+                return Err(Response::plain(setup_text(
+                    locale,
+                    SetupText::RepairIdentityUnsafe,
+                )));
             }
         };
         let persisted_bot_id = state.identities.bot_user_id;
-        let identity = match tokio::time::timeout(Duration::from_secs(25), bot_api.get_me(&token))
-            .await
-        {
-            Ok(Ok(identity)) => identity,
-            Ok(Err(_)) | Err(_) => {
-                return Err(Response::plain(
-                    "⚠️ Сохранённый токен не удалось безопасно проверить. Восстановление не запущено."
-                        .to_owned(),
-                ));
-            }
-        };
+        let identity =
+            match tokio::time::timeout(Duration::from_secs(25), bot_api.get_me(&token)).await {
+                Ok(Ok(identity)) => identity,
+                Ok(Err(_)) | Err(_) => {
+                    return Err(Response::plain(setup_text(
+                        locale,
+                        SetupText::RepairTokenUnsafe,
+                    )));
+                }
+            };
         if !identity.username.eq_ignore_ascii_case(&username) {
-            return Err(Response::plain(
-                "⚠️ Сохранённый токен не соответствует сохранённому боту. Восстановление не запущено."
-                    .to_owned(),
-            ));
+            return Err(Response::plain(setup_text(
+                locale,
+                SetupText::RepairTokenMismatch,
+            )));
         }
         if let Some(bot_id) = persisted_bot_id {
             if identity.id != bot_id {
-                return Err(Response::plain(
-                    "⚠️ Сохранённый токен не соответствует сохранённому боту. Восстановление не запущено."
-                        .to_owned(),
-                ));
+                return Err(Response::plain(setup_text(
+                    locale,
+                    SetupText::RepairTokenMismatch,
+                )));
             }
         } else {
             let state_path = self.state_path.clone();
@@ -2010,71 +2551,111 @@ impl SetupCoordinator {
             })
             .await;
             if !matches!(persisted, Ok(Ok(()))) {
-                return Err(Response::plain(
-                    "⚠️ Проверенный идентификатор бота не удалось безопасно сохранить. Восстановление не запущено."
-                        .to_owned(),
-                ));
+                return Err(Response::plain(setup_text(
+                    locale,
+                    SetupText::RepairIdentitySaveFailed,
+                )));
             }
         }
         Ok(username)
     }
 }
 
+fn setup_status_label(locale: Locale, status: &str) -> &'static str {
+    let key = match status {
+        "idle" => SetupText::StatusIdleValue,
+        "bot_validated" => SetupText::StatusBotValidated,
+        "complete" => SetupText::StatusComplete,
+        "completed_without_folder_capacity" => SetupText::StatusCompletedWithoutFolderCapacity,
+        "completed_without_folder_name_conflict" => {
+            SetupText::StatusCompletedWithoutFolderNameConflict
+        }
+        "companion_and_community_configured" => SetupText::StatusCompanionAndCommunityConfigured,
+        "companion_configured_community_pending" => {
+            SetupText::StatusCompanionConfiguredCommunityPending
+        }
+        _ => SetupText::StatusUnknown,
+    };
+    setup_text(locale, key)
+}
+
+fn setup_status_response(locale: Locale, status: &str, bot: Option<&str>) -> Response {
+    Response::plain_with_locale(
+        locale,
+        setup_text(locale, SetupText::Status)
+            .replace("{status}", setup_status_label(locale, status))
+            .replace(
+                "{bot}",
+                bot.unwrap_or(setup_text(locale, SetupText::NotConfigured)),
+            ),
+    )
+}
+
 fn fastfetch_response(
     result: FastfetchResult,
+    locale: Locale,
     prefix: &str,
     profile_path: &std::path::Path,
 ) -> Response {
     match result {
         FastfetchResult::Success(response) => response,
-        FastfetchResult::Empty => fastfetch_failure("produced no output", prefix),
-        FastfetchResult::TimedOut => fastfetch_failure("timed out", prefix),
-        FastfetchResult::Unavailable => fastfetch_failure("is unavailable", prefix),
-        FastfetchResult::NonZero { code, .. } => {
-            fastfetch_failure(&format!("failed (exit code {code})"), prefix)
+        FastfetchResult::Empty => fastfetch_failure(locale, FastfetchText::Empty, prefix),
+        FastfetchResult::TimedOut => fastfetch_failure(locale, FastfetchText::TimedOut, prefix),
+        FastfetchResult::Unavailable => {
+            fastfetch_failure(locale, FastfetchText::Unavailable, prefix)
         }
-        FastfetchResult::UnexpectedStatus => fastfetch_failure("ended unexpectedly", prefix),
-        FastfetchResult::InvalidArguments(error) => fastfetch_failure(
-            &format!("input error: {}", fastfetch_input_message(error)),
-            prefix,
+        FastfetchResult::NonZero { code, .. } => Response::plain_with_locale(
+            locale,
+            fastfetch_text(locale, FastfetchText::NonZero)
+                .replace("{code}", &code.to_string())
+                .replace("{prefix}", prefix),
         ),
-        FastfetchResult::ProfileError(error) => Response::plain(format!(
-            "⚠️ Fastfetch profile error: {} at {profile_path:?}. See {prefix}help fastfetch",
-            fastfetch_profile_error_message(error)
-        )),
+        FastfetchResult::UnexpectedStatus => {
+            fastfetch_failure(locale, FastfetchText::UnexpectedStatus, prefix)
+        }
+        FastfetchResult::InvalidArguments(error) => {
+            fastfetch_failure(locale, fastfetch_input_text(error), prefix)
+        }
+        FastfetchResult::ProfileError(error) => Response::plain_with_locale(
+            locale,
+            fastfetch_text(locale, fastfetch_profile_error_text(error))
+                .replace("{path}", &format!("{profile_path:?}"))
+                .replace("{prefix}", prefix),
+        ),
     }
 }
 
-fn fastfetch_profile_error_message(error: FastfetchProfileError) -> &'static str {
+fn fastfetch_profile_error_text(error: FastfetchProfileError) -> FastfetchText {
     match error {
-        FastfetchProfileError::NotReadable => "NotReadable",
-        FastfetchProfileError::Malformed => "Malformed",
-        FastfetchProfileError::UnsupportedVersion => "UnsupportedVersion",
-        FastfetchProfileError::TooLarge => "TooLarge",
-        FastfetchProfileError::UnsafePath => "UnsafePath",
-        FastfetchProfileError::InvalidLogo => "InvalidLogo",
-        FastfetchProfileError::InvalidStructure => "InvalidStructure",
-        FastfetchProfileError::InvalidSeparator => "InvalidSeparator",
-        FastfetchProfileError::InvalidLogoPadding => "InvalidLogoPadding",
+        FastfetchProfileError::NotReadable => FastfetchText::ProfileNotReadable,
+        FastfetchProfileError::Malformed => FastfetchText::ProfileMalformed,
+        FastfetchProfileError::UnsupportedVersion => FastfetchText::ProfileUnsupportedVersion,
+        FastfetchProfileError::TooLarge => FastfetchText::ProfileTooLarge,
+        FastfetchProfileError::UnsafePath => FastfetchText::ProfileUnsafePath,
+        FastfetchProfileError::InvalidLogo => FastfetchText::ProfileInvalidLogo,
+        FastfetchProfileError::InvalidStructure => FastfetchText::ProfileInvalidStructure,
+        FastfetchProfileError::InvalidSeparator => FastfetchText::ProfileInvalidSeparator,
+        FastfetchProfileError::InvalidLogoPadding => FastfetchText::ProfileInvalidLogoPadding,
     }
 }
 
-fn fastfetch_failure(message: &str, prefix: &str) -> Response {
-    Response::plain(format!(
-        "⚠️ Fastfetch {message}. See {prefix}help fastfetch"
-    ))
+fn fastfetch_failure(locale: Locale, key: FastfetchText, prefix: &str) -> Response {
+    Response::plain_with_locale(
+        locale,
+        fastfetch_text(locale, key).replace("{prefix}", prefix),
+    )
 }
 
-fn fastfetch_input_message(error: FastfetchInputError) -> &'static str {
+fn fastfetch_input_text(error: FastfetchInputError) -> FastfetchText {
     match error {
-        FastfetchInputError::Tokenization => "invalid quoting",
-        FastfetchInputError::UnsupportedOption => "unsupported option",
-        FastfetchInputError::MissingValue => "option value is missing",
-        FastfetchInputError::DuplicateOption => "option is repeated",
-        FastfetchInputError::InvalidLogo => "invalid --logo value",
-        FastfetchInputError::InvalidStructure => "invalid --structure value",
-        FastfetchInputError::InvalidSeparator => "invalid --separator value",
-        FastfetchInputError::InvalidLogoPadding => "invalid --logo-padding value",
+        FastfetchInputError::Tokenization => FastfetchText::InputTokenization,
+        FastfetchInputError::UnsupportedOption => FastfetchText::InputUnsupportedOption,
+        FastfetchInputError::MissingValue => FastfetchText::InputMissingValue,
+        FastfetchInputError::DuplicateOption => FastfetchText::InputDuplicateOption,
+        FastfetchInputError::InvalidLogo => FastfetchText::InputInvalidLogo,
+        FastfetchInputError::InvalidStructure => FastfetchText::InputInvalidStructure,
+        FastfetchInputError::InvalidSeparator => FastfetchText::InputInvalidSeparator,
+        FastfetchInputError::InvalidLogoPadding => FastfetchText::InputInvalidLogoPadding,
     }
 }
 
@@ -2215,6 +2796,7 @@ fn format_duration(duration: Duration) -> String {
 }
 
 fn format_stats(
+    locale: Locale,
     telegram: &str,
     lavis_uptime: Duration,
     proc_stats: &ProcStats,
@@ -2223,15 +2805,19 @@ fn format_stats(
     let system_uptime = proc_stats
         .system_uptime
         .map(format_duration)
-        .unwrap_or_else(|| "unavailable".to_owned());
+        .unwrap_or_else(|| stats_text(locale, StatsText::Unavailable).to_owned());
     let memory = proc_stats
         .memory_kib
         .map(|memory_kib| format!("{:.1} MiB RSS", memory_kib as f64 / 1024.0))
-        .unwrap_or_else(|| "unavailable".to_owned());
+        .unwrap_or_else(|| stats_text(locale, StatsText::Unavailable).to_owned());
 
-    format!(
-        "📊 Lavis stats\n\nTelegram: {telegram}\nLavis uptime: {}\nSystem uptime: {system_uptime}\nMemory: {memory}\nCommands: {recognized_commands}\nVersion: {}",
-        format_duration(lavis_uptime),
+    render_stats_text(
+        locale,
+        telegram,
+        &format_duration(lavis_uptime),
+        &system_uptime,
+        &memory,
+        recognized_commands,
         env!("CARGO_PKG_VERSION"),
     )
 }
@@ -2239,10 +2825,10 @@ fn format_stats(
 #[cfg(test)]
 mod tests {
     use super::{
-        MODULE_MUTATION_DENIED, ProcStats, REBOOT_DENIED, SensitiveCommandDenial,
-        SensitiveCommandPolicy, authorize_sensitive_message, bounded_list,
-        external_event_error_category, fastfetch_response, format_duration, format_latency,
-        format_stats, lm_usage, parse_memory_kib, parse_system_uptime, render_install_plan,
+        ProcStats, SensitiveCommandDenial, SensitiveCommandPolicy, authorize_sensitive_message,
+        bounded_list, external_event_error_category, fastfetch_response, format_duration,
+        format_latency, format_stats, lm_usage, missing_descriptor_response, parse_memory_kib,
+        parse_system_uptime, render_install_plan, setup_status_label, setup_status_response,
     };
     use crate::response::Response;
     use crate::{
@@ -2255,6 +2841,9 @@ mod tests {
             ModuleInstallPlan, SourceIdentity, SourceKind,
         },
         fastfetch::{FastfetchInputError, FastfetchProfileError, FastfetchResult},
+        i18n::{
+            Locale, PingText, RuntimeText, SensitiveText, ping_text, runtime_text, sensitive_text,
+        },
         setup_store::{CompanionToken, PersistedSetupState, SetupStore},
     };
     use grammers_session::types::PeerId;
@@ -2281,7 +2870,10 @@ mod tests {
                 compressed_bytes: 1,
                 expanded_bytes: 1,
             },
-            warnings: vec![InspectionWarning::TelegramRawNotSandboxed],
+            warnings: vec![
+                InspectionWarning::StoredOnlyArchive,
+                InspectionWarning::TelegramRawNotSandboxed,
+            ],
             times: InspectionTimes {
                 inspected_unix_seconds: 0,
                 expires_unix_seconds: 0,
@@ -2293,7 +2885,67 @@ mod tests {
             fingerprint: "fingerprint".to_owned(),
         };
         let approval_id = ApprovalId::from_bytes([0; APPROVAL_ID_BYTES]);
-        assert!(render_install_plan(&plan, approval_id, ".").contains("account.updateStatus"));
+        for locale in [Locale::English, Locale::Russian] {
+            let rendered = render_install_plan(locale, &plan, approval_id, ".");
+            assert!(rendered.contains("account.updateStatus"));
+            assert!(!rendered.contains("StoredOnlyArchive"));
+            assert!(!rendered.contains("TelegramRawNotSandboxed"));
+        }
+    }
+
+    #[test]
+    fn setup_status_codes_are_localized_without_echoing_unknown_values() {
+        for (locale, expected_unknown) in [
+            (Locale::English, "unknown"),
+            (Locale::Russian, "неизвестно"),
+        ] {
+            for status in [
+                "idle",
+                "bot_validated",
+                "complete",
+                "completed_without_folder_capacity",
+                "completed_without_folder_name_conflict",
+                "companion_and_community_configured",
+                "companion_configured_community_pending",
+            ] {
+                assert_ne!(setup_status_label(locale, status), expected_unknown);
+            }
+            assert_eq!(
+                setup_status_label(locale, "untrusted_internal_value"),
+                expected_unknown
+            );
+        }
+    }
+
+    #[test]
+    fn persisted_idle_status_has_exactly_one_heading_in_each_locale() {
+        for (locale, expected) in [
+            (
+                Locale::English,
+                "⚙️ Setup status: idle\nBot: not configured",
+            ),
+            (
+                Locale::Russian,
+                "⚙️ Состояние настройки: бездействует\nБот: не настроен",
+            ),
+        ] {
+            assert_eq!(
+                setup_status_response(locale, "idle", None),
+                Response::plain(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn missing_descriptor_output_is_sanitized_in_each_locale() {
+        for locale in [Locale::English, Locale::Russian] {
+            let response =
+                missing_descriptor_response(locale, "safe\x1b[31m\x00bidi\u{202e}", "missing");
+            assert!(response.text.contains("safebidi"));
+            assert!(!response.text.contains('\x1b'));
+            assert!(!response.text.contains('\x00'));
+            assert!(!response.text.contains('\u{202e}'));
+        }
     }
 
     #[test]
@@ -2321,10 +2973,10 @@ mod tests {
             Err(SensitiveCommandDenial::Edited)
         );
         assert_eq!(
-            SensitiveCommandDenial::Edited.response(SensitiveCommandPolicy::Reboot),
-            REBOOT_DENIED
+            SensitiveCommandDenial::Edited
+                .response(Locale::Russian, SensitiveCommandPolicy::Reboot),
+            sensitive_text(Locale::Russian, SensitiveText::RebootDenied)
         );
-        assert!(!REBOOT_DENIED.contains("модул"));
 
         let request = SensitiveCommandPolicy::ModuleMutation;
         assert_eq!(
@@ -2336,8 +2988,8 @@ mod tests {
             Err(SensitiveCommandDenial::NotSelfAuthored)
         );
         assert_eq!(
-            SensitiveCommandDenial::NotSavedMessages.response(request),
-            MODULE_MUTATION_DENIED
+            SensitiveCommandDenial::NotSavedMessages.response(Locale::Russian, request),
+            sensitive_text(Locale::Russian, SensitiveText::ModuleMutationDenied)
         );
     }
 
@@ -2385,6 +3037,11 @@ mod tests {
     #[tokio::test]
     async fn setup_timeout_ends_flow_without_an_inbound_botfather_update() {
         let (mut runtime, directory) = runtime_with_alias().await;
+        runtime
+            .settings
+            .set_locale(Some(crate::i18n::Locale::English))
+            .await
+            .unwrap();
         let saved_messages = PeerId::user(1).unwrap();
         let botfather = PeerId::user(2).unwrap();
         runtime.configure_setup(
@@ -2402,9 +3059,41 @@ mod tests {
         tokio::time::sleep_until(deadline.into()).await;
         let response = runtime.handle_setup_timeout().unwrap();
 
-        assert!(response.text.contains("таймаут"));
+        assert!(response.text.contains("timed out"));
         assert!(runtime.setup_timeout_deadline().is_none());
         assert!(runtime.setup_protects_message(botfather, false));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_without_botfather_resolution_fails_closed_for_token_text() {
+        let (mut runtime, directory) = runtime_with_alias().await;
+        runtime
+            .settings
+            .set_locale(Some(crate::i18n::Locale::English))
+            .await
+            .unwrap();
+        runtime.configure_setup(
+            directory.join("state.json"),
+            directory.join("token"),
+            PeerId::user(1).unwrap(),
+        );
+        assert!(!runtime.external_projection_permitted_for_tests());
+        // This is representative BotFather token-shaped text. The gate is set
+        // before external modules are attached, so a restarted process cannot
+        // project it while authoritative peer resolution is unavailable.
+        assert!(
+            runtime
+                .prepare_message_event_dispatch(
+                    PeerId::user(2).unwrap(),
+                    1,
+                    crate::external_modules::protocol::MessageEventKind::Created,
+                    "123456:abcdefghijklmnopqrstUVWX",
+                    false,
+                    vec![],
+                )
+                .is_none()
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -2475,6 +3164,60 @@ mod tests {
         let response = runtime.lm_info("missing").await;
 
         assert_eq!(response.text, "⚠️ Модуль не установлен.");
+        fs::remove_dir_all(state_directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn lm_info_logs_and_doctor_empty_responses_follow_the_locale() {
+        let (mut runtime, state_directory) = runtime_with_alias().await;
+        let module_root = state_directory.join("modules");
+        fs::create_dir_all(&module_root).unwrap();
+        runtime.configure_module_control(
+            module_root,
+            state_directory.join("module-state.json"),
+            state_directory.join("declarative.json"),
+            PeerId::user(1).unwrap(),
+        );
+        runtime
+            .set_external_manager(
+                crate::external_modules::manager::ExternalManagerHandle::new(
+                    crate::external_modules::manager::ExternalManager::new(),
+                ),
+            )
+            .await;
+
+        for (locale, info_missing, logs_empty, doctor_all, doctor_missing) in [
+            (
+                Locale::Russian,
+                "⚠️ Модуль не установлен.",
+                "ℹ️ Для модуля missing нет сохранённой runtime-ошибки.",
+                "🩺 Диагностика внешних модулей\n\nВнешние модули не установлены.",
+                "ℹ️ Модуль missing не найден.",
+            ),
+            (
+                Locale::English,
+                "⚠️ Module is not installed.",
+                "ℹ️ Module missing has no retained runtime error.",
+                "🩺 External module diagnostics\n\nNo external modules are installed.",
+                "ℹ️ Module missing was not found.",
+            ),
+        ] {
+            runtime.settings.set_locale(Some(locale)).await.unwrap();
+            assert_eq!(
+                runtime.lm_info("missing").await,
+                Response::plain(info_missing)
+            );
+            assert_eq!(
+                runtime.lm_logs("missing").await,
+                Response::plain(logs_empty)
+            );
+            assert_eq!(runtime.lm_doctor(None).await, Response::plain(doctor_all));
+            assert_eq!(
+                runtime.lm_doctor(Some("missing")).await,
+                Response::plain(doctor_missing)
+            );
+        }
+
         fs::remove_dir_all(state_directory).unwrap();
     }
 
@@ -2555,7 +3298,8 @@ mod tests {
         );
         runtime.set_external_manager(handle.clone()).await;
         assert_eq!(
-            runtime.external_snapshot.module_statuses[0].status, "активен",
+            runtime.external_snapshot.module_statuses[0].status,
+            crate::external_modules::manager::ExternalModuleRuntimeStatus::Running,
             "the cached routing snapshot intentionally predates the crash"
         );
         for _ in 0..200 {
@@ -2564,7 +3308,11 @@ mod tests {
                 .await
                 .module_statuses
                 .iter()
-                .any(|status| status.id == "sample" && status.status == "ошибка")
+                .any(|status| {
+                    status.id == "sample"
+                        && status.status
+                            == crate::external_modules::manager::ExternalModuleRuntimeStatus::Failed
+                })
             {
                 break;
             }
@@ -2576,7 +3324,11 @@ mod tests {
                 .await
                 .module_statuses
                 .iter()
-                .any(|status| status.id == "sample" && status.status == "ошибка")
+                .any(|status| {
+                    status.id == "sample"
+                        && status.status
+                            == crate::external_modules::manager::ExternalModuleRuntimeStatus::Failed
+                })
         );
 
         assert!(
@@ -2601,6 +3353,41 @@ mod tests {
                 .contains("Runtime: ошибка")
         );
 
+        let russian_diagnostic = runtime.lm_logs("sample").await;
+        assert!(
+            russian_diagnostic
+                .text
+                .starts_with("📋 Последняя ошибка модуля sample\n\n")
+        );
+        assert!(russian_diagnostic.text.contains("stage="));
+
+        runtime
+            .settings
+            .set_locale(Some(Locale::English))
+            .await
+            .unwrap();
+        let english_diagnostic = runtime.lm_logs("sample").await;
+        assert!(
+            english_diagnostic
+                .text
+                .starts_with("📋 Last module error: sample\n\n")
+        );
+        assert!(english_diagnostic.text.contains("stage="));
+        assert!(
+            runtime
+                .lm_info("sample")
+                .await
+                .text
+                .contains("Runtime: failed")
+        );
+        assert!(
+            runtime
+                .lm_doctor(Some("sample"))
+                .await
+                .text
+                .contains("Last failure:")
+        );
+
         handle.shutdown_all().await;
         fs::remove_dir_all(directory).unwrap();
         fs::remove_dir_all(state_directory).unwrap();
@@ -2617,7 +3404,12 @@ mod tests {
         };
 
         let response = setup
-            .confirm_or_start(crate::setup::generate_candidate().unwrap(), true, 1)
+            .confirm_or_start(
+                crate::setup::generate_candidate().unwrap(),
+                true,
+                1,
+                Locale::Russian,
+            )
             .await;
 
         assert!(response.text.contains("confirm"));
@@ -2641,7 +3433,9 @@ mod tests {
             },
         };
 
-        let response = setup.handle_username_input("lavis_test_bot").await;
+        let response = setup
+            .handle_username_input("lavis_test_bot", Locale::Russian)
+            .await;
 
         assert_eq!(
             response.text,
@@ -2651,6 +3445,31 @@ mod tests {
             setup.phase,
             super::SetupPhase::AwaitingConfirmation { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn pending_setup_renders_with_the_locale_selected_at_response_time() {
+        let mut setup = super::SetupCoordinator {
+            state_path: PathBuf::new(),
+            token_path: PathBuf::new(),
+            saved_messages_peer: PeerId::user(1).unwrap(),
+            botfather_peer: None,
+            phase: super::SetupPhase::AwaitingUsername {
+                automatic: false,
+                deadline: Instant::now(),
+            },
+        };
+
+        let response = setup
+            .handle_username_input("invalid", Locale::English)
+            .await;
+
+        assert_eq!(
+            response,
+            Response::plain(
+                "⚠️ The username must contain 5–32 ASCII letters, digits, or _ and end in _bot."
+            )
+        );
     }
 
     struct RepairBotApi {
@@ -2688,7 +3507,12 @@ mod tests {
                 username: "lavis_test_bot".to_owned(),
             }),
         };
-        assert!(setup.repair_preflight(&wrong).await.is_err());
+        assert!(
+            setup
+                .repair_preflight(&wrong, Locale::Russian)
+                .await
+                .is_err()
+        );
 
         let matching = RepairBotApi {
             identity: Ok(BotIdentity {
@@ -2697,7 +3521,10 @@ mod tests {
             }),
         };
         assert_eq!(
-            setup.repair_preflight(&matching).await.unwrap(),
+            setup
+                .repair_preflight(&matching, Locale::Russian)
+                .await
+                .unwrap(),
             "lavis_test_bot"
         );
         fs::remove_dir_all(directory).unwrap();
@@ -2730,7 +3557,12 @@ mod tests {
                 username: "other_bot".to_owned(),
             }),
         };
-        assert!(setup.repair_preflight(&wrong).await.is_err());
+        assert!(
+            setup
+                .repair_preflight(&wrong, Locale::Russian)
+                .await
+                .is_err()
+        );
         assert_eq!(
             SetupStore::new(state_path.clone(), token_path.clone())
                 .load_state()
@@ -2746,7 +3578,12 @@ mod tests {
                 username: "LAVIS_TEST_BOT".to_owned(),
             }),
         };
-        assert!(setup.repair_preflight(&matching).await.is_ok());
+        assert!(
+            setup
+                .repair_preflight(&matching, Locale::Russian)
+                .await
+                .is_ok()
+        );
         assert_eq!(
             SetupStore::new(state_path, token_path)
                 .load_state()
@@ -2781,6 +3618,11 @@ mod tests {
     #[tokio::test]
     async fn shows_existing_alias_with_utf16_safe_collapsed_body() {
         let (mut runtime, directory) = runtime_with_alias().await;
+        runtime
+            .settings
+            .set_locale(Some(crate::i18n::Locale::English))
+            .await
+            .unwrap();
         let response = runtime
             .execute_alias(
                 &AliasRequest::Show {
@@ -2817,6 +3659,11 @@ mod tests {
     #[tokio::test]
     async fn reports_missing_alias_and_invalid_show_usage() {
         let (mut runtime, directory) = runtime_with_alias().await;
+        runtime
+            .settings
+            .set_locale(Some(crate::i18n::Locale::English))
+            .await
+            .unwrap();
 
         assert_eq!(
             runtime
@@ -2827,7 +3674,7 @@ mod tests {
                     "!"
                 )
                 .await,
-            Response::plain("⚠️ Alias !missing does not exist")
+            Response::plain("⚠️ Alias does not exist: !missing")
         );
         assert_eq!(
             runtime.execute_alias(&AliasRequest::Invalid, "!").await,
@@ -2848,7 +3695,7 @@ mod tests {
             runtime.execute_modules(&crate::commands::ModulesRequest::Overview, runtime.prefix());
         assert!(overview.text.starts_with("🧩 Модули Lavis: 3\n\n"));
         assert!(overview.text.contains("🦀fastfetch"));
-        assert!(overview.text.contains("Команды (10)"));
+        assert!(overview.text.contains("Команды (12)"));
         assert_eq!(overview.entities.len(), 2);
         assert_eq!(
             runtime.execute_modules(&crate::commands::ModulesRequest::Invalid, runtime.prefix(),),
@@ -2866,7 +3713,7 @@ mod tests {
             "🧩 Модули Lavis: 3\n\n"
         );
         let body = String::from_utf16(&units[offset..offset + length]).unwrap();
-        assert!(body.contains("Команды (10)"));
+        assert!(body.contains("Команды (12)"));
         let grammers_client::tl::enums::MessageEntity::Blockquote(provenance) =
             &overview.entities[1]
         else {
@@ -2880,6 +3727,21 @@ mod tests {
             String::from_utf16(&units[provenance_offset..provenance_offset + provenance_length])
                 .unwrap(),
             "Это встроенный модуль Lavis. Его нельзя выгрузить или заменить."
+        );
+
+        runtime
+            .settings
+            .set_locale(Some(Locale::English))
+            .await
+            .unwrap();
+        let english =
+            runtime.execute_modules(&crate::commands::ModulesRequest::Overview, runtime.prefix());
+        assert!(english.text.starts_with("🧩 Lavis modules: 3\n\n"));
+        assert!(english.text.contains("Commands (12)"));
+        assert!(!english.text.contains("Модули"));
+        assert_eq!(
+            runtime.execute_modules(&crate::commands::ModulesRequest::Invalid, runtime.prefix(),),
+            Response::plain("⚠️ Usage: 🦀modules")
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -2931,7 +3793,7 @@ mod tests {
                 .execute_prefix(&crate::commands::PrefixRequest::Set(".".to_owned()))
                 .await
                 .text,
-            "⚙️ Command prefix set to: ."
+            "⚙️ Префикс команд изменён: ."
         );
         assert_eq!(runtime.prefix(), ".");
         assert_eq!(
@@ -2946,7 +3808,7 @@ mod tests {
                 .execute_prefix(&crate::commands::PrefixRequest::Reset)
                 .await
                 .text,
-            "⚙️ Command prefix reset to: ,"
+            "⚙️ Префикс сброшен: ,"
         );
         assert_eq!(runtime.prefix(), ",");
         assert!(
@@ -2954,10 +3816,222 @@ mod tests {
                 .execute_prefix(&crate::commands::PrefixRequest::Set("bad".to_owned()))
                 .await
                 .text
-                .contains("Could not change")
+                .contains("Не удалось изменить")
         );
         assert_eq!(runtime.prefix(), ",");
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn prefix_and_alias_responses_follow_the_locale_without_internal_errors() {
+        let (mut runtime, directory) = runtime_with_alias().await;
+        for (locale, current, usage, added, listed, shown, deleted, missing, invalid_alias) in [
+            (
+                Locale::English,
+                "⚙️ Active prefix: ,",
+                "⚠️ Usage: ,prefix [new-prefix|reset]",
+                "🔗 Added alias: ,new",
+                "🔗 Aliases\n\n,mini → ,fastfetch --separator ' → '\n,new → ,ping",
+                "🔗 ,new\n\nAlias for:\n,ping",
+                "🔗 Deleted alias: ,new",
+                "❓ Alias not found: missing",
+                "⚠️ Usage: ,alias [list|add <name> <command> [arguments...]|show <name>|del <name>]",
+            ),
+            (
+                Locale::Russian,
+                "⚙️ Текущий префикс: ,",
+                "⚠️ Использование: ,prefix [new-prefix|reset]",
+                "🔗 Добавлен псевдоним: ,new",
+                "🔗 Псевдонимы\n\n,mini → ,fastfetch --separator ' → '\n,new → ,ping",
+                "🔗 ,new\n\nПсевдоним для:\n,ping",
+                "🔗 Псевдоним удалён: ,new",
+                "❓ Псевдоним не найден: missing",
+                "⚠️ Использование: ,alias [list|add <name> <command> [arguments...]|show <name>|del <name>]",
+            ),
+        ] {
+            runtime.settings.set_locale(Some(locale)).await.unwrap();
+            assert_eq!(
+                runtime
+                    .execute_prefix(&crate::commands::PrefixRequest::Show)
+                    .await
+                    .text,
+                current
+            );
+            assert_eq!(
+                runtime
+                    .execute_prefix(&crate::commands::PrefixRequest::Invalid)
+                    .await
+                    .text,
+                usage
+            );
+            assert_eq!(
+                runtime
+                    .execute_alias(
+                        &AliasRequest::Add {
+                            name: "new".to_owned(),
+                            target: "ping".to_owned(),
+                            args: vec![],
+                        },
+                        ",",
+                    )
+                    .await
+                    .text,
+                added
+            );
+            assert_eq!(
+                runtime.execute_alias(&AliasRequest::List, ",").await.text,
+                listed
+            );
+            assert_eq!(
+                runtime
+                    .execute_alias(
+                        &AliasRequest::Show {
+                            name: "new".to_owned()
+                        },
+                        ","
+                    )
+                    .await
+                    .text,
+                shown
+            );
+            assert_eq!(
+                runtime
+                    .execute_alias(
+                        &AliasRequest::Delete {
+                            name: "new".to_owned()
+                        },
+                        ","
+                    )
+                    .await
+                    .text,
+                deleted
+            );
+            assert_eq!(
+                runtime
+                    .execute_alias(
+                        &AliasRequest::Delete {
+                            name: "missing".to_owned()
+                        },
+                        ","
+                    )
+                    .await
+                    .text,
+                missing
+            );
+            assert_eq!(
+                runtime
+                    .execute_alias(&AliasRequest::Invalid, ",")
+                    .await
+                    .text,
+                invalid_alias
+            );
+        }
+        for (locale, prefix_error, alias_error) in [
+            (
+                Locale::English,
+                "⚠️ Could not change prefix.",
+                "⚠️ Could not add alias.",
+            ),
+            (
+                Locale::Russian,
+                "⚠️ Не удалось изменить префикс.",
+                "⚠️ Не удалось добавить псевдоним.",
+            ),
+        ] {
+            runtime.settings.set_locale(Some(locale)).await.unwrap();
+            assert_eq!(
+                runtime
+                    .execute_prefix(&crate::commands::PrefixRequest::Set("bad".to_owned()))
+                    .await
+                    .text,
+                prefix_error
+            );
+            assert_eq!(
+                runtime
+                    .execute_alias(
+                        &AliasRequest::Add {
+                            name: "ping".to_owned(),
+                            target: "stats".to_owned(),
+                            args: vec![],
+                        },
+                        ",",
+                    )
+                    .await
+                    .text,
+                alias_error
+            );
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn fastfetch_validation_and_failure_responses_follow_the_locale() {
+        for (locale, invalid, failure) in [
+            (
+                Locale::English,
+                "⚠️ Fastfetch input error: invalid --logo value. See !help fastfetch",
+                "⚠️ Fastfetch timed out. See !help fastfetch",
+            ),
+            (
+                Locale::Russian,
+                "⚠️ Ошибка ввода Fastfetch: неверное значение --logo. См. !help fastfetch",
+                "⚠️ Fastfetch превысил время ожидания. См. !help fastfetch",
+            ),
+        ] {
+            assert_eq!(
+                fastfetch_response(
+                    FastfetchResult::InvalidArguments(FastfetchInputError::InvalidLogo),
+                    locale,
+                    "!",
+                    std::path::Path::new("/tmp/fastfetch.json"),
+                ),
+                Response::plain(invalid)
+            );
+            assert_eq!(
+                fastfetch_response(
+                    FastfetchResult::TimedOut,
+                    locale,
+                    "!",
+                    std::path::Path::new("/tmp/fastfetch.json"),
+                ),
+                Response::plain(failure)
+            );
+        }
+    }
+
+    #[test]
+    fn reboot_and_sensitive_denial_responses_follow_the_locale() {
+        for (locale, rebooting, reboot_denial, module_denial) in [
+            (
+                Locale::English,
+                "♻️ Lavis is restarting…",
+                "⚠️ Restart is available only from a new self-authored message.",
+                "⚠️ This module operation is available only from a new self-authored message in Saved Messages.",
+            ),
+            (
+                Locale::Russian,
+                "♻️ Lavis перезапускается…",
+                "⚠️ Перезапуск доступен только из нового собственного сообщения.",
+                "⚠️ Эта операция с модулями доступна только из нового собственного сообщения в Saved Messages.",
+            ),
+        ] {
+            assert_eq!(runtime_text(locale, RuntimeText::Rebooting), rebooting);
+            for denial in [
+                SensitiveCommandDenial::Edited,
+                SensitiveCommandDenial::NotSelfAuthored,
+                SensitiveCommandDenial::InvalidMessageId,
+            ] {
+                assert_eq!(
+                    denial.response(locale, SensitiveCommandPolicy::Reboot),
+                    reboot_denial
+                );
+            }
+            assert_eq!(
+                SensitiveCommandDenial::NotSavedMessages
+                    .response(locale, SensitiveCommandPolicy::ModuleMutation),
+                module_denial
+            );
+        }
     }
 
     #[test]
@@ -2977,6 +4051,26 @@ mod tests {
         assert_eq!(format_latency(Duration::ZERO), "<1 ms");
         assert_eq!(format_latency(Duration::from_micros(999)), "<1 ms");
         assert_eq!(format_latency(Duration::from_millis(12)), "12 ms");
+    }
+
+    #[test]
+    fn ping_success_and_failure_follow_the_locale() {
+        assert_eq!(
+            ping_text(Locale::English, PingText::Success, "12 ms"),
+            "🏓 Pong: 12 ms"
+        );
+        assert_eq!(
+            runtime_text(Locale::English, RuntimeText::PingFailed),
+            "⚠️ Telegram ping failed"
+        );
+        assert_eq!(
+            ping_text(Locale::Russian, PingText::Success, "12 ms"),
+            "🏓 Понг: 12 ms"
+        );
+        assert_eq!(
+            runtime_text(Locale::Russian, RuntimeText::PingFailed),
+            "⚠️ Не удалось выполнить Telegram ping"
+        );
     }
 
     #[test]
@@ -3161,6 +4255,7 @@ for line in sys.stdin:
                     code: 1,
                     stderr: "sensitive diagnostic".to_owned(),
                 },
+                Locale::English,
                 "!",
                 std::path::Path::new("/tmp/fastfetch.json"),
             )
@@ -3175,6 +4270,7 @@ for line in sys.stdin:
         assert_eq!(
             fastfetch_response(
                 FastfetchResult::InvalidArguments(FastfetchInputError::InvalidLogo),
+                Locale::English,
                 "🦀",
                 std::path::Path::new("/tmp/fastfetch.json"),
             ),
@@ -3183,10 +4279,11 @@ for line in sys.stdin:
         let profile_path = PathBuf::from("/tmp/profile\nfastfetch.json");
         let response = fastfetch_response(
             FastfetchResult::ProfileError(FastfetchProfileError::Malformed),
+            Locale::English,
             "🦀",
             &profile_path,
         );
-        assert!(response.text.contains("Malformed"));
+        assert!(response.text.contains("profile is malformed"));
         assert!(response.text.contains(&format!("{profile_path:?}")));
         assert!(!response.text.contains("/tmp/profile\nfastfetch.json"));
         assert!(response.text.contains("🦀help fastfetch"));
@@ -3243,6 +4340,7 @@ for line in sys.stdin:
     #[test]
     fn formats_stats_with_all_labels_and_values() {
         let output = format_stats(
+            Locale::English,
             "12 ms",
             Duration::from_secs(61),
             &ProcStats {
@@ -3263,16 +4361,44 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn stats_unavailable_values_follow_the_locale() {
+        let unavailable = ProcStats::default();
+        let english = format_stats(
+            Locale::English,
+            "unavailable",
+            Duration::from_secs(1),
+            &unavailable,
+            0,
+        );
+        assert!(english.contains("📊 Lavis stats"));
+        assert!(english.contains("Telegram: unavailable"));
+        assert!(english.contains("System uptime: unavailable"));
+        assert!(english.contains("Memory: unavailable"));
+
+        let russian = format_stats(
+            Locale::Russian,
+            "недоступно",
+            Duration::from_secs(1),
+            &unavailable,
+            0,
+        );
+        assert!(russian.contains("📊 Статистика Lavis"));
+        assert!(russian.contains("Telegram: недоступно"));
+        assert!(russian.contains("Время работы системы: недоступно"));
+        assert!(russian.contains("Память: недоступно"));
+    }
+
+    #[test]
     fn module_install_lists_are_bounded_and_mutation_denial_text_is_exact() {
         let values = (0..10)
             .map(|index| format!("value-{index}"))
             .collect::<Vec<_>>();
         assert_eq!(
-            bounded_list(&values),
+            bounded_list(Locale::Russian, &values),
             "value-0, value-1, value-2, value-3, value-4, value-5, value-6, value-7, ещё 2"
         );
         assert_eq!(
-            MODULE_MUTATION_DENIED,
+            sensitive_text(Locale::Russian, SensitiveText::ModuleMutationDenied),
             "⚠️ Эта операция с модулями доступна только из нового собственного сообщения в Saved Messages."
         );
     }
@@ -3339,8 +4465,63 @@ for line in sys.stdin:
     #[test]
     fn lm_usage_lists_each_supported_form() {
         assert_eq!(
-            lm_usage("."),
+            lm_usage(Locale::Russian, "."),
             "⚠️ Использование:\n.lm\n.lm list\n.lm info <id>\n.lm logs <id>\n.lm doctor [<id>]\n.lm install\n.lm confirm <ApprovalId>\n.lm cancel <ApprovalId>\n.lm enable <id>\n.lm disable <id>"
         );
+    }
+
+    #[tokio::test]
+    async fn bare_lm_and_lm_list_empty_responses_follow_the_locale() {
+        let (mut runtime, directory) = runtime_with_alias().await;
+        runtime.configure_module_control(
+            directory.join("modules"),
+            directory.join("state.json"),
+            directory.join("declarative.json"),
+            PeerId::user(1).unwrap(),
+        );
+
+        let russian = Response::plain(
+            "📦 Внешние модули не установлены.\n\nПрикрепите .lmod к сообщению, затем используйте:\n,lm install",
+        );
+        assert_eq!(runtime.render_lm_list().await, russian);
+        assert_eq!(runtime.render_lm_list().await, russian);
+
+        runtime
+            .settings
+            .set_locale(Some(Locale::English))
+            .await
+            .unwrap();
+        let english = Response::plain(
+            "📦 No external modules are installed.\n\nAttach a .lmod document to a message, then use:\n,lm install",
+        );
+        assert_eq!(runtime.render_lm_list().await, english);
+        assert_eq!(runtime.render_lm_list().await, english);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_lm_usage_response_follows_the_locale() {
+        let (mut runtime, directory) = runtime_with_alias().await;
+        assert_eq!(
+            runtime.lm_invalid_usage_response(),
+            Response::plain(
+                "⚠️ Использование:\n,lm\n,lm list\n,lm info <id>\n,lm logs <id>\n,lm doctor [<id>]\n,lm install\n,lm confirm <ApprovalId>\n,lm cancel <ApprovalId>\n,lm enable <id>\n,lm disable <id>"
+            )
+        );
+
+        runtime
+            .settings
+            .set_locale(Some(Locale::English))
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime.lm_invalid_usage_response(),
+            Response::plain(
+                "⚠️ Usage:\n,lm\n,lm list\n,lm info <id>\n,lm logs <id>\n,lm doctor [<id>]\n,lm install\n,lm confirm <ApprovalId>\n,lm cancel <ApprovalId>\n,lm enable <id>\n,lm disable <id>"
+            )
+        );
+
+        fs::remove_dir_all(directory).unwrap();
     }
 }

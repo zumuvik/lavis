@@ -644,7 +644,7 @@ async fn supervise(
                             break;
                         }
                         if active_calls.len() > V6_MAX_ACTIVE_RPCS {
-                            let error = V6CallError { kind: "capacity".to_owned(), message: "too many active calls".to_owned() };
+                            let error = V6CallError { kind: "capacity".to_owned(), message: "too many active calls".to_owned(), code: None, name: None, retry_after_seconds: None };
                             if let Err(queue_error) = queue_writer(&writer_tx, WriterCommand::Frame(V6OutboundCoreFrame::TelegramResult { call_id: call_id.clone(), result: Err(error) }, Flush::Call(call_id))) {
                                 fatal_reason = Some(FatalReason::from_writer(queue_error));
                                 fatal_stage = "rpc";
@@ -1251,16 +1251,25 @@ fn validate_invoke(
         return Err(V6CallError {
             kind: "protocol".to_owned(),
             message: "duplicate call_id".to_owned(),
+            code: None,
+            name: None,
+            retry_after_seconds: None,
         });
     }
     let method = v6_registry::lookup(method).ok_or_else(|| V6CallError {
         kind: "validation".to_owned(),
         message: "gateway method is not recognized".to_owned(),
+        code: None,
+        name: None,
+        retry_after_seconds: None,
     })?;
     if !descriptor.telegram_methods.contains(&method) {
         return Err(V6CallError {
             kind: "capability".to_owned(),
             message: "method is not granted".to_owned(),
+            code: None,
+            name: None,
+            retry_after_seconds: None,
         });
     }
     // Capability policy comes from the generated registry (`required_capability`)
@@ -1275,6 +1284,9 @@ fn validate_invoke(
         return Err(V6CallError {
             kind: "capability".to_owned(),
             message: format!("{required} capability is required"),
+            code: None,
+            name: None,
+            retry_after_seconds: None,
         });
     }
     Ok(method)
@@ -1293,26 +1305,48 @@ fn v6_executor_error(error: V6ExecutorError) -> V6CallError {
         V6ExecutorError::InvalidParams(_) => V6CallError {
             kind: "validation".to_owned(),
             message: "invalid parameters".to_owned(),
+            code: None,
+            name: None,
+            retry_after_seconds: None,
         },
-        V6ExecutorError::Rpc { .. } => V6CallError {
+        V6ExecutorError::Rpc {
+            code,
+            name,
+            retry_after_seconds,
+        } => V6CallError {
             kind: "rpc".to_owned(),
             message: "Telegram RPC request failed".to_owned(),
+            code: Some(code),
+            name: Some(name),
+            retry_after_seconds,
         },
         V6ExecutorError::Transport => V6CallError {
             kind: "transport".to_owned(),
             message: "Telegram transport unavailable".to_owned(),
+            code: None,
+            name: None,
+            retry_after_seconds: None,
         },
         V6ExecutorError::Timeout => V6CallError {
             kind: "timeout".to_owned(),
             message: "Telegram RPC deadline exceeded".to_owned(),
+            code: None,
+            name: None,
+            retry_after_seconds: None,
         },
         V6ExecutorError::InvalidResponse => V6CallError {
             kind: "internal".to_owned(),
             message: "invalid gateway response".to_owned(),
+            code: None,
+            name: None,
+            retry_after_seconds: None,
         },
         V6ExecutorError::ShuttingDown => V6CallError {
             kind: "shutdown".to_owned(),
             message: "gateway is shutting down".to_owned(),
+            code: None,
+            name: None,
+            retry_after_seconds: None,
         },
     }
 }
@@ -1466,6 +1500,27 @@ mod tests {
         },
         v6_executor::{self, V6ExecutorError},
     };
+
+    #[test]
+    fn v6_alpha_race_and_timeout_contract_matches_process_boundaries() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../protocol/v6/alpha-contract.json")).unwrap();
+        assert_eq!(fixture["timeout_start"], "after_write_flush");
+        assert_eq!(lifecycle_timeout(), V6_LIFECYCLE_TIMEOUT);
+        assert_eq!(V6_RPC_TIMEOUT, Duration::from_secs(5));
+        assert_eq!(
+            fixture["race_semantics"]["duplicate_active_call_id"],
+            "protocol_violation"
+        );
+        assert_eq!(
+            fixture["race_semantics"]["cancellation"],
+            "drain_active_lifecycle_log"
+        );
+        assert_eq!(
+            fixture["race_semantics"]["shutdown"],
+            "discard_late_telegram_result"
+        );
+    }
 
     fn descriptor() -> ExternalModuleDescriptor {
         ExternalModuleDescriptor {
@@ -1932,7 +1987,14 @@ sys.exit(0)
         ensure_test_state_base();
 
         let mut module = descriptor();
-        module.id = format!("v6late{}{}", kind, std::process::id());
+        // State directories are keyed by module ID.  A per-fixture ID avoids
+        // concurrent test instances sharing state when the test binary or its
+        // temporary directory is reused by a sandbox runner.
+        module.id = format!(
+            "v6late{kind}-{}-{}",
+            std::process::id(),
+            protocol::request_id()
+        );
         module.module_dir = root.clone();
         module.entrypoint = entrypoint.clone();
         let late_expression = match kind {
@@ -3071,7 +3133,10 @@ sys.exit(0)
             v6_executor_error(V6ExecutorError::InvalidParams("secret")),
             V6CallError {
                 kind: "validation".to_owned(),
-                message: "invalid parameters".to_owned()
+                message: "invalid parameters".to_owned(),
+                code: None,
+                name: None,
+                retry_after_seconds: None,
             }
         );
         assert_eq!(v6_executor_error(V6ExecutorError::Timeout).kind, "timeout");

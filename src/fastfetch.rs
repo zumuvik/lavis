@@ -14,7 +14,10 @@ use tokio::{
     time::timeout,
 };
 
-use crate::response::{Response, TRUNCATION_SUFFIX};
+use crate::{
+    i18n::{Locale, ResponseText, response_text},
+    response::Response,
+};
 
 const STDOUT_CAP: usize = 64 * 1024;
 const STDERR_CAP: usize = 16 * 1024;
@@ -161,9 +164,9 @@ struct Capture {
     truncated: bool,
 }
 
-pub async fn run(arguments: &str, profile_path: &Path) -> FastfetchResult {
+pub async fn run(locale: Locale, arguments: &str, profile_path: &Path) -> FastfetchResult {
     match prepare(arguments, profile_path).await {
-        Ok(invocation) => execute(invocation).await,
+        Ok(invocation) => execute(locale, invocation).await,
         Err(result) => result,
     }
 }
@@ -546,7 +549,7 @@ impl Module {
     }
 }
 
-async fn execute(invocation: Invocation) -> FastfetchResult {
+async fn execute(locale: Locale, invocation: Invocation) -> FastfetchResult {
     let mut command = Command::new("fastfetch");
     command
         .args(invocation.arguments)
@@ -618,16 +621,16 @@ async fn execute(invocation: Invocation) -> FastfetchResult {
     };
 
     if status.success() {
-        let output = sanitize_capture(&stdout);
+        let output = sanitize_capture(locale, &stdout);
         if output.is_empty() {
             FastfetchResult::Empty
         } else {
-            FastfetchResult::Success(Response::preformatted(output))
+            FastfetchResult::Success(Response::preformatted_with_locale(locale, output))
         }
     } else if let Some(code) = status.code() {
         FastfetchResult::NonZero {
             code,
-            stderr: truncate_excerpt(&sanitize_capture(&stderr)),
+            stderr: truncate_excerpt(locale, &sanitize_capture(locale, &stderr)),
         }
     } else {
         FastfetchResult::UnexpectedStatus
@@ -699,7 +702,7 @@ fn append_capture(capture: &mut Capture, chunk: &[u8], cap: usize) {
     capture.truncated |= captured < chunk.len();
 }
 
-fn sanitize_capture(capture: &Capture) -> String {
+fn sanitize_capture(locale: Locale, capture: &Capture) -> String {
     let stripped = strip_ansi_escapes::strip(normalize_input_bytes(&capture.bytes));
     let normalized = String::from_utf8_lossy(&stripped);
     let mut output = String::new();
@@ -721,9 +724,13 @@ fn sanitize_capture(capture: &Capture) -> String {
         .to_owned();
     if capture.truncated {
         if output.is_empty() {
-            TRUNCATION_SUFFIX.to_owned()
+            response_text(locale, ResponseText::Truncated).to_owned()
         } else {
-            format!("{output}\n{TRUNCATION_SUFFIX}")
+            format!(
+                "{}\n{}",
+                output,
+                response_text(locale, ResponseText::Truncated)
+            )
         }
     } else {
         output
@@ -754,11 +761,12 @@ fn normalize_input_bytes(bytes: &[u8]) -> Vec<u8> {
     normalized
 }
 
-fn truncate_excerpt(text: &str) -> String {
+fn truncate_excerpt(locale: Locale, text: &str) -> String {
     if text.encode_utf16().count() <= STDERR_EXCERPT_UNITS {
         return text.to_owned();
     }
-    let suffix_units = TRUNCATION_SUFFIX.encode_utf16().count();
+    let suffix = response_text(locale, ResponseText::Truncated);
+    let suffix_units = suffix.encode_utf16().count();
     let limit = STDERR_EXCERPT_UNITS.saturating_sub(suffix_units);
     let mut end = 0;
     let mut units = 0usize;
@@ -769,7 +777,7 @@ fn truncate_excerpt(text: &str) -> String {
         units += character.len_utf16();
         end = index + character.len_utf8();
     }
-    format!("{}{}", &text[..end], TRUNCATION_SUFFIX)
+    format!("{}{}", &text[..end], suffix)
 }
 
 #[cfg(test)]
@@ -779,6 +787,7 @@ mod tests {
         PROFILE_MAX_BYTES, PartialOptions, append_capture, compile, parse_logo_padding,
         parse_options, prepare, read_profile, sanitize_capture, tokenize,
     };
+    use crate::i18n::Locale;
     use std::{
         fs,
         time::{SystemTime, UNIX_EPOCH},
@@ -806,6 +815,20 @@ mod tests {
             tokenize("'unterminated"),
             Err(FastfetchInputError::Tokenization)
         );
+    }
+
+    #[test]
+    fn truncated_capture_uses_selected_locale_suffix() {
+        let capture = Capture {
+            bytes: b"third-party output".to_vec(),
+            truncated: true,
+        };
+        let english = sanitize_capture(Locale::English, &capture);
+        let russian = sanitize_capture(Locale::Russian, &capture);
+        assert_eq!(english, "third-party output\n… output truncated");
+        assert_eq!(russian, "third-party output\n… вывод сокращён");
+        assert!(!english.contains("… вывод сокращён"));
+        assert!(!russian.contains("… output truncated"));
     }
 
     #[test]
@@ -1141,7 +1164,10 @@ mod tests {
             truncated: false,
         };
 
-        assert_eq!(sanitize_capture(&capture), "red\nline\nnext      �hidden");
+        assert_eq!(
+            sanitize_capture(Locale::English, &capture),
+            "red\nline\nnext      �hidden"
+        );
     }
 
     #[test]

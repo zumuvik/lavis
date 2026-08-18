@@ -922,6 +922,7 @@ dependencies = [
  "grammers-mtsender",
  "grammers-session",
  "libc",
+ "libsql",
  "reqwest",
  "rpassword",
  "rustix",

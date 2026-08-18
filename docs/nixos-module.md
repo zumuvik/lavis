@@ -18,7 +18,7 @@ Add the Lavis flake input and import the module:
 
 ```nix
 {
-  inputs.lavis.url = "github:zumuvik/lavis";
+  inputs.lavis.url = "git+https://tangled.org/zumuvik.tngl.sh/lavis";
 
   outputs = { self, nixpkgs, lavis, ... }: {
     nixosConfigurations.host = nixpkgs.lib.nixosSystem {
@@ -93,6 +93,58 @@ The default service uses these paths:
 
 The Telegram session remains mutable secret state under
 `$XDG_STATE_HOME/lavis/session`.
+
+## Authorization recovery
+
+`lavis.service` restarts abnormal process termination, but deliberately does
+not restart an application exit with status `1`. Lavis uses that status for
+terminal application failures, including a session for which Telegram requires
+reauthorization. This prevents systemd from repeatedly retrying an invalidated
+session; inspect the journal and recover it manually instead.
+
+First stop the service so it cannot hold the local session lock:
+
+```bash
+sudo systemctl stop lavis.service
+```
+
+Run diagnostics as the service account, with the same XDG paths as the unit.
+For the default account:
+
+```bash
+sudo -u lavis \
+  HOME=/var/lib/lavis \
+  XDG_CONFIG_HOME=/var/lib/lavis/.config \
+  XDG_STATE_HOME=/var/lib/lavis/.local/state \
+  XDG_DATA_HOME=/var/lib/lavis/.local/share \
+  lavis auth doctor
+```
+
+`auth doctor` reports only sanitized diagnostics; do not copy session files or
+credentials into a ticket or shell history. If it says reauthorization is
+required, back up and reset the local session before authorizing again:
+
+```bash
+sudo -u lavis \
+  HOME=/var/lib/lavis \
+  XDG_CONFIG_HOME=/var/lib/lavis/.config \
+  XDG_STATE_HOME=/var/lib/lavis/.local/state \
+  XDG_DATA_HOME=/var/lib/lavis/.local/share \
+  lavis auth reset --backup
+sudo lavis-auth
+sudo systemctl start lavis.service
+```
+
+`auth reset --backup` refuses to modify a session while its local lock is held
+and prints the backup path. Do not delete `session.lock`: stopping the service
+or other interactive Lavis process releases the advisory lock. For a custom
+`services.lavis.user` or `services.lavis.home`, substitute that user and the
+derived XDG paths in these commands.
+
+The lock protects only one machine. Never copy a session to another host or
+run copies through independently routed connections at the same time: either
+can cause Telegram to invalidate the authorization key. Reauthorize separately
+on each host.
 
 On a fresh VPS, the usual sequence is:
 

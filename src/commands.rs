@@ -1,8 +1,11 @@
 use crate::command::Command;
+use crate::i18n::Locale;
 use crate::modules::ModuleId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CommandKind {
+    Start,
+    Language,
     Ping,
     Stats,
     Help,
@@ -30,8 +33,6 @@ pub struct CommandDefinition {
     pub kind: CommandKind,
     pub name: &'static str,
     pub usage: &'static str,
-    pub summary_ru: &'static str,
-    pub description_ru: &'static str,
     pub examples: &'static [&'static str],
     pub risk: CommandRisk,
     pub icon: &'static str,
@@ -39,13 +40,31 @@ pub struct CommandDefinition {
     pub module: ModuleId,
 }
 
-const COMMAND_SPECS: [CommandDefinition; 10] = [
+const COMMAND_SPECS: [CommandDefinition; 12] = [
+    CommandDefinition {
+        kind: CommandKind::Start,
+        name: "start",
+        usage: "start [en|ru|skip|bot]",
+        examples: &["start", "start ru", "start skip", "start bot"],
+        risk: CommandRisk::PersistentStateChange,
+        icon: "👋",
+        aliasable: false,
+        module: ModuleId::Core,
+    },
+    CommandDefinition {
+        kind: CommandKind::Language,
+        name: "language",
+        usage: "language [en|ru]",
+        examples: &["language", "language en", "language ru"],
+        risk: CommandRisk::PersistentStateChange,
+        icon: "🌐",
+        aliasable: false,
+        module: ModuleId::Core,
+    },
     CommandDefinition {
         kind: CommandKind::Help,
         name: "help",
         usage: "help [command]",
-        summary_ru: "Показать справку",
-        description_ru: "Показывает обзор команд или подробную справку о команде, псевдониме либо модуле.",
         examples: &["help", "help fastfetch"],
         risk: CommandRisk::ReadOnly,
         icon: "🛠",
@@ -56,8 +75,6 @@ const COMMAND_SPECS: [CommandDefinition; 10] = [
         kind: CommandKind::Reboot,
         name: "reboot",
         usage: "reboot",
-        summary_ru: "Перезапустить Lavis",
-        description_ru: "Редактирует сообщение команды в статус перезапуска, а после успешного запуска — в подтверждение с целым временем в секундах с усечением дробной части; отдельное сообщение не создаётся.",
         examples: &["reboot"],
         risk: CommandRisk::Privileged,
         icon: "♻️",
@@ -68,8 +85,6 @@ const COMMAND_SPECS: [CommandDefinition; 10] = [
         kind: CommandKind::Modules,
         name: "modules",
         usage: "modules",
-        summary_ru: "Список внутренних модулей",
-        description_ru: "Перечисляет статически зарегистрированные модули Lavis и их команды.",
         examples: &["modules"],
         risk: CommandRisk::ReadOnly,
         icon: "🧩",
@@ -80,8 +95,6 @@ const COMMAND_SPECS: [CommandDefinition; 10] = [
         kind: CommandKind::Ping,
         name: "ping",
         usage: "ping",
-        summary_ru: "Измерить задержку Telegram",
-        description_ru: "Измеряет время реального MTProto RPC-запроса через текущую авторизованную сессию.",
         examples: &["ping"],
         risk: CommandRisk::ReadOnly,
         icon: "🏓",
@@ -92,8 +105,6 @@ const COMMAND_SPECS: [CommandDefinition; 10] = [
         kind: CommandKind::Prefix,
         name: "prefix",
         usage: "prefix [new-prefix|reset]",
-        summary_ru: "Показать или изменить префикс",
-        description_ru: "Показывает активный префикс или сохраняет новый.",
         examples: &["prefix", "prefix .", "prefix reset"],
         risk: CommandRisk::PersistentStateChange,
         icon: "⚙️",
@@ -104,8 +115,6 @@ const COMMAND_SPECS: [CommandDefinition; 10] = [
         kind: CommandKind::Setup,
         name: "setup",
         usage: "setup [<username_bot>|auto|status|repair|cancel]",
-        summary_ru: "Настроить companion",
-        description_ru: "Запускает или управляет настройкой companion для указанного пользователя.",
         examples: &[
             "setup",
             "setup lavis_example_bot",
@@ -123,8 +132,6 @@ const COMMAND_SPECS: [CommandDefinition; 10] = [
         kind: CommandKind::Lm,
         name: "lm",
         usage: "lm [list|info <id>|logs <id>|doctor [id]|install|confirm <approval-id>|cancel <approval-id>|enable <id>|disable <id>]",
-        summary_ru: "Проверить и установить внешний модуль",
-        description_ru: "Показывает внешние модули или запускает проверяемую установку с отдельным подтверждением.",
         examples: &[
             "lm",
             "lm list",
@@ -146,8 +153,6 @@ const COMMAND_SPECS: [CommandDefinition; 10] = [
         kind: CommandKind::Stats,
         name: "stats",
         usage: "stats",
-        summary_ru: "Показать статистику работы",
-        description_ru: "Показывает задержку Telegram, время работы Lavis и хоста, память, число команд и версию пакета.",
         examples: &["stats"],
         risk: CommandRisk::ReadOnly,
         icon: "📊",
@@ -158,8 +163,6 @@ const COMMAND_SPECS: [CommandDefinition; 10] = [
         kind: CommandKind::Fastfetch,
         name: "fastfetch",
         usage: "fastfetch [--no-profile] [--logo <...>] [--structure <...>] [--separator <text>] [--logo-padding-left <n>] [--logo-padding-right <n>] [--logo-padding-top <n>]",
-        summary_ru: "Показать системную информацию",
-        description_ru: "Запускает Fastfetch только с ограниченными безопасными параметрами отображения.",
         examples: &[
             "fastfetch",
             "fastfetch --logo arch",
@@ -174,8 +177,6 @@ const COMMAND_SPECS: [CommandDefinition; 10] = [
         kind: CommandKind::Alias,
         name: "alias",
         usage: "alias [list|add <name> <command> [arguments...]|show <name>|del <name>]",
-        summary_ru: "Управлять псевдонимами команд",
-        description_ru: "Создаёт, показывает и удаляет постоянные псевдонимы канонических команд.",
         examples: &["alias list", "alias add sys fastfetch", "alias del sys"],
         risk: CommandRisk::PersistentStateChange,
         icon: "🔗",
@@ -183,6 +184,110 @@ const COMMAND_SPECS: [CommandDefinition; 10] = [
         module: ModuleId::Aliases,
     },
 ];
+
+pub fn command_summary(kind: CommandKind, locale: Locale) -> &'static str {
+    match (kind, locale) {
+        (CommandKind::Start, Locale::English) => "Start the tutorial or companion setup",
+        (CommandKind::Start, Locale::Russian) => "Начать обучение",
+        (CommandKind::Language, Locale::English) => "Show or change the interface language",
+        (CommandKind::Language, Locale::Russian) => "Показать или изменить язык",
+        (CommandKind::Ping, Locale::English) => "Measure Telegram latency",
+        (CommandKind::Ping, Locale::Russian) => "Измерить задержку Telegram",
+        (CommandKind::Stats, Locale::English) => "Show runtime statistics",
+        (CommandKind::Stats, Locale::Russian) => "Показать статистику работы",
+        (CommandKind::Help, Locale::English) => "Show command help",
+        (CommandKind::Help, Locale::Russian) => "Показать справку",
+        (CommandKind::Fastfetch, Locale::English) => "Show safe system information",
+        (CommandKind::Fastfetch, Locale::Russian) => "Показать системную информацию",
+        (CommandKind::Alias, Locale::English) => "Manage command aliases",
+        (CommandKind::Alias, Locale::Russian) => "Управлять псевдонимами команд",
+        (CommandKind::Prefix, Locale::English) => "Show or change the command prefix",
+        (CommandKind::Prefix, Locale::Russian) => "Показать или изменить префикс",
+        (CommandKind::Modules, Locale::English) => "List built-in modules",
+        (CommandKind::Modules, Locale::Russian) => "Список внутренних модулей",
+        (CommandKind::Setup, Locale::English) => "Configure the companion workspace",
+        (CommandKind::Setup, Locale::Russian) => "Настроить companion",
+        (CommandKind::Lm, Locale::English) => "Inspect and install external modules",
+        (CommandKind::Lm, Locale::Russian) => "Проверить и установить внешний модуль",
+        (CommandKind::Reboot, Locale::English) => "Restart Lavis",
+        (CommandKind::Reboot, Locale::Russian) => "Перезапустить Lavis",
+    }
+}
+
+pub fn command_description(kind: CommandKind, locale: Locale) -> &'static str {
+    match (kind, locale) {
+        (CommandKind::Start, Locale::English) => {
+            "Start the tutorial or the single safe companion and private workspace setup flow."
+        }
+        (CommandKind::Start, Locale::Russian) => {
+            "Запускает последовательное обучение Lavis или единый безопасный сценарий настройки companion и приватного workspace."
+        }
+        (CommandKind::Language, Locale::English) => {
+            "Shows the selected interface language or saves a new one without resetting settings."
+        }
+        (CommandKind::Language, Locale::Russian) => {
+            "Показывает выбранный язык интерфейса или сохраняет новый без сброса настроек."
+        }
+        (CommandKind::Help, Locale::English) => {
+            "Shows a command overview or detailed help for a command, alias, or module."
+        }
+        (CommandKind::Help, Locale::Russian) => {
+            "Показывает обзор команд или подробную справку о команде, псевдониме либо модуле."
+        }
+        (CommandKind::Reboot, Locale::English) => {
+            "Edits the command message to restarting status and, after successful startup, to a confirmation with truncated whole seconds; it creates no separate message."
+        }
+        (CommandKind::Reboot, Locale::Russian) => {
+            "Редактирует сообщение команды в статус перезапуска, а после успешного запуска — в подтверждение с целым временем в секундах с усечением дробной части; отдельное сообщение не создаётся."
+        }
+        (CommandKind::Modules, Locale::English) => {
+            "Lists statically registered Lavis modules and their commands."
+        }
+        (CommandKind::Modules, Locale::Russian) => {
+            "Перечисляет статически зарегистрированные модули Lavis и их команды."
+        }
+        (CommandKind::Ping, Locale::English) => {
+            "Measures a real MTProto RPC request through the current authorized session."
+        }
+        (CommandKind::Ping, Locale::Russian) => {
+            "Измеряет время реального MTProto RPC-запроса через текущую авторизованную сессию."
+        }
+        (CommandKind::Prefix, Locale::English) => "Shows the active prefix or saves a new one.",
+        (CommandKind::Prefix, Locale::Russian) => {
+            "Показывает активный префикс или сохраняет новый."
+        }
+        (CommandKind::Setup, Locale::English) => {
+            "Starts or manages companion setup for the specified user."
+        }
+        (CommandKind::Setup, Locale::Russian) => {
+            "Запускает или управляет настройкой companion для указанного пользователя."
+        }
+        (CommandKind::Lm, Locale::English) => {
+            "Shows external modules or starts a reviewed installation with separate confirmation."
+        }
+        (CommandKind::Lm, Locale::Russian) => {
+            "Показывает внешние модули или запускает проверяемую установку с отдельным подтверждением."
+        }
+        (CommandKind::Stats, Locale::English) => {
+            "Shows Telegram latency, Lavis and host uptime, memory, command count, and package version."
+        }
+        (CommandKind::Stats, Locale::Russian) => {
+            "Показывает задержку Telegram, время работы Lavis и хоста, память, число команд и версию пакета."
+        }
+        (CommandKind::Fastfetch, Locale::English) => {
+            "Runs Fastfetch only with restricted safe display options."
+        }
+        (CommandKind::Fastfetch, Locale::Russian) => {
+            "Запускает Fastfetch только с ограниченными безопасными параметрами отображения."
+        }
+        (CommandKind::Alias, Locale::English) => {
+            "Creates, shows, and deletes persistent aliases for canonical commands."
+        }
+        (CommandKind::Alias, Locale::Russian) => {
+            "Создаёт, показывает и удаляет постоянные псевдонимы канонических команд."
+        }
+    }
+}
 
 pub fn commands() -> &'static [CommandDefinition] {
     &COMMAND_SPECS
@@ -221,6 +326,8 @@ pub struct ExternalInvocation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
+    Start(StartRequest),
+    Language(LanguageRequest),
     Ping,
     Stats,
     Help(HelpRequest),
@@ -262,6 +369,8 @@ pub enum PrefixRequest {
 impl Action {
     pub fn name(&self) -> &str {
         match self {
+            Self::Start(_) => "start",
+            Self::Language(_) => "language",
             Self::Ping => "ping",
             Self::Stats => "stats",
             Self::Help(_) => "help",
@@ -285,6 +394,8 @@ impl Action {
 pub fn dispatch(command: &Command) -> Option<Action> {
     let definition = canonical_command(&command.name)?;
     match definition.kind {
+        CommandKind::Start => Some(Action::Start(parse_start_request(&command.args))),
+        CommandKind::Language => Some(Action::Language(parse_language_request(&command.args))),
         CommandKind::Ping => Some(Action::Ping),
         CommandKind::Stats => Some(Action::Stats),
         CommandKind::Help => Some(Action::Help(parse_help_request(&command.args))),
@@ -307,6 +418,50 @@ pub fn definition(kind: CommandKind) -> &'static CommandDefinition {
 pub enum ModulesRequest {
     Overview,
     Invalid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartRequest {
+    Begin,
+    Locale(crate::i18n::Locale),
+    Skip,
+    Bot,
+    Invalid,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LanguageRequest {
+    Show,
+    Set(crate::i18n::Locale),
+    Invalid,
+}
+
+fn parse_start_request(args: &str) -> StartRequest {
+    let mut words = args.split_whitespace();
+    let Some(word) = words.next() else {
+        return StartRequest::Begin;
+    };
+    if words.next().is_some() {
+        return StartRequest::Invalid;
+    }
+    match word.to_ascii_lowercase().as_str() {
+        "skip" => StartRequest::Skip,
+        "bot" => StartRequest::Bot,
+        _ => crate::i18n::Locale::parse(word)
+            .map(StartRequest::Locale)
+            .unwrap_or(StartRequest::Invalid),
+    }
+}
+fn parse_language_request(args: &str) -> LanguageRequest {
+    let mut words = args.split_whitespace();
+    let Some(word) = words.next() else {
+        return LanguageRequest::Show;
+    };
+    if words.next().is_some() {
+        return LanguageRequest::Invalid;
+    }
+    crate::i18n::Locale::parse(word)
+        .map(LanguageRequest::Set)
+        .unwrap_or(LanguageRequest::Invalid)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -498,10 +653,12 @@ fn parse_help_request(args: &str) -> HelpRequest {
 #[cfg(test)]
 mod tests {
     use super::{
-        Action, AliasRequest, CommandKind, CommandRisk, HelpRequest, LmRequest, ModulesRequest,
-        SetupRequest, command_by_kind, command_by_name, commands, dispatch, module_for_command,
+        Action, AliasRequest, CommandKind, CommandRisk, HelpRequest, LanguageRequest, LmRequest,
+        ModulesRequest, SetupRequest, StartRequest, command_by_kind, command_by_name,
+        command_description, command_summary, commands, dispatch, module_for_command,
     };
     use crate::command::Command;
+    use crate::i18n::Locale;
     use crate::modules::{
         ModuleId, commands_for_module, module_by_name, module_definition, modules,
     };
@@ -515,6 +672,35 @@ mod tests {
         };
 
         assert_eq!(dispatch(&command), Some(Action::Ping));
+    }
+
+    #[test]
+    fn dispatches_start_and_language_with_exact_arguments() {
+        assert_eq!(
+            dispatch(&Command {
+                name: "start".into(),
+                args: "ru".into()
+            }),
+            Some(Action::Start(StartRequest::Locale(
+                crate::i18n::Locale::Russian
+            )))
+        );
+        assert_eq!(
+            dispatch(&Command {
+                name: "start".into(),
+                args: "group".into()
+            }),
+            Some(Action::Start(StartRequest::Invalid))
+        );
+        assert_eq!(
+            dispatch(&Command {
+                name: "language".into(),
+                args: "en".into()
+            }),
+            Some(Action::Language(LanguageRequest::Set(
+                crate::i18n::Locale::English
+            )))
+        );
     }
 
     #[test]
@@ -590,6 +776,8 @@ mod tests {
         assert_eq!(
             names,
             [
+                "start",
+                "language",
                 "help",
                 "reboot",
                 "modules",
@@ -631,11 +819,10 @@ mod tests {
                 .len(),
             names.len()
         );
-        assert!(
-            modules()
-                .iter()
-                .all(|module| !module.description_ru.is_empty())
-        );
+        assert!(modules().iter().all(|module| {
+            !crate::modules::module_description(module.id, Locale::English).is_empty()
+                && !crate::modules::module_description(module.id, Locale::Russian).is_empty()
+        }));
         assert!(
             modules()
                 .iter()
@@ -649,8 +836,10 @@ mod tests {
         assert_eq!(module_definition(ModuleId::Aliases).name, "aliases");
         for definition in commands() {
             assert!(!definition.usage.is_empty());
-            assert!(!definition.summary_ru.is_empty());
-            assert!(!definition.description_ru.is_empty());
+            assert!(!command_summary(definition.kind, Locale::English).is_empty());
+            assert!(!command_summary(definition.kind, Locale::Russian).is_empty());
+            assert!(!command_description(definition.kind, Locale::English).is_empty());
+            assert!(!command_description(definition.kind, Locale::Russian).is_empty());
             assert!(!definition.icon.is_empty());
             assert!(
                 modules()
@@ -675,7 +864,8 @@ mod tests {
                 .map(|command| command.name)
                 .collect::<Vec<_>>(),
             [
-                "help", "reboot", "modules", "ping", "prefix", "setup", "lm", "stats"
+                "start", "language", "help", "reboot", "modules", "ping", "prefix", "setup", "lm",
+                "stats"
             ]
         );
         assert_eq!(
@@ -725,8 +915,10 @@ mod tests {
 
         for command in commands() {
             assert!(!command.usage.is_empty());
-            assert!(!command.summary_ru.is_empty());
-            assert!(!command.description_ru.is_empty());
+            assert!(!command_summary(command.kind, Locale::English).is_empty());
+            assert!(!command_summary(command.kind, Locale::Russian).is_empty());
+            assert!(!command_description(command.kind, Locale::English).is_empty());
+            assert!(!command_description(command.kind, Locale::Russian).is_empty());
             assert!(!command.icon.is_empty());
             assert!(!command.examples.is_empty());
             assert!(command.examples.iter().all(|example| {
