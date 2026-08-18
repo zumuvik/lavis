@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/logo.png" alt="Lavis logo" width="240">
+<img src="https://raw.githubusercontent.com/zumuvik/lavis/main/assets/logo.png" alt="Lavis logo" width="240">
 
 # Lavis
 
