@@ -133,6 +133,39 @@ fn read_lock_holder(session_path: &Path) -> Option<SessionLockHolder> {
     Some(SessionLockHolder { pid, context })
 }
 
+/// Removes the temporary diagnostic file on drop unless the temporary was
+/// successfully published. Removal uses `unlink` semantics (`fs::remove_file`
+/// never follows a symlink on the final component), so a stray temporary file
+/// can never be deleted through a symlink, and the only entry ever removed is
+/// the exact `O_EXCL`/`O_NOFOLLOW` temporary we created.
+struct TemporaryDiagnosticGuard {
+    temporary_path: PathBuf,
+    published: bool,
+}
+
+impl TemporaryDiagnosticGuard {
+    fn new(temporary_path: PathBuf) -> Self {
+        Self {
+            temporary_path,
+            published: false,
+        }
+    }
+
+    /// Marks the temporary as renamed to its final path; the guard must then
+    /// not delete the final file.
+    fn disarm(mut self) {
+        self.published = true;
+    }
+}
+
+impl Drop for TemporaryDiagnosticGuard {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = fs::remove_file(&self.temporary_path);
+        }
+    }
+}
+
 pub(crate) fn write_last_authorization_diagnostic(
     session_path: &Path,
     diagnostic: LastAuthorizationDiagnostic,
@@ -145,6 +178,7 @@ pub(crate) fn write_last_authorization_diagnostic(
         Mode::RUSR | Mode::WUSR,
     )
     .map_err(|_| ClientError::WriteAuthorizationDiagnostic)?;
+    let guard = TemporaryDiagnosticGuard::new(temporary_path.clone());
     fchmod(&file, Mode::RUSR | Mode::WUSR)
         .map_err(|_| ClientError::WriteAuthorizationDiagnostic)?;
     let mut file = fs::File::from(file);
@@ -156,7 +190,9 @@ pub(crate) fn write_last_authorization_diagnostic(
         .map_err(|_| ClientError::WriteAuthorizationDiagnostic)?;
     drop(file);
     fs::rename(temporary_path, authorization_diagnostic_path(session_path))
-        .map_err(|_| ClientError::WriteAuthorizationDiagnostic)
+        .map_err(|_| ClientError::WriteAuthorizationDiagnostic)?;
+    guard.disarm();
+    Ok(())
 }
 
 pub(crate) fn read_last_authorization_diagnostic(
@@ -239,7 +275,13 @@ pub(crate) fn validate_session_file_no_follow(session_path: &Path) -> Result<(),
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
     )
-    .map_err(|_| ClientError::SessionSymlink)?;
+    .map_err(|error| {
+        if error == rustix::io::Errno::LOOP {
+            ClientError::SessionSymlink
+        } else {
+            ClientError::OpenSession
+        }
+    })?;
     drop(file);
     if has_invalid_sqlite_header(session_path)? {
         Err(ClientError::MalformedSession)
@@ -418,6 +460,39 @@ mod tests {
         assert_eq!(
             read_last_authorization_diagnostic(&session_path).unwrap(),
             StoredAuthorizationDiagnostic::Invalid
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn cleans_up_the_temporary_diagnostic_file_when_publish_fails() {
+        let directory = test_directory("diagnostic-temp-cleanup");
+        fs::create_dir(&directory).unwrap();
+        let session_path = directory.join("session");
+        // A directory at the final diagnostic path forces the publish rename
+        // to fail after the O_EXCL temporary file has already been created and
+        // fsynced, exercising the recovery of an interrupted write.
+        fs::create_dir(directory.join("session.auth-diagnostic")).unwrap();
+
+        assert!(matches!(
+            write_last_authorization_diagnostic(
+                &session_path,
+                LastAuthorizationDiagnostic::Timeout,
+            ),
+            Err(ClientError::WriteAuthorizationDiagnostic)
+        ));
+        let leftovers = fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "temporary files survived: {leftovers:?}"
+        );
+        assert!(
+            directory.join("session.auth-diagnostic").is_dir(),
+            "the conflicting final entry must be left untouched"
         );
         fs::remove_dir_all(directory).unwrap();
     }
