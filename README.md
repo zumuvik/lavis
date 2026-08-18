@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/logo.png" alt="Lavis logo" width="240">
+<img src="https://tangled.org/zumuvik.tngl.sh/lavis/raw/main/assets/logo.png" alt="Lavis logo" width="240">
 
 # Lavis
 
@@ -9,13 +9,13 @@
 Runs directly over MTProto, targets Linux, and provides first-class declarative NixOS integration.
 
 <p>
-  <a href="README.ru.md">
+  <a href="https://tangled.org/zumuvik.tngl.sh/lavis/blob/main/README.ru.md">
     <img src="https://img.shields.io/badge/README-Русский-5277C3.svg" alt="Русский README">
   </a>
   <a href="https://tangled.org/zumuvik.tngl.sh/lavis/pipelines">
     <img src="https://img.shields.io/badge/CI-Tangled-5A67D8.svg" alt="Tangled CI">
   </a>
-  <a href="LICENSE">
+  <a href="https://tangled.org/zumuvik.tngl.sh/lavis/blob/main/LICENSE">
     <img src="https://img.shields.io/badge/license-GPL--3.0--only-blue.svg" alt="GPL-3.0-only">
   </a>
   <img src="https://img.shields.io/badge/Rust-stable-orange.svg" alt="Rust">
