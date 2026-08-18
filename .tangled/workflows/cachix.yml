@@ -22,5 +22,6 @@ steps:
       bash <<'BASH'
       set -euo pipefail
       export CACHIX_AUTH_TOKEN="$cachix"
-      cachix watch-exec "$CACHIX_NAME" -- nix build --no-link --print-build-logs
+      nix build --no-link --print-build-logs --print-out-paths \
+        | cachix push "$CACHIX_NAME"
       BASH
