@@ -453,7 +453,7 @@ in
       "d ${effectiveHome} 0700 ${serviceUser} ${serviceGroup} - -"
     );
 
-    environment.systemPackages = [ authScript ];
+    environment.systemPackages = [ cfg.package authScript ];
 
     systemd.services.lavis = {
       description = "Lavis Telegram userbot";
