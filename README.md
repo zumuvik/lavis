@@ -4,119 +4,193 @@
 
 # Lavis
 
-**A personal Telegram userbot for Linux, written in Rust and packaged with Nix.**
+**Fast and extensible Telegram userbot written in Rust**
 
-[Pipelines](https://tangled.org/zumuvik.tngl.sh/lavis/pipelines) · [GPL-3.0-only](LICENSE) · **Alpha**
+Runs directly over MTProto, targets Linux, and provides first-class declarative NixOS integration.
+
+<p>
+  <a href="README.ru.md">
+    <img src="https://img.shields.io/badge/README-Русский-5277C3.svg" alt="Русский README">
+  </a>
+  <a href="https://tangled.org/zumuvik.tngl.sh/lavis/pipelines">
+    <img src="https://img.shields.io/badge/CI-Tangled-5A67D8.svg" alt="Tangled CI">
+  </a>
+  <a href="LICENSE">
+    <img src="https://img.shields.io/badge/license-GPL--3.0--only-blue.svg" alt="GPL-3.0-only">
+  </a>
+  <img src="https://img.shields.io/badge/Rust-stable-orange.svg" alt="Rust">
+  <img src="https://img.shields.io/badge/NixOS-supported-5277C3.svg" alt="NixOS">
+  <img src="https://img.shields.io/badge/status-alpha-yellow.svg" alt="Alpha">
+</p>
 
 </div>
 
-## What Lavis is
+---
 
-Lavis is a single-account, local Telegram userbot. It connects directly to Telegram over MTProto and accepts commands only from messages sent by the authenticated account. Command results normally edit the outgoing command message rather than creating a separate reply.
+## What is Lavis
 
-It is intentionally small: static built-in commands, local state, a reviewed external-module path, and a Nix/NixOS-first Linux workflow. It is not a bot token service, a plugin marketplace, or a remote-code-execution framework.
+Lavis is a personal Telegram userbot built in Rust on top of [grammers](https://github.com/Lonami/grammers).
 
-The command prefix is dynamic. The default is `,`, so examples use `,ping`; after changing it with `,prefix .`, use `.ping` and every other command with `.` instead.
+It works through your Telegram account, handles commands from your own messages, edits the original command message with the result, and supports both built-in commands and external modules.
 
-## Install and authorize
+```text
+,ping
+,stats
+,fastfetch
+,help
+```
 
-Create a Telegram application at [my.telegram.org/apps](https://my.telegram.org/apps) and obtain an API ID and API hash. Then run the canonical Tangled flake:
+The default prefix is `,`, but it can be changed at runtime.
+
+---
+
+## Features
+
+| Feature | Description |
+| --- | --- |
+| ⚡ **Native Rust core** | Async Telegram access directly over MTProto |
+| 🔐 **Local authorization** | Telegram session and API credentials stay local with restrictive permissions |
+| ✏️ **Message editing** | Command output replaces the original outgoing message |
+| 🧩 **External modules** | Language-agnostic modules over a JSON Lines protocol |
+| 📦 **`.lmod` packages** | Reviewed module installation through Saved Messages |
+| 🔌 **Module API v6** | Capability-based events, Telegram RPC adapters and bounded raw MTProto access |
+| 🐧 **NixOS integration** | Flake, package, dev shell and ready-to-use NixOS module |
+| 🔧 **Prefixes and aliases** | Persistent aliases and configurable command prefix |
+| 🤖 **Companion bot** | Optional BotFather-backed companion/workspace setup |
+| 🖥️ **Fastfetch** | Restricted and validated system information output |
+| 🌐 **English / Russian UI** | Persistent interface language and onboarding |
+
+---
+
+## Quick start
+
+### 1. Get Telegram API credentials
+
+Create an application at [my.telegram.org/apps](https://my.telegram.org/apps) and obtain:
+
+- `API ID`;
+- `API hash`.
+
+### 2. Run Lavis
 
 ```bash
 nix run 'git+https://tangled.org/zumuvik.tngl.sh/lavis'
 ```
 
-On first interactive use, Lavis stores API credentials locally and performs Telegram authorization: phone number, login code, and (when enabled) the two-factor password. You can run authorization explicitly with:
+On first interactive launch Lavis stores the API credentials locally and asks for the Telegram phone number, login code and, when enabled, the two-factor password.
+
+Authorization can also be started explicitly:
 
 ```bash
 nix run 'git+https://tangled.org/zumuvik.tngl.sh/lavis' -- auth
 ```
 
-After successful authorization, Lavis sends an invitation to Saved Messages (with a stdout fallback if sending fails). Start the in-Telegram introduction with:
+After authorization, start the Telegram introduction from Saved Messages:
 
 ```text
 ,start
 ```
 
-If no language has been selected, choose one first:
+Choose the interface language explicitly if needed:
 
 ```text
 ,start en
 ,start ru
 ```
 
-The tutorial is sequential and persistent. Send `,start` for the next page, or `,start skip` to skip it. `,language [en|ru]` shows or changes the interface language without resetting aliases, modules, setup state, or tutorial state. A completed tutorial starts again from the beginning when run again.
+> [!IMPORTANT]
+> Never publish your API hash, `credentials.json`, Telegram session database, companion token, XDG state directories, or authorization logs containing secrets.
 
-## Commands
+---
 
-Replace `,` with your configured prefix.
+## Main commands
 
-| Command | Syntax | Purpose |
-| --- | --- | --- |
-| Start | `,start [en\|ru\|skip\|bot]` | Start/continue the tutorial, select its language, skip it, or enter the companion setup flow. |
-| Language | `,language [en\|ru]` | Show or persist the interface language. |
-| Help | `,help [command]` | List commands/modules or show a command, alias, or module card. |
-| Modules | `,modules` | List built-in modules and active external commands. |
-| Ping | `,ping` | Measure a live Telegram RPC latency. |
-| Stats | `,stats` | Show Telegram latency, uptime, host/process information, command count, and package version. |
-| Prefix | `,prefix [new-prefix\|reset]` | Show, set, or reset the command prefix. |
-| Alias | `,alias [list\|add <name> <command> [arguments...]\|show <name>\|del <name>]` | Manage persistent aliases for canonical commands. |
-| Fastfetch | `,fastfetch [--no-profile] [--logo <...>] [--structure <...>] [--separator <text>] [--logo-padding-left <n>] [--logo-padding-right <n>] [--logo-padding-top <n>]` | Run Fastfetch with a restricted, validated argument set. |
-| Setup | `,setup [<username_bot>\|auto\|status\|repair\|cancel]` | Manage companion-bot/workspace setup in Saved Messages. |
-| Modules install | `,lm [list\|info <id>\|logs <id>\|doctor [id]\|install\|confirm <approval-id>\|cancel <approval-id>\|enable <id>\|disable <id>]` | Inspect, install, and control external modules. |
-| Reboot | `,reboot` | Restart the Lavis process from a fresh self-authored message. |
+| Command | Purpose |
+| --- | --- |
+| `start` | Start or continue onboarding |
+| `language` | Show or change the interface language |
+| `help` | Command, alias and module help |
+| `modules` | Built-in and active external modules |
+| `ping` | Live Telegram RPC latency |
+| `stats` | Uptime, latency, process and host statistics |
+| `prefix` | Show, set or reset the command prefix |
+| `alias` | Manage persistent command aliases |
+| `fastfetch` | Validated Fastfetch output |
+| `setup` | Companion bot/workspace setup and repair |
+| `lm` | Install and control external `.lmod` modules |
+| `reboot` | Restart the Lavis process |
 
-Examples:
+<details>
+<summary><b>Command examples</b></summary>
 
 ```text
+,help
 ,help fastfetch
+,modules
+,ping
+,stats
 ,prefix .
 .alias add sys fastfetch --logo arch
 .sys
 .lm list
 ```
 
-## External modules and `.lmod`
+</details>
 
-An external module is a separate executable that communicates with Lavis through a JSON-lines protocol. Modules may be written in any suitable language. Installed modules are disabled by default and do not hot-load; enable or disable changes takes effect after a Lavis restart.
+---
 
-To install an archive through Telegram, attach a `.lmod` file to a **new self-authored message in Saved Messages** and send:
+## External modules
 
-```text
-,lm install
+An external Lavis module is a separate executable communicating with the core through JSON Lines over `stdin` and `stdout`.
+
+Modules can be written in Rust, Go, Python, or any other suitable language. The current Module API v6 supports capability-gated Telegram operations, message events and a bounded raw MTProto escape hatch.
+
+Local module operations:
+
+```bash
+lavis modules validate ./my-module/module.json
+lavis modules enable my-module
+lavis modules disable my-module
+lavis modules status
 ```
 
-Lavis inspects the attachment and shows a plan without running its code. Review it, then confirm its one-time, ten-minute approval identifier:
+### Install a `.lmod` from Telegram
 
-```text
-,lm confirm XXXX-XXXX-XXXX-XXXX
-,lm enable <module-id>
-,reboot
-```
+1. Attach a `.lmod` archive to a **new self-authored message in Saved Messages**.
+2. Send:
 
-`lm list`, `lm info`, `lm logs`, and `lm doctor` provide status and diagnostics. `lm disable <module-id>` disables a module for the next start. Declaratively managed NixOS extensions cannot be enabled or disabled from Telegram.
+   ```text
+   ,lm install
+   ```
 
-External modules run as the Lavis user and are **not placed in a system sandbox**. Install only code you trust. See [External modules](docs/external-modules.md), [`.lmod` packaging](docs/lmod-packaging.md), and the [module API documents](#documentation).
+3. Review the installation plan.
+4. Confirm the one-time approval ID:
 
-## Companion bot and private workspace
+   ```text
+   ,lm confirm XXXX-XXXX-XXXX-XXXX
+   ```
 
-`<prefix>start bot` is a convenience handoff to the existing `setup` flow; it does not silently create anything. It enters the same confirmation-based BotFather conversation and uses the same persistent, idempotent setup state. There is deliberately **no** `start group` command and no standalone group-creation shortcut.
+5. Enable the module and restart Lavis:
 
-The confirmed setup creates or repairs a companion bot and a private Lavis forum workspace: a forum supergroup, General/Logs/Backups topics, the bot invitation, minimal bot rights for topic management/deleting/pinning messages, and a Lavis dialog folder. Optional official-community integration may also be attempted. Existing recorded bot/group resources are recognized and repaired rather than duplicated; interrupted setup can be inspected with `,setup status`, resumed with `,setup repair`, or locally cancelled with `,setup cancel`.
+   ```text
+   ,lm enable <module-id>
+   ,reboot
+   ```
 
-Setup is available only in Saved Messages. BotFather tokens are secret, are kept in a separate private local file, and are never shown in setup status. See [Companion bot setup](docs/companion-bot-setup.md) for the detailed resource and recovery behavior.
+Useful commands include `,lm list`, `,lm info <id>`, `,lm logs <id>` and `,lm doctor [id]`.
 
-## Local data and security
+> [!WARNING]
+> External modules are not placed in a system sandbox and run with the Lavis user's OS permissions. Capability checks constrain core-mediated operations, not arbitrary OS access. Install only code you trust.
 
-Lavis keeps mutable data outside the Nix store under XDG paths:
+See [External modules](docs/external-modules.md), [`.lmod` packaging](docs/lmod-packaging.md), and [Module API v6](docs/module-api-v6.md).
 
-```text
-$XDG_CONFIG_HOME/lavis/       # credentials, companion token, Fastfetch profile
-$XDG_STATE_HOME/lavis/        # MTProto session, settings, aliases, setup/module state
-$XDG_DATA_HOME/lavis/         # installed modules and staging data
-```
+---
 
-When the XDG variables are absent, these resolve below `~/.config`, `~/.local/state`, and `~/.local/share`. Settings, credentials, tokens, and state files use restrictive local permissions. Useful local CLI operations are:
+## Authorization recovery
+
+Lavis locks the local Telegram session and distinguishes recoverable authorization problems from deterministic session corruption.
+
+Useful CLI commands:
 
 ```bash
 lavis credentials
@@ -124,52 +198,46 @@ lavis credentials reset
 lavis auth doctor
 lavis auth reset --backup
 lavis logout
-lavis modules validate ./module.json
-lavis modules enable <id>
-lavis modules disable <id>
-lavis modules status
 ```
 
-`logout` removes the local session; it does not revoke Telegram sessions remotely. Never publish an API hash, session database, companion token, XDG directory contents, approval data, or authorization logs. Fastfetch can expose host information. BotFather messages are kept out of external-module event projection.
+`auth doctor` inspects the local session. `auth reset --backup` replaces a broken session while preserving a backup. `logout` removes only the local session and does not revoke Telegram sessions remotely.
 
-## NixOS service
+---
 
-Add the flake and import its NixOS module:
+## NixOS
+
+Add Lavis to your flake inputs:
 
 ```nix
 {
   inputs.lavis.url = "git+https://tangled.org/zumuvik.tngl.sh/lavis";
+}
+```
 
-  outputs = { self, nixpkgs, lavis, ... }: {
-    nixosConfigurations.host = nixpkgs.lib.nixosSystem {
-      system = "x86_64-linux";
-      modules = [
-        lavis.nixosModules.default
-        ({ ... }: {
-          services.lavis = {
-            enable = true;
-            autoStart = false;
-            credentialsEnvironmentFile = "/run/secrets/lavis.env";
-          };
-        })
-      ];
-    };
+Import the module and enable the service:
+
+```nix
+{
+  imports = [ inputs.lavis.nixosModules.default ];
+
+  services.lavis = {
+    enable = true;
+    autoStart = false;
+    credentialsEnvironmentFile = "/run/secrets/lavis.env";
   };
 }
 ```
 
-The environment file may contain only literal `LAVIS_API_ID=...` and `LAVIS_API_HASH=...` values. By default the module creates a dedicated `lavis` system user with home `/var/lib/lavis`, derives XDG directories under that home, and provides `lavis-auth`.
-
-Apply the configuration, then authorize as the service user through the supplied root-only helper before starting the service:
+By default the module creates the dedicated `lavis` system user with home `/var/lib/lavis`. After applying the configuration, authorize through the supplied helper and start the service:
 
 ```bash
 sudo lavis-auth
 sudo systemctl start lavis.service
 ```
 
-After authorization, set `services.lavis.autoStart = true` if boot startup is desired. The service uses `lavis run`, restarts on ordinary failures, and deliberately does not restart exit status `78`, which means local interactive reauthorization is required.
+After successful authorization, `autoStart` can be enabled.
 
-Available module options include `services.lavis.package`, `user`, `group`, `home`, `autoStart`, `credentialsEnvironmentFile`, `logLevel`, `settings.prefix`, `fastfetchProfile`, and declarative `extensions`. For example:
+Declarative external modules are also supported:
 
 ```nix
 services.lavis.extensions = [
@@ -180,7 +248,23 @@ services.lavis.extensions = [
 ];
 ```
 
-Read [NixOS module](docs/nixos-module.md) for service recovery and declarative extension details.
+See [NixOS module](docs/nixos-module.md) for service, recovery and declarative extension details.
+
+---
+
+## Local data
+
+Lavis keeps mutable data outside the Nix store under XDG paths:
+
+```text
+$XDG_CONFIG_HOME/lavis/       # credentials, companion token, Fastfetch profile
+$XDG_STATE_HOME/lavis/        # MTProto session, settings, aliases and runtime state
+$XDG_DATA_HOME/lavis/         # installed modules and staging data
+```
+
+Without explicit XDG variables these resolve under `~/.config`, `~/.local/state` and `~/.local/share`.
+
+---
 
 ## Development
 
@@ -191,34 +275,59 @@ nix develop
 cargo run
 ```
 
-Run the local checks:
+Project checks:
 
 ```bash
 cargo fmt --check
 cargo check --all-targets --all-features
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
-nix flake check
-nix build
+nix flake check --print-build-logs
+nix build --print-build-logs
 ```
+
+---
 
 ## Documentation
 
 | Document | Scope |
 | --- | --- |
-| [Companion bot setup](docs/companion-bot-setup.md) | BotFather flow, workspace resources, recovery, and limits. |
-| [NixOS module](docs/nixos-module.md) | Service, authorization, credentials, and declarative extensions. |
-| [External modules](docs/external-modules.md) | Module lifecycle and operational model. |
-| [`.lmod` packaging](docs/lmod-packaging.md) | Archive packaging and validation. |
-| [Module API v1](docs/module-api-v1.md), [v2](docs/module-api-v2.md), [v3](docs/module-api-v3.md), [v4](docs/module-api-v4.md), [v5](docs/module-api-v5.md), [v6](docs/module-api-v6.md) | Protocol and capability evolution. |
-| [Contributing](CONTRIBUTING.md) | Development contribution guidance. |
+| [Companion bot setup](docs/companion-bot-setup.md) | BotFather flow, workspace resources and recovery |
+| [External modules](docs/external-modules.md) | External module lifecycle and runtime model |
+| [`.lmod` packaging](docs/lmod-packaging.md) | Packaging and validation rules |
+| [Module API v1](docs/module-api-v1.md) | Early module metadata/API |
+| [Module API v2](docs/module-api-v2.md) / [v3](docs/module-api-v3.md) | Manifest and event protocol evolution |
+| [Module API v4](docs/module-api-v4.md) | Message edits and reaction sets |
+| [Module API v5](docs/module-api-v5.md) | Telegram account-status gateway |
+| [Module API v6](docs/module-api-v6.md) | Capability-based Telegram RPC and raw MTProto boundary |
+| [NixOS module](docs/nixos-module.md) | Declarative service configuration |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Development and contribution guide |
 
-## Status and disclaimer
+---
 
-Lavis is alpha software. Its command behavior, module APIs, `.lmod` format, persistence schema, and Nix interfaces may change incompatibly.
+## Security
 
-Lavis is an unofficial Telegram client. Userbot use can lead to account restrictions or loss. You are responsible for your Telegram account, credentials, installed modules, compliance with Telegram rules and applicable law. The software is provided without warranty.
+Lavis has access to the authenticated Telegram session.
+
+- do not run untrusted Lavis builds;
+- do not install unknown external modules;
+- do not publish API credentials or session files;
+- do not share Lavis XDG directories;
+- prefer `RUST_LOG=lavis=debug` over globally enabling dependency debug logs;
+- remember that Fastfetch may expose host information.
+
+---
+
+## Project status
+
+Lavis is under active development and is currently **alpha software**. Module APIs, `.lmod` format, persistence schema, commands and Nix interfaces may change incompatibly.
+
+Lavis is an unofficial Telegram client. Userbot usage may lead to account restrictions or loss. You are responsible for your Telegram account, installed modules, credentials and compliance with Telegram rules and applicable law.
+
+---
 
 ## License
 
-Copyright © 2026 zumuvik. Lavis is licensed under [GNU GPL-3.0-only](LICENSE).
+Copyright © 2026 zumuvik.
+
+Lavis is licensed under [GNU GPL-3.0-only](LICENSE).
