@@ -214,6 +214,23 @@ lavis logout
 }
 ```
 
+### Бинарный кеш
+
+Lavis публикует Nix-сборки в Cachix. Добавьте кеш декларативно, чтобы Nix скачивал готовые сборки Lavis вместо локальной компиляции:
+
+```nix
+{
+  nix.settings = {
+    extra-substituters = [ "https://lavis.cachix.org" ];
+    extra-trusted-public-keys = [
+      "lavis.cachix.org-1:EXJoSAQxNZb8j/p/2DrBBLmOXHP0VemCUZ5FdifeHbg="
+    ];
+  };
+}
+```
+
+После этого примените конфигурацию NixOS обычным rebuild. Если нужный output Lavis уже есть в кеше, Nix скачает его с `lavis.cachix.org` вместо сборки из исходников.
+
 Импортируйте модуль и включите сервис:
 
 ```nix
