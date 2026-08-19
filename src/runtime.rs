@@ -369,8 +369,6 @@ impl RuntimeState {
         if !expired {
             return None;
         }
-        // Only the ephemeral conversation ends. Persisted bot data remains
-        // available to the repair path.
         setup.phase = SetupPhase::Idle;
         Some(Response::plain(setup_text(locale, SetupText::TimedOut)))
     }
@@ -603,7 +601,6 @@ impl RuntimeState {
         true
     }
 
-    /// Claims the one Saved Messages fallback allowed for a setup input source.
     pub fn claim_setup_edit_fallback(&mut self, peer_id: PeerId, message_id: i32) -> bool {
         if self
             .setup_edit_fallback_sources
@@ -640,8 +637,6 @@ impl RuntimeState {
         })
     }
 
-    /// Resolve a dotted external command `module-id.command-name`.
-    /// Uses the pre-computed set for sync routing.
     pub fn resolve_external(&self, name: &str, args: &str) -> Option<Action> {
         if !self.has_active_external_command(name) {
             return None;
@@ -942,8 +937,6 @@ impl RuntimeState {
             StartRequest::Bot => {
                 return self.execute_setup(client, &SetupRequest::Start, peer).await;
             }
-            // Repair is the existing idempotent provisioning path. It verifies the
-            // stored bot/token before creating or repairing the private group.
             StartRequest::Invalid => {
                 return Response::plain_with_locale(
                     self.locale(),
@@ -1012,8 +1005,6 @@ impl RuntimeState {
             progress.message(locale, self.prefix()),
             text(locale, Text::StartUsage).replace("{prefix}", self.prefix())
         );
-        // Keep the rendered page as the durable cursor. This makes a failed
-        // delivery retry the same page rather than silently skipping it.
         match self.settings.set_onboarding(progress).await {
             Ok(()) => RuntimeExecution {
                 response: Response::plain_with_locale(self.locale(), response),
@@ -1206,10 +1197,6 @@ impl RuntimeState {
         }
     }
 
-    /// Health checklist over the module runtime: per-module state, process
-    /// status, and the last retained crash diagnostic (including failures that
-    /// happened before the process left the running index). With an ID the
-    /// report is narrowed to one module; without one it covers all modules.
     async fn lm_doctor(&self, id: Option<&str>) -> Response {
         let Some(config) = &self.module_control else {
             return Response::plain_with_locale(
@@ -1686,9 +1673,6 @@ impl RuntimeState {
             .into();
         }
         let execution = setup.handle_command(client, request, locale).await;
-        // Starting setup resolves BotFather as part of the confirmed flow. That
-        // authoritative peer is also sufficient to re-open external projection
-        // after a startup resolution failure.
         if setup.botfather_peer.is_some() {
             self.external_projection_permitted = true;
         }
@@ -3079,9 +3063,6 @@ mod tests {
             PeerId::user(1).unwrap(),
         );
         assert!(!runtime.external_projection_permitted_for_tests());
-        // This is representative BotFather token-shaped text. The gate is set
-        // before external modules are attached, so a restarted process cannot
-        // project it while authoritative peer resolution is unavailable.
         assert!(
             runtime
                 .prepare_message_event_dispatch(
@@ -3112,7 +3093,6 @@ mod tests {
         ));
         fs::create_dir_all(&directory).unwrap();
 
-        // One valid installed module (disabled) with an executable entrypoint.
         let module_dir = directory.join("sample");
         fs::create_dir_all(&module_dir).unwrap();
         fs::write(
@@ -3261,7 +3241,7 @@ mod tests {
             .expect("fixture tests require python3 in PATH");
         let entrypoint = module_dir.join("run");
         let script = format!(
-            "#!{}\nimport json, sys, time\nframe = json.loads(sys.stdin.readline())\nprint(json.dumps({{'protocol_version':6,'type':'initialized','request_id':frame['request_id'],'module_id':'sample'}}), flush=True)\nframe = json.loads(sys.stdin.readline())\nprint(json.dumps({{'protocol_version':6,'type':'health','request_id':frame['request_id']}}), flush=True)\ntime.sleep(0.4)\nsys.exit(7)\n",
+            "#!{}\nimport json, os, sys, time\nframe = json.loads(sys.stdin.readline())\nprint(json.dumps({{'protocol_version':6,'type':'initialized','request_id':frame['request_id'],'module_id':'sample'}}), flush=True)\nframe = json.loads(sys.stdin.readline())\nprint(json.dumps({{'protocol_version':6,'type':'health','request_id':frame['request_id']}}), flush=True)\ncrash_signal = os.path.join(os.path.dirname(__file__), 'crash')\nwhile not os.path.exists(crash_signal):\n    time.sleep(0.01)\nsys.exit(7)\n",
             python.display()
         );
         fs::write(&entrypoint, script).unwrap();
@@ -3302,6 +3282,7 @@ mod tests {
             crate::external_modules::manager::ExternalModuleRuntimeStatus::Running,
             "the cached routing snapshot intentionally predates the crash"
         );
+        fs::write(module_dir.join("crash"), b"").unwrap();
         for _ in 0..200 {
             if handle
                 .snapshot()
