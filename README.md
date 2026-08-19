@@ -214,6 +214,23 @@ Add Lavis to your flake inputs:
 }
 ```
 
+### Binary cache
+
+Lavis publishes Nix build outputs to Cachix. Add the cache declaratively so Nix can download prebuilt Lavis packages instead of compiling them locally:
+
+```nix
+{
+  nix.settings = {
+    extra-substituters = [ "https://lavis.cachix.org" ];
+    extra-trusted-public-keys = [
+      "lavis.cachix.org-1:EXJoSAQxNZb8j/p/2DrBBLmOXHP0VemCUZ5FdifeHbg="
+    ];
+  };
+}
+```
+
+Then rebuild your NixOS configuration normally. Future Lavis outputs that are available in the cache will be substituted from `lavis.cachix.org` instead of being built locally.
+
 Import the module and enable the service:
 
 ```nix
