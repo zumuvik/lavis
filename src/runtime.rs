@@ -2829,11 +2829,11 @@ fn format_stats(
 #[cfg(test)]
 mod tests {
     use super::{
-        ProcStats, SensitiveCommandDenial, SensitiveCommandPolicy, authorize_sensitive_message,
-        bounded_list, external_event_error_category, fastfetch_response, format_duration,
-        format_info, format_latency, format_stats, lm_usage, missing_descriptor_response,
-        parse_memory_kib, parse_system_uptime, render_install_plan, setup_status_label,
-        setup_status_response,
+        LAVIS_SOURCE_URL, ProcStats, SensitiveCommandDenial, SensitiveCommandPolicy,
+        authorize_sensitive_message, bounded_list, external_event_error_category,
+        fastfetch_response, format_duration, format_info, format_latency, format_stats, lm_usage,
+        missing_descriptor_response, parse_memory_kib, parse_system_uptime, render_install_plan,
+        setup_status_label, setup_status_response,
     };
     use crate::response::Response;
     use crate::{

@@ -287,18 +287,12 @@ pub fn command_description(kind: CommandKind, locale: Locale) -> &'static str {
         (CommandKind::Stats, Locale::Russian) => {
             "Показывает задержку Telegram, время работы Lavis и хоста, память, число команд и версию пакета."
         }
-        (CommandKind::Info, Locale::English) => concat!(
-            "Lavis — really your userbot.\n\n",
-            "Version: ",
-            env!("CARGO_PKG_VERSION"),
-            "\nMTProto: grammers\nModule API: v6\nSource: https://tangled.org/zumuvik.tngl.sh/lavis"
-        ),
-        (CommandKind::Info, Locale::Russian) => concat!(
-            "Lavis — really your userbot.\n\n",
-            "Версия: ",
-            env!("CARGO_PKG_VERSION"),
-            "\nMTProto: grammers\nAPI модулей: v6\nИсходники: https://tangled.org/zumuvik.tngl.sh/lavis"
-        ),
+        (CommandKind::Info, Locale::English) => {
+            "Shows Lavis version, module API, active prefix, module counts, and source repository."
+        }
+        (CommandKind::Info, Locale::Russian) => {
+            "Показывает версию Lavis, API модулей, текущий префикс, количество модулей и репозиторий исходников."
+        }
         (CommandKind::Fastfetch, Locale::English) => {
             "Runs Fastfetch only with restricted safe display options."
         }

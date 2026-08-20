@@ -1003,7 +1003,7 @@ mod tests {
         assert!(
             response
                 .text
-                .starts_with("🛠 Справка Lavis: 3 модулей, 12 команд")
+                .starts_with("🛠 Справка Lavis: 3 модулей, 13 команд")
         );
         assert!(response.text.find("🧩 core").unwrap() < response.text.find("🖥 system").unwrap());
         assert!(response.text.contains("🦀fastfetch"));
@@ -1047,7 +1047,7 @@ mod tests {
         assert!(
             response
                 .text
-                .starts_with("🛠 Lavis help: 4 modules, 14 commands")
+                .starts_with("🛠 Lavis help: 4 modules, 15 commands")
         );
         assert!(response.text.contains("!fastfetch"));
         assert!(response.text.contains("🔗 Aliases: !core"));
@@ -1093,12 +1093,12 @@ mod tests {
         assert!(
             english
                 .text
-                .starts_with("🛠 Lavis help: 4 modules, 14 commands")
+                .starts_with("🛠 Lavis help: 4 modules, 15 commands")
         );
         assert!(
             russian
                 .text
-                .starts_with("🛠 Справка Lavis: 4 модулей, 14 команд")
+                .starts_with("🛠 Справка Lavis: 4 модулей, 15 команд")
         );
         assert!(english.text.contains("🔗 Aliases: !core"));
         assert!(russian.text.contains("🔗 Псевдонимы: !core"));
@@ -1351,7 +1351,7 @@ mod tests {
     async fn modules_overview_matches_help_registry_counts() {
         let rendered = render_modules_overview(".");
         assert!(rendered.response.text.contains("Модули: "));
-        assert!(rendered.response.text.contains("Команды (12)"));
+        assert!(rendered.response.text.contains("Команды (13)"));
         assert!(rendered.response.text.contains(".modules"));
         assert_eq!(rendered.response.entities.len(), 2);
         let grammers_client::tl::enums::MessageEntity::Blockquote(primary) =
