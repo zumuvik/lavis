@@ -8,6 +8,7 @@ pub enum CommandKind {
     Language,
     Ping,
     Stats,
+    Info,
     Help,
     Fastfetch,
     Alias,
@@ -40,7 +41,7 @@ pub struct CommandDefinition {
     pub module: ModuleId,
 }
 
-const COMMAND_SPECS: [CommandDefinition; 12] = [
+const COMMAND_SPECS: [CommandDefinition; 13] = [
     CommandDefinition {
         kind: CommandKind::Start,
         name: "start",
@@ -160,6 +161,16 @@ const COMMAND_SPECS: [CommandDefinition; 12] = [
         module: ModuleId::Core,
     },
     CommandDefinition {
+        kind: CommandKind::Info,
+        name: "info",
+        usage: "info",
+        examples: &["info"],
+        risk: CommandRisk::ReadOnly,
+        icon: "ℹ️",
+        aliasable: true,
+        module: ModuleId::Core,
+    },
+    CommandDefinition {
         kind: CommandKind::Fastfetch,
         name: "fastfetch",
         usage: "fastfetch [--no-profile] [--logo <...>] [--structure <...>] [--separator <text>] [--logo-padding-left <n>] [--logo-padding-right <n>] [--logo-padding-top <n>]",
@@ -195,6 +206,8 @@ pub fn command_summary(kind: CommandKind, locale: Locale) -> &'static str {
         (CommandKind::Ping, Locale::Russian) => "Измерить задержку Telegram",
         (CommandKind::Stats, Locale::English) => "Show runtime statistics",
         (CommandKind::Stats, Locale::Russian) => "Показать статистику работы",
+        (CommandKind::Info, Locale::English) => "Show Lavis project information",
+        (CommandKind::Info, Locale::Russian) => "Показать информацию о Lavis",
         (CommandKind::Help, Locale::English) => "Show command help",
         (CommandKind::Help, Locale::Russian) => "Показать справку",
         (CommandKind::Fastfetch, Locale::English) => "Show safe system information",
@@ -274,6 +287,18 @@ pub fn command_description(kind: CommandKind, locale: Locale) -> &'static str {
         (CommandKind::Stats, Locale::Russian) => {
             "Показывает задержку Telegram, время работы Lavis и хоста, память, число команд и версию пакета."
         }
+        (CommandKind::Info, Locale::English) => concat!(
+            "Lavis — really your userbot.\n\n",
+            "Version: ",
+            env!("CARGO_PKG_VERSION"),
+            "\nMTProto: grammers\nModule API: v6\nSource: https://tangled.org/zumuvik.tngl.sh/lavis"
+        ),
+        (CommandKind::Info, Locale::Russian) => concat!(
+            "Lavis — really your userbot.\n\n",
+            "Версия: ",
+            env!("CARGO_PKG_VERSION"),
+            "\nMTProto: grammers\nAPI модулей: v6\nИсходники: https://tangled.org/zumuvik.tngl.sh/lavis"
+        ),
         (CommandKind::Fastfetch, Locale::English) => {
             "Runs Fastfetch only with restricted safe display options."
         }
@@ -398,6 +423,10 @@ pub fn dispatch(command: &Command) -> Option<Action> {
         CommandKind::Language => Some(Action::Language(parse_language_request(&command.args))),
         CommandKind::Ping => Some(Action::Ping),
         CommandKind::Stats => Some(Action::Stats),
+        CommandKind::Info if command.args.trim().is_empty() => {
+            Some(Action::Help(HelpRequest::Topic("info".to_owned())))
+        }
+        CommandKind::Info => None,
         CommandKind::Help => Some(Action::Help(parse_help_request(&command.args))),
         CommandKind::Fastfetch => Some(Action::Fastfetch(command.args.clone())),
         CommandKind::Alias => Some(Action::Alias(parse_alias_request(&command.args))),
@@ -444,12 +473,11 @@ fn parse_start_request(args: &str) -> StartRequest {
         return StartRequest::Invalid;
     }
     match word.to_ascii_lowercase().as_str() {
-        "skip" => StartRequest::Skip,
-        "bot" => StartRequest::Bot,
-        _ => crate::i18n::Locale::parse(word)
-            .map(StartRequest::Locale)
-            .unwrap_or(StartRequest::Invalid),
+        "skip" => Some(StartRequest::Skip),
+        "bot" => Some(StartRequest::Bot),
+        _ => crate::i18n::Locale::parse(word).map(StartRequest::Locale),
     }
+    .unwrap_or(StartRequest::Invalid)
 }
 fn parse_language_request(args: &str) -> LanguageRequest {
     let mut words = args.split_whitespace();
@@ -675,6 +703,26 @@ mod tests {
     }
 
     #[test]
+    fn dispatches_info_to_its_project_card() {
+        let command = Command {
+            name: "info".to_owned(),
+            args: String::new(),
+        };
+
+        assert_eq!(
+            dispatch(&command),
+            Some(Action::Help(HelpRequest::Topic("info".to_owned())))
+        );
+        assert_eq!(
+            dispatch(&Command {
+                name: "info".to_owned(),
+                args: "extra".to_owned(),
+            }),
+            None
+        );
+    }
+
+    #[test]
     fn dispatches_start_and_language_with_exact_arguments() {
         assert_eq!(
             dispatch(&Command {
@@ -752,7 +800,7 @@ mod tests {
     #[test]
     fn dispatches_invalid_help_requests() {
         let unknown = Command {
-            name: "help".to_owned(),
+            name: "unknown".to_owned(),
             args: "missing".to_owned(),
         };
         let invalid = Command {
@@ -760,10 +808,7 @@ mod tests {
             args: "ping extra".to_owned(),
         };
 
-        assert_eq!(
-            dispatch(&unknown),
-            Some(Action::Help(HelpRequest::Topic("missing".to_owned())))
-        );
+        assert_eq!(dispatch(&unknown), None);
         assert_eq!(dispatch(&invalid), Some(Action::Help(HelpRequest::Invalid)));
     }
 
@@ -786,6 +831,7 @@ mod tests {
                 "setup",
                 "lm",
                 "stats",
+                "info",
                 "fastfetch",
                 "alias"
             ]
@@ -865,7 +911,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "start", "language", "help", "reboot", "modules", "ping", "prefix", "setup", "lm",
-                "stats"
+                "stats", "info"
             ]
         );
         assert_eq!(
@@ -945,6 +991,7 @@ mod tests {
             CommandKind::Modules,
             CommandKind::Ping,
             CommandKind::Stats,
+            CommandKind::Info,
         ] {
             assert_eq!(command_by_kind(kind).unwrap().risk, CommandRisk::ReadOnly);
         }
