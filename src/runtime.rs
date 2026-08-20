@@ -2785,15 +2785,15 @@ fn format_duration(duration: Duration) -> String {
 
 const LAVIS_SOURCE_URL: &str = "https://tangled.org/zumuvik.tngl.sh/lavis";
 
-fn format_info(locale: Locale, prefix: &str, external_modules: usize) -> String {
+fn format_info(locale: Locale, prefix: &str, installed_external_modules: usize) -> String {
     let built_in_modules = crate::modules::modules().len();
     match locale {
         Locale::English => format!(
-            "ℹ️ Lavis — really your userbot\n\nVersion: {}\nMTProto: grammers\nModule API: v6\nPrefix: {prefix}\nBuilt-in modules: {built_in_modules}\nExternal modules: {external_modules}\nSource: {LAVIS_SOURCE_URL}",
+            "ℹ️ Lavis — really your userbot\n\nVersion: {}\nMTProto: grammers\nModule API: v6\nPrefix: {prefix}\nBuilt-in modules: {built_in_modules}\nInstalled external modules: {installed_external_modules}\nSource: {LAVIS_SOURCE_URL}",
             env!("CARGO_PKG_VERSION")
         ),
         Locale::Russian => format!(
-            "ℹ️ Lavis — really your userbot\n\nВерсия: {}\nMTProto: grammers\nAPI модулей: v6\nПрефикс: {prefix}\nВстроенные модули: {built_in_modules}\nВнешние модули: {external_modules}\nИсходники: {LAVIS_SOURCE_URL}",
+            "ℹ️ Lavis — really your userbot\n\nВерсия: {}\nMTProto: grammers\nAPI модулей: v6\nПрефикс: {prefix}\nВстроенные модули: {built_in_modules}\nУстановленные внешние модули: {installed_external_modules}\nИсходники: {LAVIS_SOURCE_URL}",
             env!("CARGO_PKG_VERSION")
         ),
     }
@@ -3695,9 +3695,14 @@ mod tests {
             .await;
         let overview =
             runtime.execute_modules(&crate::commands::ModulesRequest::Overview, runtime.prefix());
-        assert!(overview.text.starts_with("🧩 Модули Lavis: 3\n\n"));
+        let heading = format!("🧩 Модули Lavis: {}\n\n", crate::modules::modules().len());
+        assert!(overview.text.starts_with(&heading));
         assert!(overview.text.contains("🦀fastfetch"));
-        assert!(overview.text.contains("Команды (13)"));
+        assert!(
+            overview
+                .text
+                .contains(&format!("Команды ({})", crate::commands::commands().len()))
+        );
         assert_eq!(overview.entities.len(), 2);
         assert_eq!(
             runtime.execute_modules(&crate::commands::ModulesRequest::Invalid, runtime.prefix(),),
@@ -3710,12 +3715,9 @@ mod tests {
         let units = overview.text.encode_utf16().collect::<Vec<_>>();
         let offset = usize::try_from(entity.offset).unwrap();
         let length = usize::try_from(entity.length).unwrap();
-        assert_eq!(
-            String::from_utf16(&units[..offset]).unwrap(),
-            "🧩 Модули Lavis: 3\n\n"
-        );
+        assert_eq!(String::from_utf16(&units[..offset]).unwrap(), heading);
         let body = String::from_utf16(&units[offset..offset + length]).unwrap();
-        assert!(body.contains("Команды (13)"));
+        assert!(body.contains(&format!("Команды ({})", crate::commands::commands().len())));
         let grammers_client::tl::enums::MessageEntity::Blockquote(provenance) =
             &overview.entities[1]
         else {
@@ -3738,8 +3740,13 @@ mod tests {
             .unwrap();
         let english =
             runtime.execute_modules(&crate::commands::ModulesRequest::Overview, runtime.prefix());
-        assert!(english.text.starts_with("🧩 Lavis modules: 3\n\n"));
-        assert!(english.text.contains("Commands (13)"));
+        let english_heading = format!("🧩 Lavis modules: {}\n\n", crate::modules::modules().len());
+        assert!(english.text.starts_with(&english_heading));
+        assert!(
+            english
+                .text
+                .contains(&format!("Commands ({})", crate::commands::commands().len()))
+        );
         assert!(!english.text.contains("Модули"));
         assert_eq!(
             runtime.execute_modules(&crate::commands::ModulesRequest::Invalid, runtime.prefix(),),
@@ -4341,14 +4348,15 @@ for line in sys.stdin:
 
     #[test]
     fn formats_info_as_project_identity_without_runtime_stats() {
+        let built_in_modules = crate::modules::modules().len();
         let english = format_info(Locale::English, "🦀", 2);
         assert!(english.starts_with("ℹ️ Lavis — really your userbot"));
         assert!(english.contains("Version: 0.1.0"));
         assert!(english.contains("MTProto: grammers"));
         assert!(english.contains("Module API: v6"));
         assert!(english.contains("Prefix: 🦀"));
-        assert!(english.contains("Built-in modules: 3"));
-        assert!(english.contains("External modules: 2"));
+        assert!(english.contains(&format!("Built-in modules: {built_in_modules}")));
+        assert!(english.contains("Installed external modules: 2"));
         assert!(english.contains(LAVIS_SOURCE_URL));
         assert!(!english.contains("Telegram:"));
         assert!(!english.contains("uptime"));
@@ -4357,8 +4365,8 @@ for line in sys.stdin:
         assert!(russian.contains("Версия: 0.1.0"));
         assert!(russian.contains("API модулей: v6"));
         assert!(russian.contains("Префикс: ,"));
-        assert!(russian.contains("Встроенные модули: 3"));
-        assert!(russian.contains("Внешние модули: 0"));
+        assert!(russian.contains(&format!("Встроенные модули: {built_in_modules}")));
+        assert!(russian.contains("Установленные внешние модули: 0"));
         assert!(russian.contains(LAVIS_SOURCE_URL));
     }
 
