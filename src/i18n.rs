@@ -791,6 +791,53 @@ pub fn render_stats_text(
         .replace("{version}", version)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InfoText {
+    Caption,
+    Unknown,
+    Unavailable,
+}
+
+pub fn info_text(locale: Locale, key: InfoText) -> &'static str {
+    match (locale, key) {
+        (Locale::English, InfoText::Caption) => {
+            "ℹ️ Lavis — really your userbot\n\nOwner: {owner}\nVersion: {version}\nCurrent commit: {commit}\nUpstream main: {upstream}\nPrefix: {prefix}\nModules: {active}/{total}\nHost: {host}\nOS: {os}"
+        }
+        (Locale::Russian, InfoText::Caption) => {
+            "ℹ️ Lavis — really your userbot\n\nВладелец: {owner}\nВерсия: {version}\nТекущий коммит: {commit}\nОсновная ветка: {upstream}\nПрефикс: {prefix}\nМодули: {active}/{total}\nХост: {host}\nОС: {os}"
+        }
+        (Locale::English, InfoText::Unknown) => "unknown",
+        (Locale::Russian, InfoText::Unknown) => "неизвестно",
+        (Locale::English, InfoText::Unavailable) => "unavailable",
+        (Locale::Russian, InfoText::Unavailable) => "недоступно",
+    }
+}
+
+pub struct InfoCaptionData<'a> {
+    pub owner: &'a str,
+    pub version: &'a str,
+    pub commit: &'a str,
+    pub upstream: &'a str,
+    pub prefix: &'a str,
+    pub active_modules: usize,
+    pub total_modules: usize,
+    pub host: &'a str,
+    pub os: &'a str,
+}
+
+pub fn render_info_text(locale: Locale, info: InfoCaptionData<'_>) -> String {
+    info_text(locale, InfoText::Caption)
+        .replace("{owner}", info.owner)
+        .replace("{version}", info.version)
+        .replace("{commit}", info.commit)
+        .replace("{upstream}", info.upstream)
+        .replace("{prefix}", info.prefix)
+        .replace("{active}", &info.active_modules.to_string())
+        .replace("{total}", &info.total_modules.to_string())
+        .replace("{host}", info.host)
+        .replace("{os}", info.os)
+}
+
 /// Lavis-owned framing for an external command result. Module-provided text is
 /// deliberately not catalogued or translated.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1476,9 +1523,9 @@ pub fn bilingual(key: Text, prefix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExternalCommandText, LmInstallPlanText, LmText, Locale, RebootText, Text,
-        external_command_text, lm_format, lm_runtime_status, lm_text, reboot_text,
-        render_lm_install_plan, text,
+        ExternalCommandText, InfoCaptionData, InfoText, LmInstallPlanText, LmText, Locale,
+        RebootText, Text, external_command_text, info_text, lm_format, lm_runtime_status, lm_text,
+        reboot_text, render_info_text, render_lm_install_plan, text,
     };
     use crate::external_modules::manager::ExternalModuleRuntimeStatus;
 
@@ -1671,6 +1718,64 @@ mod tests {
                 ExternalModuleRuntimeStatus::InstalledDisabled
             ),
             "установлен, выключен"
+        );
+    }
+
+    #[test]
+    fn info_caption_is_localized_without_hardcoded_counts() {
+        let english = render_info_text(
+            Locale::English,
+            InfoCaptionData {
+                owner: "@owner",
+                version: "0.1.0",
+                commit: "b1d18f8",
+                upstream: "unavailable",
+                prefix: ",",
+                active_modules: 3,
+                total_modules: 5,
+                host: "standalone",
+                os: "NixOS 25.05",
+            },
+        );
+        assert!(english.contains("Owner: @owner"));
+        assert!(english.contains("Version: 0.1.0"));
+        assert!(english.contains("Current commit: b1d18f8"));
+        assert!(english.contains("Upstream main: unavailable"));
+        assert!(english.contains("Prefix: ,"));
+        assert!(english.contains("Modules: 3/5"));
+        assert!(english.contains("Host: standalone"));
+        assert!(english.contains("OS: NixOS 25.05"));
+        assert!(!contains_cyrillic(&english));
+
+        let russian = render_info_text(
+            Locale::Russian,
+            InfoCaptionData {
+                owner: "@owner",
+                version: "0.1.0",
+                commit: "b1d18f8",
+                upstream: "недоступно",
+                prefix: ",",
+                active_modules: 3,
+                total_modules: 5,
+                host: "standalone",
+                os: "NixOS 25.05",
+            },
+        );
+        assert!(russian.contains("Владелец: @owner"));
+        assert!(russian.contains("Версия: 0.1.0"));
+        assert!(russian.contains("Основная ветка: недоступно"));
+        assert!(russian.contains("Модули: 3/5"));
+    }
+
+    #[test]
+    fn info_unavailable_string_is_localized() {
+        assert_eq!(
+            info_text(Locale::English, InfoText::Unavailable),
+            "unavailable"
+        );
+        assert_eq!(
+            info_text(Locale::Russian, InfoText::Unavailable),
+            "недоступно"
         );
     }
 }

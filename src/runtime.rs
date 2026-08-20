@@ -11,6 +11,7 @@ use grammers_session::types::PeerId;
 
 use crate::{
     aliases::{Alias, AliasStore, DeleteResult},
+    auth::SelfIdentity,
     bot_api::{BotApi, HttpBotApi},
     command::Command,
     commands::{
@@ -34,7 +35,7 @@ use crate::{
     },
     external_modules::{
         control,
-        manager::{ExternalManagerHandle, ExternalRuntimeSnapshot},
+        manager::{ExternalManagerHandle, ExternalModuleRuntimeStatus, ExternalRuntimeSnapshot},
         state::ExternalStateStore,
     },
     fastfetch::{self, FastfetchInputError, FastfetchProfileError, FastfetchResult},
@@ -43,20 +44,23 @@ use crate::{
         render_with_external_locale,
     },
     i18n::{
-        AliasText, ExternalCommandText, FastfetchText, LmInfoResponse, LmInstallPlanText, LmLabel,
-        LmText, Locale, PingText, PrefixText, RuntimeText, SensitiveText, SetupText, StatsText,
-        Text, alias_text, external_command_text, fastfetch_text, inspection_warning_text,
-        lm_format, lm_label, lm_runtime_status, lm_state_text, lm_text, ping_text, prefix_text,
-        render_lm_doctor_missing_catalog, render_lm_doctor_module, render_lm_doctor_report,
-        render_lm_info, render_lm_install_plan, render_stats_text, runtime_text, sensitive_text,
-        setup_text, stats_text, text,
+        AliasText, ExternalCommandText, FastfetchText, InfoCaptionData, InfoText, LmInfoResponse,
+        LmInstallPlanText, LmLabel, LmText, Locale, PingText, PrefixText, RuntimeText,
+        SensitiveText, SetupText, StatsText, Text, alias_text, external_command_text,
+        fastfetch_text, info_text, inspection_warning_text, lm_format, lm_label, lm_runtime_status,
+        lm_state_text, lm_text, ping_text, prefix_text, render_lm_doctor_missing_catalog,
+        render_lm_doctor_module, render_lm_doctor_report, render_lm_info, render_lm_install_plan,
+        render_info_text, render_stats_text, runtime_text, sensitive_text, setup_text, stats_text,
+        text,
     },
+    info,
     onboarding::OnboardingProgress,
     response::{Response, sanitize_external_output},
     settings::{DEFAULT_PREFIX, SettingsStore},
     setup::{self, UsernameCandidate},
     setup_store::SetupStore,
     setup_telegram::{BotFatherProgress, CompanionSetup, GrammersTelegramSetup, ProvisionRequest},
+    upstream::UpstreamRev,
 };
 
 pub struct RuntimeState {
@@ -65,6 +69,9 @@ pub struct RuntimeState {
     aliases: AliasStore,
     settings: SettingsStore,
     fastfetch_profile_path: PathBuf,
+    self_identity: Option<SelfIdentity>,
+    upstream: Option<Box<dyn UpstreamRev>>,
+    upstream_main_rev_cache: Option<(Instant, String)>,
     external_manager: Option<ExternalManagerHandle>,
     external_snapshot: ExternalRuntimeSnapshot,
     expected_self_edits: VecDeque<ExpectedSelfEdit>,
@@ -225,6 +232,10 @@ pub(crate) struct RuntimeExecution {
     pub shutdown: Option<ShutdownReason>,
     pub post_edit: Option<PostEditAction>,
     pub onboarding_page: bool,
+    /// Static media to deliver alongside `response` instead of editing the
+    /// command message. Only `info` sets this today; when present, the update
+    /// layer sends the media and falls back to a text edit on failure.
+    pub media: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,6 +264,7 @@ impl From<Response> for RuntimeExecution {
             shutdown: None,
             post_edit: None,
             onboarding_page: false,
+            media: None,
         }
     }
 }
@@ -286,6 +298,9 @@ impl RuntimeState {
             aliases,
             settings,
             fastfetch_profile_path,
+            self_identity: None,
+            upstream: None,
+            upstream_main_rev_cache: None,
             external_manager: None,
             external_snapshot: ExternalRuntimeSnapshot::new(),
             expected_self_edits: VecDeque::new(),
@@ -462,6 +477,67 @@ impl RuntimeState {
 
     pub fn external_manager(&self) -> Option<&ExternalManagerHandle> {
         self.external_manager.as_ref()
+    }
+
+    /// Stores the identity captured during authorization so `info` can render
+    /// the owner without a per-invocation Telegram RPC.
+    pub fn set_self_identity(&mut self, identity: SelfIdentity) {
+        self.self_identity = Some(identity);
+    }
+
+    pub fn self_identity(&self) -> Option<&SelfIdentity> {
+        self.self_identity.as_ref()
+    }
+
+    /// Injects the upstream revision resolver. Tests use a fake; production
+    /// calls `set_http_upstream` once at startup.
+    pub fn set_upstream(&mut self, upstream: Box<dyn UpstreamRev>) {
+        self.upstream = Some(upstream);
+    }
+
+    pub fn set_http_upstream(&mut self) {
+        match crate::upstream::HttpUpstreamRev::new() {
+            Ok(client) => self.upstream = Some(Box::new(client)),
+            Err(error) => tracing::warn!(
+                event = "upstream_client_unavailable",
+                ?error,
+                "Upstream revision lookup will report unavailable"
+            ),
+        }
+    }
+
+    /// Resolves the upstream `main` revision once per TTL. Failures are cached
+    /// as an empty string so repeated `info` invocations do not hammer the
+    /// endpoint; the caption renders the localized "unavailable" for it.
+    async fn upstream_main_rev(&mut self) -> String {
+        const UPSTREAM_MAIN_REV_TTL: Duration = Duration::from_secs(300);
+        if let Some((resolved_at, revision)) = self.upstream_main_rev_cache.as_ref()
+            && resolved_at.elapsed() < UPSTREAM_MAIN_REV_TTL
+        {
+            return revision.clone();
+        }
+        let resolved = match &self.upstream {
+            Some(upstream) => match upstream.main_rev().await {
+                Ok(revision) => revision,
+                Err(error) => {
+                    tracing::warn!(
+                        event = "upstream_main_rev_unavailable",
+                        ?error,
+                        "Could not resolve the upstream main revision"
+                    );
+                    String::new()
+                }
+            },
+            None => {
+                tracing::warn!(
+                    event = "upstream_resolver_unavailable",
+                    "No upstream resolver is configured"
+                );
+                String::new()
+            }
+        };
+        self.upstream_main_rev_cache = Some((Instant::now(), resolved.clone()));
+        resolved
     }
 
     pub async fn refresh_snapshot(&mut self) {
@@ -810,6 +886,9 @@ impl RuntimeState {
         if let Action::Setup(request) = action {
             return self.execute_setup(client, request, peer_id).await;
         }
+        if let Action::Info = action {
+            return self.execute_info().await;
+        }
         match action {
             Action::Language(request) => self.execute_language(request).await,
             Action::Ping => match telegram_ping(client, message_id).await {
@@ -846,10 +925,7 @@ impl RuntimeState {
                     ),
                 )
             }
-            Action::Info => Response::plain_with_locale(
-                self.locale(),
-                format_info(self.locale(), &prefix, self.external_descriptors().len()),
-            ),
+            Action::Info => unreachable!("info actions return before response dispatch"),
             Action::Help(request) => {
                 let rendered = render_with_external_locale(
                     request,
@@ -883,6 +959,72 @@ impl RuntimeState {
             Action::External(invocation) => self.execute_external(invocation).await,
         }
         .into()
+    }
+
+    /// Builds the `info` reply: a dynamic caption plus the static branding
+    /// image when it is available. `media` is left `None` for a text-only card
+    /// when the packaged image cannot be resolved.
+    async fn execute_info(&mut self) -> RuntimeExecution {
+        self.refresh_snapshot().await;
+        let locale = self.locale();
+        let prefix = self.prefix().to_owned();
+        let owner = self
+            .self_identity()
+            .map(info::owner_label)
+            .unwrap_or_else(|| info_text(locale, InfoText::Unknown).to_owned());
+        let upstream = self.upstream_main_rev().await;
+        let upstream = if upstream.is_empty() {
+            info_text(locale, InfoText::Unavailable).to_owned()
+        } else {
+            info::short_commit(&upstream).to_owned()
+        };
+        let built_in_modules = crate::modules::modules().len();
+        let total_modules = built_in_modules + self.external_descriptors().len();
+        let active_modules = built_in_modules
+            + self
+                .external_snapshot
+                .module_statuses
+                .iter()
+                .filter(|status| status.status == ExternalModuleRuntimeStatus::Running)
+                .count();
+        let host = info::deployment_label(std::env::var("LAVIS_HOST").ok().as_deref());
+        let os = tokio::task::spawn_blocking(info::read_os_release_pretty_name)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| std::env::consts::OS.to_owned());
+        let caption = render_info_text(
+            locale,
+            InfoCaptionData {
+                owner: &owner,
+                version: env!("CARGO_PKG_VERSION"),
+                commit: info::short_commit(info::build_rev()),
+                upstream: &upstream,
+                prefix: &prefix,
+                active_modules,
+                total_modules,
+                host,
+                os: &os,
+            },
+        );
+        let media = info::info_asset_path(
+            std::env::var_os("LAVIS_INFO_IMAGE").as_deref(),
+            env!("CARGO_MANIFEST_DIR"),
+        );
+        if media.is_none() {
+            tracing::warn!(
+                event = "info_image_unavailable",
+                "Info image is missing; replying with a text-only card"
+            );
+        }
+        RuntimeExecution {
+            response: Response::plain_with_locale(locale, caption),
+            media,
+            provision: None,
+            shutdown: None,
+            post_edit: None,
+            onboarding_page: false,
+        }
     }
 
     async fn execute_language(&mut self, request: &LanguageRequest) -> Response {
@@ -1016,6 +1158,7 @@ impl RuntimeState {
                 shutdown: None,
                 post_edit: None,
                 onboarding_page: true,
+                media: None,
             },
             Err(_) => {
                 Response::plain_with_locale(self.locale(), text(locale, Text::OnboardingSaveFailed))
@@ -1426,6 +1569,7 @@ impl RuntimeState {
                 shutdown: None,
                 post_edit: Some(PostEditAction::ArmRebootReceipt),
                 onboarding_page: false,
+                media: None,
             },
             Err(response) => response.into(),
         }
@@ -2453,6 +2597,7 @@ impl SetupCoordinator {
                 shutdown: None,
                 post_edit: None,
                 onboarding_page: false,
+                media: None,
             },
             Err(response) => response.into(),
         }
@@ -2829,11 +2974,13 @@ fn format_stats(
 #[cfg(test)]
 mod tests {
     use super::{
-        LAVIS_SOURCE_URL, ProcStats, SensitiveCommandDenial, SensitiveCommandPolicy,
-        authorize_sensitive_message, bounded_list, external_event_error_category,
-        fastfetch_response, format_duration, format_info, format_latency, format_stats, lm_usage,
-        missing_descriptor_response, parse_memory_kib, parse_system_uptime, render_install_plan,
-        setup_status_label, setup_status_response,
+        ProcStats, SensitiveCommandDenial, SensitiveCommandPolicy, authorize_sensitive_message,
+        bounded_list, external_event_error_category, fastfetch_response, format_duration,
+        format_latency, format_stats, lm_usage, missing_descriptor_response, parse_memory_kib,
+        parse_system_uptime, render_install_plan, setup_status_label, setup_status_response,
+    };
+    use crate::external_modules::manager::{
+        ExternalModuleRuntimeStatus, ExternalModuleStatus, ExternalRuntimeSnapshot,
     };
     use crate::response::Response;
     use crate::{
@@ -2850,6 +2997,7 @@ mod tests {
             Locale, PingText, RuntimeText, SensitiveText, ping_text, runtime_text, sensitive_text,
         },
         setup_store::{CompanionToken, PersistedSetupState, SetupStore},
+        upstream::{UpstreamError, UpstreamRev, UpstreamRevFuture},
     };
     use grammers_session::types::PeerId;
     use std::{
@@ -4346,28 +4494,152 @@ for line in sys.stdin:
         assert_eq!(parse_memory_kib("VmRSS: 1234 bytes\n"), None);
     }
 
-    #[test]
-    fn formats_info_as_project_identity_without_runtime_stats() {
-        let built_in_modules = crate::modules::modules().len();
-        let english = format_info(Locale::English, "🦀", 2);
-        assert!(english.starts_with("ℹ️ Lavis — really your userbot"));
-        assert!(english.contains("Version: 0.1.0"));
-        assert!(english.contains("MTProto: grammers"));
-        assert!(english.contains("Module API: v6"));
-        assert!(english.contains("Prefix: 🦀"));
-        assert!(english.contains(&format!("Built-in modules: {built_in_modules}")));
-        assert!(english.contains("Installed external modules: 2"));
-        assert!(english.contains(LAVIS_SOURCE_URL));
-        assert!(!english.contains("Telegram:"));
-        assert!(!english.contains("uptime"));
+    #[tokio::test]
+    async fn info_caption_computes_module_counts_from_runtime_state() {
+        use crate::external_modules::manifest::{ExternalCapability, ExternalModuleDescriptor};
 
-        let russian = format_info(Locale::Russian, ",", 0);
-        assert!(russian.contains("Версия: 0.1.0"));
-        assert!(russian.contains("API модулей: v6"));
-        assert!(russian.contains("Префикс: ,"));
-        assert!(russian.contains(&format!("Встроенные модули: {built_in_modules}")));
-        assert!(russian.contains("Установленные внешние модули: 0"));
-        assert!(russian.contains(LAVIS_SOURCE_URL));
+        fn descriptor(id: &str) -> ExternalModuleDescriptor {
+            ExternalModuleDescriptor {
+                protocol_version: 6,
+                id: id.to_owned(),
+                display_name: id.to_owned(),
+                version: "test".to_owned(),
+                author: "test".to_owned(),
+                entrypoint: PathBuf::from("/unused"),
+                module_dir: PathBuf::from("/unused"),
+                capabilities: vec![ExternalCapability::MessageRead],
+                default_command: None,
+                subscriptions: Vec::new(),
+                telegram_methods: Vec::new(),
+                actions: Vec::new(),
+                commands: Vec::new(),
+            }
+        }
+
+        let mut snapshot = ExternalRuntimeSnapshot::new();
+        let built_in_modules = crate::modules::modules().len();
+        snapshot.descriptors.push(descriptor("alpha"));
+        snapshot.descriptors.push(descriptor("beta"));
+        snapshot.module_statuses.push(ExternalModuleStatus {
+            id: "alpha".to_owned(),
+            display_name: "alpha".to_owned(),
+            version: "test".to_owned(),
+            author: "test".to_owned(),
+            capabilities: Vec::new(),
+            command_count: 1,
+            status: ExternalModuleRuntimeStatus::Running,
+        });
+        snapshot.module_statuses.push(ExternalModuleStatus {
+            id: "beta".to_owned(),
+            display_name: "beta".to_owned(),
+            version: "test".to_owned(),
+            author: "test".to_owned(),
+            capabilities: Vec::new(),
+            command_count: 1,
+            status: ExternalModuleRuntimeStatus::InstalledDisabled,
+        });
+
+        let (mut runtime, directory) = runtime_with_alias().await;
+        runtime.set_external_snapshot_for_tests(snapshot);
+        runtime
+            .settings
+            .set_locale(Some(crate::i18n::Locale::English))
+            .await
+            .unwrap();
+        let execution = runtime.execute_info().await;
+
+        assert!(execution.response.text.contains(&format!(
+            "Modules: {}/{}",
+            built_in_modules + 1,
+            built_in_modules + 2
+        )));
+        assert!(execution.response.text.contains("Host: "));
+        assert!(execution.response.text.contains("OS: "));
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[tokio::test]
+    async fn info_action_dispatches_through_execute() {
+        use grammers_session::types::PeerId;
+        let (mut runtime, directory) = runtime_with_alias().await;
+        runtime
+            .settings
+            .set_locale(Some(crate::i18n::Locale::English))
+            .await
+            .unwrap();
+        runtime.set_self_identity(crate::auth::SelfIdentity {
+            username: Some("@owner".to_owned()),
+            display_name: None,
+            id: PeerId::self_user(),
+        });
+        runtime.set_upstream(Box::new(FakeUpstream::new(
+            "b1d18f8ef407d043506c983b0d68e96c282eb1c9",
+        )));
+
+        let execution = runtime.execute_info().await;
+
+        assert!(execution.response.text.contains("Owner: @owner"));
+        assert!(execution.response.text.contains("Current commit: "));
+        assert!(execution.response.text.contains("Upstream main: b1d18f8"));
+        assert!(execution.response.text.contains("Prefix: "));
+        assert!(execution.response.text.contains("Modules: "));
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[tokio::test]
+    async fn info_reports_unavailable_upstream_when_resolver_fails() {
+        let (mut runtime, directory) = runtime_with_alias().await;
+        runtime
+            .settings
+            .set_locale(Some(crate::i18n::Locale::English))
+            .await
+            .unwrap();
+        runtime.set_upstream(Box::new(FakeUpstream::new_err()));
+
+        let execution = runtime.execute_info().await;
+
+        assert!(execution.response.text.contains("Upstream main: unavailable"));
+        assert!(execution.media.is_some());
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[tokio::test]
+    async fn info_owner_falls_back_to_unknown_without_identity() {
+        let (mut runtime, directory) = runtime_with_alias().await;
+        runtime
+            .settings
+            .set_locale(Some(crate::i18n::Locale::English))
+            .await
+            .unwrap();
+
+        let execution = runtime.execute_info().await;
+
+        assert!(execution.response.text.contains("Owner: unknown"));
+        fs::remove_dir_all(directory).ok();
+    }
+
+    struct FakeUpstream {
+        result: Result<String, UpstreamError>,
+    }
+
+    impl FakeUpstream {
+        fn new(revision: &str) -> Self {
+            Self {
+                result: Ok(revision.to_owned()),
+            }
+        }
+
+        fn new_err() -> Self {
+            Self {
+                result: Err(UpstreamError::NoMainRef),
+            }
+        }
+    }
+
+    impl UpstreamRev for FakeUpstream {
+        fn main_rev<'a>(&'a self) -> UpstreamRevFuture<'a> {
+            Box::pin(async move { self.result.clone() })
+        }
     }
 
     #[test]

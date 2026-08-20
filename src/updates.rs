@@ -305,6 +305,58 @@ fn is_temporary_telegram_error(error: &grammers_client::InvocationError) -> bool
     }
 }
 
+/// Classifies media-delivery failures for structured diagnostics. The photo
+/// path has no single error type: uploads surface `std::io::Error` while the
+/// send and delete steps surface `InvocationError`.
+fn delivery_error_category(error: &anyhow::Error) -> &'static str {
+    if let Some(source) = error.source() {
+        if source.downcast_ref::<grammers_client::InvocationError>().is_some() {
+            return "invocation";
+        }
+    }
+    "other"
+}
+
+/// Sends a static media asset as a new photo message with `caption`, then
+/// removes the outgoing command message. This path deliberately does not
+/// register an expected self-edit: the delivered photo surfaces as a separate
+/// self-authored Created event that is safe for external modules.
+async fn deliver_photo(
+    client: &grammers_client::Client,
+    command_message: &Message,
+    media_path: &std::path::Path,
+    caption: String,
+) -> anyhow::Result<()> {
+    let peer = command_message
+        .peer_ref()
+        .await
+        .map_err(|error| anyhow::anyhow!("resolve command peer: {error}"))?
+        .ok_or_else(|| anyhow::anyhow!("command message has no peer"))?;
+    let uploaded = client
+        .upload_file(media_path)
+        .await
+        .map_err(|error| anyhow::anyhow!("upload info image: {error}"))?;
+    let input = grammers_client::message::InputMessage::new()
+        .text(caption)
+        .photo(uploaded);
+    client
+        .send_message(peer, input)
+        .await
+        .map_err(|error| anyhow::anyhow!("send photo reply: {error}"))?;
+    match command_message.delete().await {
+        Ok(()) => {}
+        Err(error) => {
+            tracing::warn!(
+                event = "command_media_delete_failed",
+                error_category = invocation_error_category(&error),
+                error = %error,
+                "Leaving the command message in place after photo delivery"
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn send_setup_notification(
     client: &grammers_client::Client,
     runtime: &mut RuntimeState,
@@ -548,6 +600,30 @@ async fn process_update(
         None
     };
     let rendered_text = execution.response.text;
+    if let Some(media_path) = execution.media {
+        let caption = rendered_text.clone();
+        match deliver_photo(client, &message, &media_path, caption).await {
+            Ok(()) => {
+                tracing::info!(
+                    event = "command_media_delivered",
+                    command = action.name(),
+                    message_id,
+                    "Delivered reply as a photo message"
+                );
+                return shutdown_reason;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    event = "command_media_delivery_failed",
+                    command = action.name(),
+                    message_id,
+                    error_category = delivery_error_category(&error),
+                    error = %error,
+                    "Falling back to a text edit"
+                );
+            }
+        }
+    }
     let input = grammers_client::message::InputMessage::new()
         .text(rendered_text.clone())
         .fmt_entities(execution.response.entities);
