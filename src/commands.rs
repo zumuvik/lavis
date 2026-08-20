@@ -355,6 +355,7 @@ pub enum Action {
     Language(LanguageRequest),
     Ping,
     Stats,
+    Info,
     Help(HelpRequest),
     Fastfetch(String),
     Alias(AliasRequest),
@@ -398,6 +399,7 @@ impl Action {
             Self::Language(_) => "language",
             Self::Ping => "ping",
             Self::Stats => "stats",
+            Self::Info => "info",
             Self::Help(_) => "help",
             Self::Fastfetch(_) => "fastfetch",
             Self::Alias(_) => "alias",
@@ -423,9 +425,7 @@ pub fn dispatch(command: &Command) -> Option<Action> {
         CommandKind::Language => Some(Action::Language(parse_language_request(&command.args))),
         CommandKind::Ping => Some(Action::Ping),
         CommandKind::Stats => Some(Action::Stats),
-        CommandKind::Info if command.args.trim().is_empty() => {
-            Some(Action::Help(HelpRequest::Topic("info".to_owned())))
-        }
+        CommandKind::Info if command.args.trim().is_empty() => Some(Action::Info),
         CommandKind::Info => None,
         CommandKind::Help => Some(Action::Help(parse_help_request(&command.args))),
         CommandKind::Fastfetch => Some(Action::Fastfetch(command.args.clone())),
@@ -473,11 +473,12 @@ fn parse_start_request(args: &str) -> StartRequest {
         return StartRequest::Invalid;
     }
     match word.to_ascii_lowercase().as_str() {
-        "skip" => Some(StartRequest::Skip),
-        "bot" => Some(StartRequest::Bot),
-        _ => crate::i18n::Locale::parse(word).map(StartRequest::Locale),
+        "skip" => StartRequest::Skip,
+        "bot" => StartRequest::Bot,
+        _ => crate::i18n::Locale::parse(word)
+            .map(StartRequest::Locale)
+            .unwrap_or(StartRequest::Invalid),
     }
-    .unwrap_or(StartRequest::Invalid)
 }
 fn parse_language_request(args: &str) -> LanguageRequest {
     let mut words = args.split_whitespace();
@@ -703,16 +704,13 @@ mod tests {
     }
 
     #[test]
-    fn dispatches_info_to_its_project_card() {
+    fn dispatches_info() {
         let command = Command {
             name: "info".to_owned(),
             args: String::new(),
         };
 
-        assert_eq!(
-            dispatch(&command),
-            Some(Action::Help(HelpRequest::Topic("info".to_owned())))
-        );
+        assert_eq!(dispatch(&command), Some(Action::Info));
         assert_eq!(
             dispatch(&Command {
                 name: "info".to_owned(),
@@ -800,7 +798,7 @@ mod tests {
     #[test]
     fn dispatches_invalid_help_requests() {
         let unknown = Command {
-            name: "unknown".to_owned(),
+            name: "help".to_owned(),
             args: "missing".to_owned(),
         };
         let invalid = Command {
@@ -808,7 +806,10 @@ mod tests {
             args: "ping extra".to_owned(),
         };
 
-        assert_eq!(dispatch(&unknown), None);
+        assert_eq!(
+            dispatch(&unknown),
+            Some(Action::Help(HelpRequest::Topic("missing".to_owned())))
+        );
         assert_eq!(dispatch(&invalid), Some(Action::Help(HelpRequest::Invalid)));
     }
 
