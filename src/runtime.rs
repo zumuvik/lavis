@@ -846,6 +846,10 @@ impl RuntimeState {
                     ),
                 )
             }
+            Action::Info => Response::plain_with_locale(
+                self.locale(),
+                format_info(self.locale(), &prefix, self.external_descriptors().len()),
+            ),
             Action::Help(request) => {
                 let rendered = render_with_external_locale(
                     request,
@@ -2779,6 +2783,22 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
+const LAVIS_SOURCE_URL: &str = "https://tangled.org/zumuvik.tngl.sh/lavis";
+
+fn format_info(locale: Locale, prefix: &str, external_modules: usize) -> String {
+    let built_in_modules = crate::modules::modules().len();
+    match locale {
+        Locale::English => format!(
+            "ℹ️ Lavis — really your userbot\n\nVersion: {}\nMTProto: grammers\nModule API: v6\nPrefix: {prefix}\nBuilt-in modules: {built_in_modules}\nExternal modules: {external_modules}\nSource: {LAVIS_SOURCE_URL}",
+            env!("CARGO_PKG_VERSION")
+        ),
+        Locale::Russian => format!(
+            "ℹ️ Lavis — really your userbot\n\nВерсия: {}\nMTProto: grammers\nAPI модулей: v6\nПрефикс: {prefix}\nВстроенные модули: {built_in_modules}\nВнешние модули: {external_modules}\nИсходники: {LAVIS_SOURCE_URL}",
+            env!("CARGO_PKG_VERSION")
+        ),
+    }
+}
+
 fn format_stats(
     locale: Locale,
     telegram: &str,
@@ -2811,8 +2831,9 @@ mod tests {
     use super::{
         ProcStats, SensitiveCommandDenial, SensitiveCommandPolicy, authorize_sensitive_message,
         bounded_list, external_event_error_category, fastfetch_response, format_duration,
-        format_latency, format_stats, lm_usage, missing_descriptor_response, parse_memory_kib,
-        parse_system_uptime, render_install_plan, setup_status_label, setup_status_response,
+        format_info, format_latency, format_stats, lm_usage, missing_descriptor_response,
+        parse_memory_kib, parse_system_uptime, render_install_plan, setup_status_label,
+        setup_status_response,
     };
     use crate::response::Response;
     use crate::{
@@ -3676,7 +3697,7 @@ mod tests {
             runtime.execute_modules(&crate::commands::ModulesRequest::Overview, runtime.prefix());
         assert!(overview.text.starts_with("🧩 Модули Lavis: 3\n\n"));
         assert!(overview.text.contains("🦀fastfetch"));
-        assert!(overview.text.contains("Команды (12)"));
+        assert!(overview.text.contains("Команды (13)"));
         assert_eq!(overview.entities.len(), 2);
         assert_eq!(
             runtime.execute_modules(&crate::commands::ModulesRequest::Invalid, runtime.prefix(),),
@@ -3694,7 +3715,7 @@ mod tests {
             "🧩 Модули Lavis: 3\n\n"
         );
         let body = String::from_utf16(&units[offset..offset + length]).unwrap();
-        assert!(body.contains("Команды (12)"));
+        assert!(body.contains("Команды (13)"));
         let grammers_client::tl::enums::MessageEntity::Blockquote(provenance) =
             &overview.entities[1]
         else {
@@ -3718,7 +3739,7 @@ mod tests {
         let english =
             runtime.execute_modules(&crate::commands::ModulesRequest::Overview, runtime.prefix());
         assert!(english.text.starts_with("🧩 Lavis modules: 3\n\n"));
-        assert!(english.text.contains("Commands (12)"));
+        assert!(english.text.contains("Commands (13)"));
         assert!(!english.text.contains("Модули"));
         assert_eq!(
             runtime.execute_modules(&crate::commands::ModulesRequest::Invalid, runtime.prefix(),),
@@ -4316,6 +4337,29 @@ for line in sys.stdin:
         assert_eq!(parse_memory_kib("Name:\tlavis\n"), None);
         assert_eq!(parse_memory_kib("VmRSS: bad kB\n"), None);
         assert_eq!(parse_memory_kib("VmRSS: 1234 bytes\n"), None);
+    }
+
+    #[test]
+    fn formats_info_as_project_identity_without_runtime_stats() {
+        let english = format_info(Locale::English, "🦀", 2);
+        assert!(english.starts_with("ℹ️ Lavis — really your userbot"));
+        assert!(english.contains("Version: 0.1.0"));
+        assert!(english.contains("MTProto: grammers"));
+        assert!(english.contains("Module API: v6"));
+        assert!(english.contains("Prefix: 🦀"));
+        assert!(english.contains("Built-in modules: 3"));
+        assert!(english.contains("External modules: 2"));
+        assert!(english.contains(LAVIS_SOURCE_URL));
+        assert!(!english.contains("Telegram:"));
+        assert!(!english.contains("uptime"));
+
+        let russian = format_info(Locale::Russian, ",", 0);
+        assert!(russian.contains("Версия: 0.1.0"));
+        assert!(russian.contains("API модулей: v6"));
+        assert!(russian.contains("Префикс: ,"));
+        assert!(russian.contains("Встроенные модули: 3"));
+        assert!(russian.contains("Внешние модули: 0"));
+        assert!(russian.contains(LAVIS_SOURCE_URL));
     }
 
     #[test]
