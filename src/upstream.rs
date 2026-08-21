@@ -18,7 +18,21 @@ pub trait UpstreamRev: Send + Sync {
 pub enum UpstreamError {
     Transport,
     Timeout,
+    HttpStatus(u16),
+    InvalidResponse,
     NoMainRef,
+}
+
+impl std::fmt::Display for UpstreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport => write!(f, "transport"),
+            Self::Timeout => write!(f, "timeout"),
+            Self::HttpStatus(code) => write!(f, "http_status_{}", code),
+            Self::InvalidResponse => write!(f, "invalid_response"),
+            Self::NoMainRef => write!(f, "no_main_ref"),
+        }
+    }
 }
 
 const UPSTREAM_INFO_REFS_URL: &str =
@@ -54,19 +68,19 @@ pub fn parse_main_rev_from_info_refs(body: &[u8]) -> Result<String, UpstreamErro
     let mut offset = 0usize;
     while offset < body.len() {
         if body.len() - offset < 4 {
-            return Err(UpstreamError::NoMainRef);
+            return Err(UpstreamError::InvalidResponse);
         }
         let length = std::str::from_utf8(&body[offset..offset + 4])
             .ok()
             .and_then(|hex| u32::from_str_radix(hex, 16).ok())
-            .ok_or(UpstreamError::NoMainRef)?;
+            .ok_or(UpstreamError::InvalidResponse)?;
         if length == 0 {
             offset += 4;
             continue;
         }
         let length = length as usize;
         if length < 4 || offset + length > body.len() {
-            return Err(UpstreamError::NoMainRef);
+            return Err(UpstreamError::InvalidResponse);
         }
         let payload = &body[offset + 4..offset + length];
         offset += length;
@@ -79,9 +93,9 @@ pub fn parse_main_rev_from_info_refs(body: &[u8]) -> Result<String, UpstreamErro
             continue;
         }
         if revision.len() != SHA1_HEX_LEN || !revision.iter().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(UpstreamError::NoMainRef);
+            return Err(UpstreamError::InvalidResponse);
         }
-        return String::from_utf8(revision.to_vec()).map_err(|_| UpstreamError::NoMainRef);
+        return String::from_utf8(revision.to_vec()).map_err(|_| UpstreamError::InvalidResponse);
     }
     Err(UpstreamError::NoMainRef)
 }
@@ -124,8 +138,9 @@ impl UpstreamRev for HttpUpstreamRev {
                 .send()
                 .await
                 .map_err(request_error)?;
-            if !response.status().is_success() {
-                return Err(UpstreamError::Transport);
+            let status = response.status();
+            if !status.is_success() {
+                return Err(UpstreamError::HttpStatus(status.as_u16()));
             }
             let body = read_bounded_body(response).await?;
             parse_main_rev_from_info_refs(&body)
@@ -218,7 +233,7 @@ mod tests {
 0000";
         assert_eq!(
             parse_main_rev_from_info_refs(body),
-            Err(UpstreamError::NoMainRef)
+            Err(UpstreamError::InvalidResponse)
         );
     }
 
@@ -228,11 +243,11 @@ mod tests {
             parse_main_rev_from_info_refs(
                 b"zzzzb1d18f8ef407d043506c983b0d68e96c282eb1c9 refs/heads/main\n"
             ),
-            Err(UpstreamError::NoMainRef)
+            Err(UpstreamError::InvalidResponse)
         );
         assert_eq!(
             parse_main_rev_from_info_refs(b"003d"),
-            Err(UpstreamError::NoMainRef)
+            Err(UpstreamError::InvalidResponse)
         );
     }
 }

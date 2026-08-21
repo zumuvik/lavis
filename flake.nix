@@ -361,10 +361,19 @@ PY
         default = package;
         lavis-extension-gaf = gafExtension;
       };
-      apps.${system}.default = {
-        type = "app";
-        program = "${package}/bin/lavis";
-      };
+      # Separate wrapper for `nix run` so it reports "Host: nix run" without
+      # affecting the base package used by NixOS module or systemPackages.
+      apps.${system}.default =
+        let
+          nixRunWrapper = pkgs.writeShellScriptBin "lavis" ''
+            export LAVIS_HOST="nix-run"
+            exec ${package}/bin/lavis "$@"
+          '';
+        in
+        {
+          type = "app";
+          program = "${nixRunWrapper}/bin/lavis";
+        };
       nixosModules.default = import ./nix/modules/lavis.nix { inherit self; };
       devShells.${system}.default = pkgs.mkShell {
         packages = with pkgs; [

@@ -532,6 +532,7 @@ in
         XDG_DATA_HOME = dataHome;
         RUST_LOG = cfg.logLevel;
         LAVIS_SERVICE = "1";
+        LAVIS_HOST = "nixos-module";
       };
 
       preStart = "${setupScript}";

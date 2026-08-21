@@ -801,10 +801,10 @@ pub enum InfoText {
 pub fn info_text(locale: Locale, key: InfoText) -> &'static str {
     match (locale, key) {
         (Locale::English, InfoText::Caption) => {
-            "ℹ️ Lavis — really your userbot\n\nOwner: {owner}\nVersion: {version}\nCurrent commit: {commit}\nUpstream main: {upstream}\nPrefix: {prefix}\nModules: {active}/{total}\nHost: {host}\nOS: {os}"
+            "ℹ️ Lavis — really your userbot\n\nOwner: {owner}\nVersion: {version}\nCurrent commit: {commit}\nUpstream main: {upstream}\nPrefix: {prefix}\nModules: {total} ({active} active)\nHost: {host}\nOS: {os}"
         }
         (Locale::Russian, InfoText::Caption) => {
-            "ℹ️ Lavis — really your userbot\n\nВладелец: {owner}\nВерсия: {version}\nТекущий коммит: {commit}\nОсновная ветка: {upstream}\nПрефикс: {prefix}\nМодули: {active}/{total}\nХост: {host}\nОС: {os}"
+            "ℹ️ Lavis — really your userbot\n\nВладелец: {owner}\nВерсия: {version}\nТекущий коммит: {commit}\nОсновная ветка: {upstream}\nПрефикс: {prefix}\nМодули: {total} ({active} активных)\nХост: {host}\nОС: {os}"
         }
         (Locale::English, InfoText::Unknown) => "unknown",
         (Locale::Russian, InfoText::Unknown) => "неизвестно",
@@ -1742,7 +1742,7 @@ mod tests {
         assert!(english.contains("Current commit: b1d18f8"));
         assert!(english.contains("Upstream main: unavailable"));
         assert!(english.contains("Prefix: ,"));
-        assert!(english.contains("Modules: 3/5"));
+        assert!(english.contains("Modules: 5 (3 active)"));
         assert!(english.contains("Host: standalone"));
         assert!(english.contains("OS: NixOS 25.05"));
         assert!(!contains_cyrillic(&english));
@@ -1764,7 +1764,7 @@ mod tests {
         assert!(russian.contains("Владелец: @owner"));
         assert!(russian.contains("Версия: 0.1.0"));
         assert!(russian.contains("Основная ветка: недоступно"));
-        assert!(russian.contains("Модули: 3/5"));
+        assert!(russian.contains("Модули: 5 (3 активных)"));
     }
 
     #[test]

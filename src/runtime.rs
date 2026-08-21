@@ -71,7 +71,7 @@ pub struct RuntimeState {
     fastfetch_profile_path: PathBuf,
     self_identity: Option<SelfIdentity>,
     upstream: Option<Box<dyn UpstreamRev>>,
-    upstream_main_rev_cache: Option<(Instant, String)>,
+    upstream_main_rev_cache: Option<(Instant, Option<String>)>,
     external_manager: Option<ExternalManagerHandle>,
     external_snapshot: ExternalRuntimeSnapshot,
     expected_self_edits: VecDeque<ExpectedSelfEdit>,
@@ -507,9 +507,9 @@ impl RuntimeState {
     }
 
     /// Resolves the upstream `main` revision once per TTL. Failures are cached
-    /// as an empty string so repeated `info` invocations do not hammer the
-    /// endpoint; the caption renders the localized "unavailable" for it.
-    async fn upstream_main_rev(&mut self) -> String {
+    /// as `None` so repeated `info` invocations do not hammer the endpoint;
+    /// the caption renders the localized "unavailable" for it.
+    async fn upstream_main_rev(&mut self) -> Option<String> {
         const UPSTREAM_MAIN_REV_TTL: Duration = Duration::from_secs(300);
         if let Some((resolved_at, revision)) = self.upstream_main_rev_cache.as_ref()
             && resolved_at.elapsed() < UPSTREAM_MAIN_REV_TTL
@@ -518,14 +518,14 @@ impl RuntimeState {
         }
         let resolved = match &self.upstream {
             Some(upstream) => match upstream.main_rev().await {
-                Ok(revision) => revision,
+                Ok(revision) => Some(revision),
                 Err(error) => {
                     tracing::warn!(
-                        event = "upstream_main_rev_unavailable",
-                        ?error,
+                        event = "upstream_revision_fetch_failed",
+                        category = %error,
                         "Could not resolve the upstream main revision"
                     );
-                    String::new()
+                    None
                 }
             },
             None => {
@@ -533,7 +533,7 @@ impl RuntimeState {
                     event = "upstream_resolver_unavailable",
                     "No upstream resolver is configured"
                 );
-                String::new()
+                None
             }
         };
         self.upstream_main_rev_cache = Some((Instant::now(), resolved.clone()));
@@ -973,10 +973,9 @@ impl RuntimeState {
             .map(info::owner_label)
             .unwrap_or_else(|| info_text(locale, InfoText::Unknown).to_owned());
         let upstream = self.upstream_main_rev().await;
-        let upstream = if upstream.is_empty() {
-            info_text(locale, InfoText::Unavailable).to_owned()
-        } else {
-            info::short_commit(&upstream).to_owned()
+        let upstream = match upstream {
+            Some(revision) => info::short_commit(&revision).to_owned(),
+            None => info_text(locale, InfoText::Unavailable).to_owned(),
         };
         let built_in_modules = crate::modules::modules().len();
         let total_modules = built_in_modules + self.external_descriptors().len();
@@ -4533,9 +4532,9 @@ for line in sys.stdin:
         let execution = runtime.execute_info().await;
 
         assert!(execution.response.text.contains(&format!(
-            "Modules: {}/{}",
-            built_in_modules + 1,
-            built_in_modules + 2
+            "Modules: {} ({} active)",
+            built_in_modules + 2,
+            built_in_modules + 1
         )));
         assert!(execution.response.text.contains("Host: "));
         assert!(execution.response.text.contains("OS: "));
