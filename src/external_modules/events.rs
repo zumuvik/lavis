@@ -7,6 +7,7 @@ use super::{
 use std::collections::HashSet;
 
 pub const MAX_EMOJI_CHARS: usize = 32;
+pub const MAX_EDIT_TEXT_CHARS: usize = 4096;
 
 pub fn opaque_message_ref() -> Result<String, getrandom::Error> {
     let mut bytes = [0_u8; 32];
@@ -33,6 +34,9 @@ pub enum ReactionValidationError {
     DuplicateReaction,
     InvalidEmoji,
     InvalidCustomEmojiDocumentId,
+    EditRequiresV6,
+    InvalidEditPayload,
+    InvalidEditText,
 }
 
 impl EventScope {
@@ -77,6 +81,37 @@ pub fn validate_reaction_action(
     request_id: &str,
     action: &EventAction,
 ) -> Result<(), ReactionValidationError> {
+    scope.validate(&descriptor.id, request_id, action)?;
+
+    if let [ReactionSpec::MessageEdit { text }] = action.reactions.as_slice() {
+        if descriptor.protocol_version != 6 {
+            return Err(ReactionValidationError::EditRequiresV6);
+        }
+        if !descriptor.actions.contains(&ExternalAction::MessageEdit) {
+            return Err(ReactionValidationError::ActionNotDeclared);
+        }
+        if !descriptor
+            .capabilities
+            .contains(&ExternalCapability::MessageEdit)
+        {
+            return Err(ReactionValidationError::CapabilityMissing);
+        }
+        if text.is_empty()
+            || text.chars().count() > MAX_EDIT_TEXT_CHARS
+            || text.chars().any(|character| character == '\0')
+        {
+            return Err(ReactionValidationError::InvalidEditText);
+        }
+        return Ok(());
+    }
+
+    if action
+        .reactions
+        .iter()
+        .any(|reaction| matches!(reaction, ReactionSpec::MessageEdit { .. }))
+    {
+        return Err(ReactionValidationError::InvalidEditPayload);
+    }
     if !descriptor.actions.contains(&ExternalAction::MessageReact) {
         return Err(ReactionValidationError::ActionNotDeclared);
     }
@@ -86,7 +121,6 @@ pub fn validate_reaction_action(
     {
         return Err(ReactionValidationError::CapabilityMissing);
     }
-    scope.validate(&descriptor.id, request_id, action)?;
     if action.reactions.len() > MAX_REACTIONS_PER_ACTION {
         return Err(ReactionValidationError::TooManyReactions);
     }
@@ -104,6 +138,9 @@ pub fn validate_reaction_action(
             }
             ReactionSpec::CustomEmoji { .. } if !valid_reaction(reaction) => {
                 return Err(ReactionValidationError::InvalidCustomEmojiDocumentId);
+            }
+            ReactionSpec::MessageEdit { .. } => {
+                return Err(ReactionValidationError::InvalidEditPayload);
             }
             _ => {}
         }
@@ -133,6 +170,7 @@ fn valid_reaction(reaction: &ReactionSpec) -> bool {
                 && document_id.bytes().all(|byte| byte.is_ascii_digit())
                 && document_id.parse::<i64>().is_ok()
         }
+        ReactionSpec::MessageEdit { .. } => false,
     }
 }
 
@@ -231,6 +269,44 @@ mod tests {
             reactions: Vec::new(),
         };
         assert!(validate_reaction_action(&descriptor, &scope(), "7", &remove).is_ok());
+    }
+
+    #[test]
+    fn v6_accepts_scoped_message_edit() {
+        let mut descriptor = descriptor(6);
+        descriptor
+            .capabilities
+            .push(ExternalCapability::MessageEdit);
+        descriptor.actions.push(ExternalAction::MessageEdit);
+        let action = EventAction {
+            message_ref: "opaque".to_owned(),
+            reactions: vec![ReactionSpec::MessageEdit {
+                text: "йах".to_owned(),
+            }],
+        };
+        assert!(validate_reaction_action(&descriptor, &scope(), "7", &action).is_ok());
+    }
+
+    #[test]
+    fn mixed_message_edit_payload_is_rejected() {
+        let mut descriptor = descriptor(6);
+        descriptor
+            .capabilities
+            .push(ExternalCapability::MessageEdit);
+        descriptor.actions.push(ExternalAction::MessageEdit);
+        let action = EventAction {
+            message_ref: "opaque".to_owned(),
+            reactions: vec![
+                ReactionSpec::MessageEdit {
+                    text: "йах".to_owned(),
+                },
+                ReactionSpec::Emoji("👍".to_owned()),
+            ],
+        };
+        assert_eq!(
+            validate_reaction_action(&descriptor, &scope(), "7", &action),
+            Err(ReactionValidationError::InvalidEditPayload)
+        );
     }
 
     #[test]
