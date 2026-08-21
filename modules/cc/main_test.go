@@ -6,25 +6,24 @@ import (
 	"testing"
 )
 
-func TestReplaceHai(t *testing.T) {
+func TestReverseText(t *testing.T) {
 	cases := map[string]string{
-		"хай":               "йах",
-		"ну хай хай":        "ну йах йах",
-		"Хай":               "Йах",
-		"ХАЙ":               "ЙАХ",
-		"хайп":              "йахп",
-		"ничего менять нет": "ничего менять нет",
+		"привет":      "тевирп",
+		"ну привет":   "тевирп ун",
+		"hello world": "dlrow olleh",
+		"Привет 👋":   "👋 тевирП",
+		"":            "",
 	}
 	for input, want := range cases {
-		if got := replaceHai(input); got != want {
-			t.Fatalf("replaceHai(%q) = %q, want %q", input, got, want)
+		if got := reverseText(input); got != want {
+			t.Fatalf("reverseText(%q) = %q, want %q", input, got, want)
 		}
 	}
 }
 
 func TestEventRequiresEnabledOutgoingMessage(t *testing.T) {
-	mod := &module{state: state{Enabled: false}}
-	payload := eventPayload{MessageRef: "opaque", Text: "хай", Outgoing: true}
+	mod := &module{state: state{Enabled: false}, expected: make(map[string]string)}
+	payload := eventPayload{MessageRef: "opaque", MessageKey: "key", Text: "привет", Outgoing: true}
 	if got := mod.handleEvent("message.created", payload); len(got) != 0 {
 		t.Fatalf("disabled module returned actions: %#v", got)
 	}
@@ -36,26 +35,54 @@ func TestEventRequiresEnabledOutgoingMessage(t *testing.T) {
 	}
 }
 
-func TestEventEditsMatchingOutgoingText(t *testing.T) {
-	mod := &module{state: state{Enabled: true}}
+func TestEventReversesOutgoingText(t *testing.T) {
+	mod := &module{state: state{Enabled: true}, expected: make(map[string]string)}
 	got := mod.handleEvent("message.created", eventPayload{
 		MessageRef: "opaque",
-		Text:       "ну хай",
+		MessageKey: "key",
+		Text:       "ну привет",
 		Outgoing:   true,
 	})
 	if len(got) != 1 {
 		t.Fatalf("got %d actions, want 1", len(got))
 	}
-	if got[0].Type != "message.edit" || got[0].MessageRef != "opaque" || got[0].Text != "ну йах" {
+	if got[0].Type != "message.edit" || got[0].MessageRef != "opaque" || got[0].Text != "тевирп ун" {
 		t.Fatalf("unexpected action: %#v", got[0])
 	}
 }
 
+func TestSelfEditDoesNotReverseBack(t *testing.T) {
+	mod := &module{state: state{Enabled: true}, expected: make(map[string]string)}
+	created := eventPayload{MessageRef: "opaque", MessageKey: "key", Text: "привет", Outgoing: true}
+	got := mod.handleEvent("message.created", created)
+	if len(got) != 1 || got[0].Text != "тевирп" {
+		t.Fatalf("unexpected create action: %#v", got)
+	}
+
+	edited := eventPayload{MessageRef: "opaque-2", MessageKey: "key", Text: "тевирп", Outgoing: true}
+	if got := mod.handleEvent("message.edited", edited); len(got) != 0 {
+		t.Fatalf("self edit reversed back: %#v", got)
+	}
+}
+
+func TestManualEditIsReversedAgain(t *testing.T) {
+	mod := &module{state: state{Enabled: true}, expected: make(map[string]string)}
+	created := eventPayload{MessageRef: "opaque", MessageKey: "key", Text: "привет", Outgoing: true}
+	_ = mod.handleEvent("message.created", created)
+	_ = mod.handleEvent("message.edited", eventPayload{MessageRef: "opaque-2", MessageKey: "key", Text: "тевирп", Outgoing: true})
+
+	got := mod.handleEvent("message.edited", eventPayload{MessageRef: "opaque-3", MessageKey: "key", Text: "пока", Outgoing: true})
+	if len(got) != 1 || got[0].Text != "акоп" {
+		t.Fatalf("manual edit was not reversed: %#v", got)
+	}
+}
+
 func TestEventIgnoresCommaPrefixedText(t *testing.T) {
-	mod := &module{state: state{Enabled: true}}
+	mod := &module{state: state{Enabled: true}, expected: make(map[string]string)}
 	got := mod.handleEvent("message.created", eventPayload{
 		MessageRef: "opaque",
-		Text:       ",say хай",
+		MessageKey: "key",
+		Text:       ",say привет",
 		Outgoing:   true,
 	})
 	if len(got) != 0 {
@@ -65,7 +92,7 @@ func TestEventIgnoresCommaPrefixedText(t *testing.T) {
 
 func TestCommandsPersistState(t *testing.T) {
 	dir := t.TempDir()
-	mod := &module{path: filepath.Join(dir, "state.json")}
+	mod := &module{path: filepath.Join(dir, "state.json"), expected: make(map[string]string)}
 
 	if text, err := mod.execute("e", ""); err != nil || text != "CC: включён" {
 		t.Fatalf("enable = %q, %v", text, err)
