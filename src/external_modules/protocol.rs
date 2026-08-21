@@ -56,13 +56,17 @@ pub struct MessageEvent {
 pub enum ReactionSpec {
     Emoji(String),
     CustomEmoji { document_id: String },
+    /// Internal typed payload for the v6 `message.edit` event action.
+    MessageEdit { text: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventAction {
     pub message_ref: String,
-    /// The complete desired reaction set. Protocol v4 permits zero to three
-    /// reactions; an empty set removes the account's reactions from a message.
+    /// Reaction actions store the complete desired reaction set. The v6
+    /// `message.edit` action is represented internally by exactly one
+    /// `ReactionSpec::MessageEdit` payload so legacy action plumbing stays
+    /// source-compatible.
     pub reactions: Vec<ReactionSpec>,
 }
 
@@ -966,10 +970,25 @@ fn parse_event_action(
     value: &serde_json::Value,
     protocol_version: u32,
 ) -> Result<EventAction, ExternalError> {
-    if value.get("type").and_then(|value| value.as_str()) != Some("message.react") {
+    let action_type = value
+        .get("type")
+        .and_then(|value| value.as_str())
+        .ok_or(ExternalError::ProtocolDecode)?;
+    let message_ref = get_string(value, "message_ref")?;
+    if action_type == "message.edit" {
+        if protocol_version != 6 {
+            return Err(ExternalError::ProtocolDecode);
+        }
+        return Ok(EventAction {
+            message_ref,
+            reactions: vec![ReactionSpec::MessageEdit {
+                text: get_string(value, "text")?,
+            }],
+        });
+    }
+    if action_type != "message.react" {
         return Err(ExternalError::ProtocolDecode);
     }
-    let message_ref = get_string(value, "message_ref")?;
     let reactions = if protocol_version == 3 {
         vec![parse_reaction(
             value.get("reaction").ok_or(ExternalError::ProtocolDecode)?,
@@ -1098,11 +1117,6 @@ mod tests {
 
     #[test]
     fn v6_alpha_contract_fixture_conforms_to_its_schema_invariants() {
-        // The frozen artifact must stay structurally consistent with
-        // protocol/v6/alpha-contract.schema.json. The schema requires the
-        // outbound error object to carry kind, message, code, name, and
-        // retry_after_seconds (each optional metadata field integer/string or
-        // null), and the contract revision to be at least 2.
         let fixture: serde_json::Value =
             serde_json::from_str(include_str!("../../protocol/v6/alpha-contract.json")).unwrap();
         for required in [
@@ -1261,14 +1275,28 @@ mod tests {
 
     #[test]
     fn v6_event_result_actions_are_validated_at_the_protocol_boundary() {
-        // A well-formed action parses into the typed shape.
         assert!(matches!(
             parse_v6_inbound_frame(
                 r#"{"protocol_version":6,"type":"event_result","request_id":"2","actions":[{"type":"message.react","message_ref":"r1","reactions":[{"type":"emoji","emoji":"👍"}]}]}"#
             ),
             Ok(V6InboundFrame::EventResult { actions, .. }) if actions.len() == 1
         ));
-        // Too many actions must be rejected at the v6 boundary.
+        let edit = parse_v6_inbound_frame(
+            r#"{"protocol_version":6,"type":"event_result","request_id":"2","actions":[{"type":"message.edit","message_ref":"r1","text":"йах"}]}"#,
+        )
+        .unwrap();
+        let V6InboundFrame::EventResult { actions, .. } = edit else {
+            panic!("expected event result");
+        };
+        assert!(matches!(
+            actions[0].reactions.as_slice(),
+            [ReactionSpec::MessageEdit { text }] if text == "йах"
+        ));
+        assert!(parse_module_line_for(
+            r#"{"protocol_version":5,"type":"event_result","request_id":"2","actions":[{"type":"message.edit","message_ref":"r1","text":"йах"}]}"#,
+            5,
+        )
+        .is_err());
         let too_many = format!(
             r#"{{"protocol_version":6,"type":"event_result","request_id":"2","actions":[{}]}}"#,
             [r#"{"type":"message.react","message_ref":"r1","reactions":[]}"#;
@@ -1279,14 +1307,12 @@ mod tests {
             parse_v6_inbound_frame(&too_many),
             Err(ExternalError::ProtocolDecode)
         ));
-        // Malformed action objects (unknown type) must be rejected.
         assert!(matches!(
             parse_v6_inbound_frame(
                 r#"{"protocol_version":6,"type":"event_result","request_id":"2","actions":[{"type":"text.send","message_ref":"r1"}]}"#
             ),
             Err(ExternalError::ProtocolDecode)
         ));
-        // Too many reactions per action must be rejected.
         let too_many_reactions = format!(
             r#"{{"protocol_version":6,"type":"event_result","request_id":"2","actions":[{{"type":"message.react","message_ref":"r1","reactions":[{}]}}]}}"#,
             [r#"{"type":"emoji","emoji":"a"}"#; MAX_REACTIONS_PER_ACTION + 1].join(",")
@@ -1522,8 +1548,6 @@ mod tests {
 
     #[test]
     fn v6_error_wire_contract_includes_optional_metadata() {
-        // Regression: docs/protocol must agree that error carries kind, message,
-        // plus optional code/name/retry_after_seconds.
         let error = V6CallError {
             kind: "rpc".to_owned(),
             message: "Telegram RPC request failed".to_owned(),
@@ -1543,7 +1567,6 @@ mod tests {
         assert_eq!(value["error"]["name"], "FLOOD_WAIT");
         assert_eq!(value["error"]["retry_after_seconds"], 7);
 
-        // When optional fields are None, they must serialize as null.
         let error = V6CallError {
             kind: "validation".to_owned(),
             message: "bad params".to_owned(),
