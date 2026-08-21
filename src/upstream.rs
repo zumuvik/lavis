@@ -228,7 +228,7 @@ impl UpstreamRev for HttpUpstreamRev {
 
 impl HttpUpstreamRev {
     /// Tangled compare: two calls with swapped rev1/rev2 to derive ahead/behind
-    /// from the `formatPatch` array length in each direction.
+    /// from the `format_patch` array length in each direction.
     async fn compare_tangled(
         &self,
         base: &str,
@@ -242,7 +242,7 @@ impl HttpUpstreamRev {
         })
     }
 
-    /// Returns the `formatPatch` array length for a single Tangled compare
+    /// Returns the `format_patch` array length for a single Tangled compare
     /// call with `rev1=from` and `rev2=to`.
     async fn tangled_patch_count(&self, from: &str, to: &str) -> Result<u64, UpstreamError> {
         let response = self
@@ -264,13 +264,13 @@ impl HttpUpstreamRev {
     }
 }
 
-/// Parses the Tangled compare JSON response, returning the `formatPatch`
+/// Parses the Tangled compare JSON response, returning the `format_patch`
 /// array length.
 fn parse_tangled_compare_response(body: &[u8]) -> Result<u64, UpstreamError> {
     let value: serde_json::Value =
         serde_json::from_slice(body).map_err(|_| UpstreamError::InvalidResponse)?;
     let patches = value
-        .get("formatPatch")
+        .get("format_patch")
         .and_then(|v| v.as_array())
         .ok_or(UpstreamError::InvalidResponse)?;
     Ok(patches.len() as u64)
@@ -504,13 +504,13 @@ mod tests {
 
     #[test]
     fn parses_tangled_compare_response() {
-        let body = br#"{"formatPatch":["patch1","patch2","patch3"]}"#;
+        let body = br#"{"format_patch":["patch1","patch2","patch3"]}"#;
         assert_eq!(parse_tangled_compare_response(body).unwrap(), 3);
     }
 
     #[test]
     fn parses_tangled_compare_empty_patches() {
-        let body = br#"{"formatPatch":[]}"#;
+        let body = br#"{"format_patch":[]}"#;
         assert_eq!(parse_tangled_compare_response(body).unwrap(), 0);
     }
 
