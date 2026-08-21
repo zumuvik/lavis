@@ -308,27 +308,8 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
 
         let self_user_id = outcome.self_user_id();
         let self_identity = outcome.identity().clone();
-        // Defer dialog cache initialization to run concurrently with module startup.
-        // This avoids blocking the entire startup sequence on fetching all dialogs.
-        let dialog_cache_client = guard.inner().client().clone();
-        tokio::spawn(async move {
-            let started = Instant::now();
-
-            if let Err(error) = initialize_dialog_cache(&dialog_cache_client).await {
-                tracing::warn!(
-                    event = "dialog_cache_init_failed",
-                    %error,
-                    "Dialog cache initialization failed"
-                );
-                return;
-            }
-
-            tracing::info!(
-                event = "dialog_cache_initialized",
-                elapsed_ms = started.elapsed().as_millis(),
-                "Dialog cache initialized"
-            );
-        });
+        // Dialog cache initialization removed — it was blocking startup for 44+ seconds
+        // and hanging indefinitely. Grammers will build its cache on-demand.
         let mut stream = {
             let client_ref = guard.inner();
             let receiver = client_ref
@@ -1375,17 +1356,6 @@ async fn modules_status() -> anyhow::Result<()> {
     println!();
     println!("⚠️ Внешние модули запускаются отдельными процессами с правами вашего пользователя.");
     println!("   Lavis не помещает их в системную песочницу. Включайте только доверенные модули.");
-    Ok(())
-}
-
-async fn initialize_dialog_cache(client: &grammers_client::Client) -> anyhow::Result<()> {
-    let mut dialogs = client.iter_dialogs();
-    while dialogs
-        .next()
-        .await
-        .context("failed to initialize the Telegram dialog cache")?
-        .is_some()
-    {}
     Ok(())
 }
 
