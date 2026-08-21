@@ -48,10 +48,10 @@ use crate::{
         LmInstallPlanText, LmLabel, LmText, Locale, PingText, PrefixText, RuntimeText,
         SensitiveText, SetupText, StatsText, Text, alias_text, external_command_text,
         fastfetch_text, info_text, inspection_warning_text, lm_format, lm_label, lm_runtime_status,
-        lm_state_text, lm_text, ping_text, prefix_text, render_lm_doctor_missing_catalog,
-        render_lm_doctor_module, render_lm_doctor_report, render_lm_info, render_lm_install_plan,
-        render_info_text, render_stats_text, runtime_text, sensitive_text, setup_text, stats_text,
-        text,
+        lm_state_text, lm_text, ping_text, prefix_text, render_info_text,
+        render_lm_doctor_missing_catalog, render_lm_doctor_module, render_lm_doctor_report,
+        render_lm_info, render_lm_install_plan, render_stats_text, runtime_text, sensitive_text,
+        setup_text, stats_text, text,
     },
     info,
     onboarding::OnboardingProgress,
@@ -2928,22 +2928,6 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
-const LAVIS_SOURCE_URL: &str = "https://tangled.org/zumuvik.tngl.sh/lavis";
-
-fn format_info(locale: Locale, prefix: &str, installed_external_modules: usize) -> String {
-    let built_in_modules = crate::modules::modules().len();
-    match locale {
-        Locale::English => format!(
-            "ℹ️ Lavis — really your userbot\n\nVersion: {}\nMTProto: grammers\nModule API: v6\nPrefix: {prefix}\nBuilt-in modules: {built_in_modules}\nInstalled external modules: {installed_external_modules}\nSource: {LAVIS_SOURCE_URL}",
-            env!("CARGO_PKG_VERSION")
-        ),
-        Locale::Russian => format!(
-            "ℹ️ Lavis — really your userbot\n\nВерсия: {}\nMTProto: grammers\nAPI модулей: v6\nПрефикс: {prefix}\nВстроенные модули: {built_in_modules}\nУстановленные внешние модули: {installed_external_modules}\nИсходники: {LAVIS_SOURCE_URL}",
-            env!("CARGO_PKG_VERSION")
-        ),
-    }
-}
-
 fn format_stats(
     locale: Locale,
     telegram: &str,
@@ -4568,7 +4552,7 @@ for line in sys.stdin:
             .await
             .unwrap();
         runtime.set_self_identity(crate::auth::SelfIdentity {
-            username: Some("@owner".to_owned()),
+            username: Some("owner".to_owned()),
             display_name: None,
             id: PeerId::self_user(),
         });
@@ -4598,7 +4582,12 @@ for line in sys.stdin:
 
         let execution = runtime.execute_info().await;
 
-        assert!(execution.response.text.contains("Upstream main: unavailable"));
+        assert!(
+            execution
+                .response
+                .text
+                .contains("Upstream main: unavailable")
+        );
         assert!(execution.media.is_some());
         fs::remove_dir_all(directory).ok();
     }

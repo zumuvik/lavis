@@ -309,10 +309,12 @@ fn is_temporary_telegram_error(error: &grammers_client::InvocationError) -> bool
 /// path has no single error type: uploads surface `std::io::Error` while the
 /// send and delete steps surface `InvocationError`.
 fn delivery_error_category(error: &anyhow::Error) -> &'static str {
-    if let Some(source) = error.source() {
-        if source.downcast_ref::<grammers_client::InvocationError>().is_some() {
-            return "invocation";
-        }
+    if error.source().is_some_and(|source| {
+        source
+            .downcast_ref::<grammers_client::InvocationError>()
+            .is_some()
+    }) {
+        return "invocation";
     }
     "other"
 }

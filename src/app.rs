@@ -308,7 +308,27 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
 
         let self_user_id = outcome.self_user_id();
         let self_identity = outcome.identity().clone();
-        initialize_dialog_cache(guard.inner().client()).await?;
+        // Defer dialog cache initialization to run concurrently with module startup.
+        // This avoids blocking the entire startup sequence on fetching all dialogs.
+        let dialog_cache_client = guard.inner().client().clone();
+        tokio::spawn(async move {
+            let started = Instant::now();
+
+            if let Err(error) = initialize_dialog_cache(&dialog_cache_client).await {
+                tracing::warn!(
+                    event = "dialog_cache_init_failed",
+                    %error,
+                    "Dialog cache initialization failed"
+                );
+                return;
+            }
+
+            tracing::info!(
+                event = "dialog_cache_initialized",
+                elapsed_ms = started.elapsed().as_millis(),
+                "Dialog cache initialized"
+            );
+        });
         let mut stream = {
             let client_ref = guard.inner();
             let receiver = client_ref
@@ -410,6 +430,7 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
             settings,
             config.fastfetch_profile_path.clone(),
         );
+        runtime.set_http_upstream();
         runtime.set_self_identity(self_identity);
         runtime.configure_setup(
             config::ConfigPaths::setup_state_path_with(&environment)
