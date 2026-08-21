@@ -1087,10 +1087,6 @@ impl RuntimeState {
             Some(data) => info::short_commit(&data.revision).to_owned(),
             None => info_text(locale, InfoText::Unavailable).to_owned(),
         };
-        let status = match &upstream_data {
-            Some(data) => render_revision_status(locale, data.relation),
-            None => render_revision_status(locale, RevisionRelation::Unavailable),
-        };
         let built_in_modules = crate::modules::modules().len();
         let total_modules = built_in_modules + self.external_descriptors().len();
         let active_modules = built_in_modules
@@ -1113,7 +1109,6 @@ impl RuntimeState {
                 version: env!("CARGO_PKG_VERSION"),
                 commit: info::short_commit(info::build_rev()),
                 upstream: &upstream,
-                status: &status,
                 prefix: &prefix,
                 active_modules,
                 total_modules,
@@ -1121,6 +1116,31 @@ impl RuntimeState {
                 os: &os,
             },
         );
+        // Insert Status line after "Upstream main:" only if relation is known
+        let caption = match &upstream_data {
+            Some(data) if data.relation != RevisionRelation::Unavailable => {
+                let status_line = match locale {
+                    Locale::English => format!("Status: {}", render_revision_status(locale, data.relation)),
+                    Locale::Russian => format!("Статус: {}", render_revision_status(locale, data.relation)),
+                };
+                // Insert after "Upstream main: ..." line
+                let upstream_prefix = match locale {
+                    Locale::English => "Upstream main: ",
+                    Locale::Russian => "Основная ветка: ",
+                };
+                if let Some(pos) = caption.find(upstream_prefix) {
+                    if let Some(newline_pos) = caption[pos..].find('\n') {
+                        let insert_pos = pos + newline_pos + 1;
+                        format!("{}{}\n{}", &caption[..insert_pos], status_line, &caption[insert_pos..])
+                    } else {
+                        caption
+                    }
+                } else {
+                    caption
+                }
+            }
+            _ => caption,
+        };
         let media = info::info_asset_path(
             std::env::var_os("LAVIS_INFO_IMAGE").as_deref(),
             env!("CARGO_MANIFEST_DIR"),

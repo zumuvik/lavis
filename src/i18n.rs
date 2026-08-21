@@ -801,10 +801,10 @@ pub enum InfoText {
 pub fn info_text(locale: Locale, key: InfoText) -> &'static str {
     match (locale, key) {
         (Locale::English, InfoText::Caption) => {
-            "ℹ️ Lavis — really your userbot\n\nOwner: {owner}\nVersion: {version}\nCurrent commit: {commit}\nUpstream main: {upstream}\nStatus: {status}\nPrefix: {prefix}\nModules: {total} ({active} active)\nHost: {host}\nOS: {os}"
+            "ℹ️ Lavis — really your userbot\n\nOwner: {owner}\nVersion: {version}\nCurrent commit: {commit}\nUpstream main: {upstream}\nPrefix: {prefix}\nModules: {total} ({active} active)\nHost: {host}\nOS: {os}"
         }
         (Locale::Russian, InfoText::Caption) => {
-            "ℹ️ Lavis — really your userbot\n\nВладелец: {owner}\nВерсия: {version}\nТекущий коммит: {commit}\nОсновная ветка: {upstream}\nСтатус: {status}\nПрефикс: {prefix}\nМодули: {total} ({active} активных)\nХост: {host}\nОС: {os}"
+            "ℹ️ Lavis — really your userbot\n\nВладелец: {owner}\nВерсия: {version}\nТекущий коммит: {commit}\nОсновная ветка: {upstream}\nПрефикс: {prefix}\nМодули: {total} ({active} активных)\nХост: {host}\nОС: {os}"
         }
         (Locale::English, InfoText::Unknown) => "unknown",
         (Locale::Russian, InfoText::Unknown) => "неизвестно",
@@ -818,7 +818,6 @@ pub struct InfoCaptionData<'a> {
     pub version: &'a str,
     pub commit: &'a str,
     pub upstream: &'a str,
-    pub status: &'a str,
     pub prefix: &'a str,
     pub active_modules: usize,
     pub total_modules: usize,
@@ -832,7 +831,6 @@ pub fn render_info_text(locale: Locale, info: InfoCaptionData<'_>) -> String {
         .replace("{version}", info.version)
         .replace("{commit}", info.commit)
         .replace("{upstream}", info.upstream)
-        .replace("{status}", info.status)
         .replace("{prefix}", info.prefix)
         .replace("{active}", &info.active_modules.to_string())
         .replace("{total}", &info.total_modules.to_string())
@@ -1764,7 +1762,6 @@ mod tests {
                 version: "0.1.0",
                 commit: "b1d18f8",
                 upstream: "unavailable",
-                status: "unavailable",
                 prefix: ",",
                 active_modules: 3,
                 total_modules: 5,
@@ -1776,7 +1773,6 @@ mod tests {
         assert!(english.contains("Version: 0.1.0"));
         assert!(english.contains("Current commit: b1d18f8"));
         assert!(english.contains("Upstream main: unavailable"));
-        assert!(english.contains("Status: unavailable"));
         assert!(english.contains("Prefix: ,"));
         assert!(english.contains("Modules: 5 (3 active)"));
         assert!(english.contains("Host: standalone"));
@@ -1790,7 +1786,6 @@ mod tests {
                 version: "0.1.0",
                 commit: "b1d18f8",
                 upstream: "недоступно",
-                status: "недоступно",
                 prefix: ",",
                 active_modules: 3,
                 total_modules: 5,
@@ -1801,7 +1796,6 @@ mod tests {
         assert!(russian.contains("Владелец: @owner"));
         assert!(russian.contains("Версия: 0.1.0"));
         assert!(russian.contains("Основная ветка: недоступно"));
-        assert!(russian.contains("Статус: недоступно"));
         assert!(russian.contains("Модули: 5 (3 активных)"));
     }
 
