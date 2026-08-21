@@ -55,6 +55,7 @@ pub enum ExternalCapability {
     MessageRead,
     MessagePeerId,
     MessageReact,
+    MessageEdit,
     TelegramAccountStatus,
     TelegramRaw,
 }
@@ -69,6 +70,7 @@ impl ExternalCapability {
             Self::MessageRead => "message.read",
             Self::MessagePeerId => "message.peer_id",
             Self::MessageReact => "message.react",
+            Self::MessageEdit => "message.edit",
             Self::TelegramAccountStatus => "telegram.account.status",
             Self::TelegramRaw => "telegram.raw",
         }
@@ -83,6 +85,7 @@ impl ExternalCapability {
             Self::MessageRead => "чтение сообщений",
             Self::MessagePeerId => "идентификатор чата сообщения",
             Self::MessageReact => "реакции на сообщения",
+            Self::MessageEdit => "изменение исходящих сообщений",
             Self::TelegramAccountStatus => "изменение статуса аккаунта Telegram",
             // This grants arbitrary Telegram RPC authority, not a sandbox boundary.
             Self::TelegramRaw => "полный доступ к Telegram RPC без песочницы",
@@ -98,6 +101,7 @@ impl ExternalCapability {
             "message.read" => Some(Self::MessageRead),
             "message.peer_id" => Some(Self::MessagePeerId),
             "message.react" => Some(Self::MessageReact),
+            "message.edit" => Some(Self::MessageEdit),
             "telegram.account.status" => Some(Self::TelegramAccountStatus),
             "telegram.raw" => Some(Self::TelegramRaw),
             _ => None,
@@ -130,10 +134,15 @@ impl ExternalSubscription {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExternalAction {
     MessageReact,
+    MessageEdit,
 }
 impl ExternalAction {
     fn from_str(value: &str) -> Option<Self> {
-        (value == "message.react").then_some(Self::MessageReact)
+        match value {
+            "message.react" => Some(Self::MessageReact),
+            "message.edit" => Some(Self::MessageEdit),
+            _ => None,
+        }
     }
 }
 
@@ -392,6 +401,9 @@ pub fn validate_manifest_at(
         }
         seen_capabilities.push(cap);
     }
+    if seen_capabilities.contains(&ExternalCapability::MessageEdit) && manifest.schema_version != 6 {
+        return Err(ExternalError::InvalidCapability);
+    }
     let telegram_method_names = manifest.telegram_methods.unwrap_or_default();
     let has_raw = seen_capabilities.contains(&ExternalCapability::TelegramRaw);
     let requests_raw = telegram_method_names
@@ -453,6 +465,9 @@ pub fn validate_manifest_at(
     }
     for value in &manifest.actions {
         let action = ExternalAction::from_str(value).ok_or(ExternalError::InvalidArgument)?;
+        if action == ExternalAction::MessageEdit && manifest.schema_version != 6 {
+            return Err(ExternalError::UnsupportedSchemaVersion);
+        }
         if actions.contains(&action) {
             return Err(ExternalError::InvalidArgument);
         }
@@ -541,6 +556,11 @@ pub fn validate_manifest_at(
     }
     if actions.contains(&ExternalAction::MessageReact)
         && !seen_capabilities.contains(&ExternalCapability::MessageReact)
+    {
+        return Err(ExternalError::InvalidCapability);
+    }
+    if actions.contains(&ExternalAction::MessageEdit)
+        && !seen_capabilities.contains(&ExternalCapability::MessageEdit)
     {
         return Err(ExternalError::InvalidCapability);
     }
@@ -771,6 +791,29 @@ mod tests {
                 .subscriptions
                 .contains(&ExternalSubscription::MessageEdited)
         );
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn v6_manifest_accepts_message_edit_and_legacy_rejects_it() {
+        let base = temp_dir();
+        let dir = create_module_dir(&base, "echo");
+        let mut json = serde_json::from_slice::<serde_json::Value>(&valid_manifest_json()).unwrap();
+        json["schema_version"] = serde_json::json!(6);
+        json["subscriptions"] = serde_json::json!(["message.created"]);
+        json["capabilities"] = serde_json::json!(["message.read", "message.edit"]);
+        json["actions"] = serde_json::json!(["message.edit"]);
+        let path = write_manifest(&dir, &serde_json::to_vec(&json).unwrap());
+        let descriptor = validate_manifest_at(&path, Some("echo")).unwrap();
+        assert!(descriptor.capabilities.contains(&ExternalCapability::MessageEdit));
+        assert!(descriptor.actions.contains(&ExternalAction::MessageEdit));
+
+        json["schema_version"] = serde_json::json!(5);
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(matches!(
+            validate_manifest_at(&path, Some("echo")),
+            Err(ExternalError::InvalidCapability) | Err(ExternalError::UnsupportedSchemaVersion)
+        ));
         fs::remove_dir_all(&base).unwrap();
     }
 
