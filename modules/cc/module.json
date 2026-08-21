@@ -1,0 +1,37 @@
+{
+  "schema_version": 6,
+  "id": "cc",
+  "name": "CC",
+  "version": "0.1.0",
+  "author": "zumuvik",
+  "entrypoint": "cc",
+  "capabilities": [
+    "persistent_state_read",
+    "persistent_state_write",
+    "message.read",
+    "message.edit"
+  ],
+  "subscriptions": [
+    "message.created",
+    "message.edited"
+  ],
+  "actions": [
+    "message.edit"
+  ],
+  "commands": [
+    {
+      "name": "e",
+      "summary_ru": "Включить автозамену хай → йах",
+      "description_ru": "Включает замену «хай» на «йах» в исходящих сообщениях.",
+      "usage": "[без аргументов]",
+      "examples": []
+    },
+    {
+      "name": "d",
+      "summary_ru": "Выключить автозамену хай → йах",
+      "description_ru": "Выключает замену «хай» на «йах» в исходящих сообщениях.",
+      "usage": "[без аргументов]",
+      "examples": []
+    }
+  ]
+}
