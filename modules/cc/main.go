@@ -14,6 +14,7 @@ const protocolVersion = 6
 
 type eventPayload struct {
 	MessageRef string `json:"message_ref"`
+	MessageKey string `json:"message_key"`
 	Text       string `json:"text"`
 	Outgoing   bool   `json:"outgoing"`
 }
@@ -51,8 +52,9 @@ type state struct {
 }
 
 type module struct {
-	path  string
-	state state
+	path     string
+	state    state
+	expected map[string]string
 }
 
 func main() {
@@ -100,7 +102,7 @@ func loadModule() (*module, error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("read state: %w", err)
 	}
-	return &module{path: path, state: current}, nil
+	return &module{path: path, state: current, expected: make(map[string]string)}, nil
 }
 
 func statePath() (string, error) {
@@ -169,6 +171,7 @@ func (m *module) execute(command, arguments string) (string, error) {
 		return "CC: включён", nil
 	case "d":
 		m.state.Enabled = false
+		m.expected = make(map[string]string)
 		if err := m.save(); err != nil {
 			return "", err
 		}
@@ -179,7 +182,7 @@ func (m *module) execute(command, arguments string) (string, error) {
 }
 
 func (m *module) handleEvent(event string, payload eventPayload) []eventAction {
-	if !m.state.Enabled || !payload.Outgoing || payload.MessageRef == "" {
+	if !m.state.Enabled || !payload.Outgoing || payload.MessageRef == "" || payload.MessageKey == "" {
 		return []eventAction{}
 	}
 	if event != "message.created" && event != "message.edited" {
@@ -188,11 +191,16 @@ func (m *module) handleEvent(event string, payload eventPayload) []eventAction {
 	if strings.HasPrefix(payload.Text, ",") {
 		return []eventAction{}
 	}
+	if expected, ok := m.expected[payload.MessageKey]; ok && expected == payload.Text {
+		delete(m.expected, payload.MessageKey)
+		return []eventAction{}
+	}
 
-	rewritten := replaceHai(payload.Text)
+	rewritten := reverseText(payload.Text)
 	if rewritten == payload.Text {
 		return []eventAction{}
 	}
+	m.expected[payload.MessageKey] = rewritten
 	return []eventAction{{
 		Type:       "message.edit",
 		MessageRef: payload.MessageRef,
@@ -200,10 +208,12 @@ func (m *module) handleEvent(event string, payload eventPayload) []eventAction {
 	}}
 }
 
-func replaceHai(text string) string {
-	text = strings.ReplaceAll(text, "ХАЙ", "ЙАХ")
-	text = strings.ReplaceAll(text, "Хай", "Йах")
-	return strings.ReplaceAll(text, "хай", "йах")
+func reverseText(text string) string {
+	runes := []rune(text)
+	for left, right := 0, len(runes)-1; left < right; left, right = left+1, right-1 {
+		runes[left], runes[right] = runes[right], runes[left]
+	}
+	return string(runes)
 }
 
 func (m *module) save() error {
