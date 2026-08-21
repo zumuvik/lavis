@@ -507,16 +507,20 @@ impl RuntimeState {
     }
 
     /// Resolves the upstream `main` revision and its relation to the current
-    /// build once per TTL. Failures are cached as `None` so repeated `info`
-    /// invocations do not hammer the endpoint; the caption renders the
-    /// localized "unavailable" for it.
+    /// build once per TTL. Uses an optimized compare algorithm that minimizes
+    /// API calls by leveraging merge_base information. Handles rate limiting
+    /// by preserving stale successful values.
     async fn upstream_revision(&mut self) -> Option<UpstreamRevision> {
         const UPSTREAM_REVISION_TTL: Duration = Duration::from_secs(300);
+        const RATE_LIMIT_CACHE_TTL: Duration = Duration::from_secs(60);
+
+        // Check cache
         if let Some((resolved_at, cached)) = self.upstream_revision_cache.as_ref()
             && resolved_at.elapsed() < UPSTREAM_REVISION_TTL
         {
             return cached.clone();
         }
+
         let resolved = match &self.upstream {
             Some(upstream) => {
                 let main_rev = match upstream.main_rev().await {
@@ -531,19 +535,91 @@ impl RuntimeState {
                         return None;
                     }
                 };
+
                 let current_rev = info::build_rev();
                 let relation = if current_rev == "unknown" {
                     RevisionRelation::Unavailable
                 } else if current_rev == main_rev {
+                    // Current == main: no compare needed
                     RevisionRelation::Current
                 } else {
+                    // First compare: main -> current
                     match upstream.compare(&main_rev, current_rev).await {
-                        Ok(compare_result) => {
-                            crate::upstream::relation_from_compare(&compare_result)
+                        Ok(first_compare) => {
+                            // Determine relation from merge_base
+                            match first_compare.merge_base.as_deref() {
+                                Some(base) if base == main_rev => {
+                                    // merge_base == main: current is ahead of main
+                                    RevisionRelation::Ahead {
+                                        commits: first_compare.ahead_by,
+                                    }
+                                }
+                                Some(base) if base == current_rev => {
+                                    // merge_base == current: current is behind main
+                                    // Need reverse compare to get behind count
+                                    match upstream.compare(current_rev, &main_rev).await {
+                                        Ok(reverse_compare) => RevisionRelation::Behind {
+                                            commits: reverse_compare.ahead_by,
+                                        },
+                                        Err(error) => {
+                                            tracing::warn!(
+                                                event = "upstream_compare_failed",
+                                                category = %error,
+                                                base = %current_rev,
+                                                head = %main_rev,
+                                                "Reverse compare failed"
+                                            );
+                                            RevisionRelation::Unavailable
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    // Diverged or no merge_base: need reverse compare
+                                    match upstream.compare(current_rev, &main_rev).await {
+                                        Ok(reverse_compare) => RevisionRelation::Diverged {
+                                            ahead: first_compare.ahead_by,
+                                            behind: reverse_compare.ahead_by,
+                                        },
+                                        Err(error) => {
+                                            tracing::warn!(
+                                                event = "upstream_compare_failed",
+                                                category = %error,
+                                                base = %current_rev,
+                                                head = %main_rev,
+                                                "Reverse compare failed"
+                                            );
+                                            RevisionRelation::Unavailable
+                                        }
+                                    }
+                                }
+                            }
                         }
                         Err(crate::upstream::UpstreamError::RevisionNotFound { .. }) => {
-                            // Current commit not published on Tangled.
+                            // Current commit not published on Tangled
                             RevisionRelation::Unavailable
+                        }
+                        Err(crate::upstream::UpstreamError::RateLimited { .. }) => {
+                            // Rate limited: preserve stale value if available
+                            tracing::warn!(
+                                event = "upstream_rate_limited",
+                                "Tangled API rate limit exceeded, preserving stale value"
+                            );
+                            // Clone stale value before modifying cache
+                            let stale_value = self
+                                .upstream_revision_cache
+                                .as_ref()
+                                .and_then(|(_, cached)| cached.clone());
+                            
+                            if let Some(stale) = stale_value {
+                                // Use stale value, extend cache briefly
+                                self.upstream_revision_cache =
+                                    Some((Instant::now(), Some(stale.clone())));
+                                return Some(stale);
+                            }
+                            // No stale value: negative-cache briefly
+                            self.upstream_revision_cache =
+                                Some((Instant::now() - UPSTREAM_REVISION_TTL + RATE_LIMIT_CACHE_TTL, None));
+                            return None;
                         }
                         Err(error) => {
                             tracing::warn!(

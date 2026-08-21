@@ -20,11 +20,12 @@ pub trait UpstreamRev: Send + Sync {
 }
 
 /// Outcome of comparing two revisions: how many commits `head` is ahead of
-/// and/or behind `base`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// and/or behind `base`, plus the merge base if available.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompareResult {
     pub ahead_by: u64,
     pub behind_by: u64,
+    pub merge_base: Option<String>,
 }
 
 /// How the current build relates to the upstream `main` branch.
@@ -63,6 +64,7 @@ pub enum UpstreamError {
     RepoNotFound,
     InvalidResponse,
     NoMainRef,
+    RateLimited { retry_after: Option<Duration> },
 }
 
 impl std::fmt::Display for UpstreamError {
@@ -77,6 +79,13 @@ impl std::fmt::Display for UpstreamError {
             Self::RepoNotFound => write!(f, "repo_not_found"),
             Self::InvalidResponse => write!(f, "invalid_response"),
             Self::NoMainRef => write!(f, "no_main_ref"),
+            Self::RateLimited { retry_after } => {
+                if let Some(duration) = retry_after {
+                    write!(f, "rate_limited(retry_after={}s)", duration.as_secs())
+                } else {
+                    write!(f, "rate_limited")
+                }
+            }
         }
     }
 }
@@ -234,17 +243,15 @@ impl HttpUpstreamRev {
         base: &str,
         head: &str,
     ) -> Result<CompareResult, UpstreamError> {
-        let ahead_by = self.tangled_patch_count(head, base).await?;
-        let behind_by = self.tangled_patch_count(base, head).await?;
-        Ok(CompareResult {
-            ahead_by,
-            behind_by,
-        })
+        // Single compare call: main -> current
+        // The caller (runtime.rs) will determine the relation from merge_base
+        // and make a reverse call if needed for Behind/Diverged cases.
+        self.tangled_compare(head, base).await
     }
 
-    /// Returns the `format_patch` array length for a single Tangled compare
-    /// call with `rev1=from` and `rev2=to`.
-    async fn tangled_patch_count(&self, from: &str, to: &str) -> Result<u64, UpstreamError> {
+    /// Performs a single Tangled compare call with `rev1=from` and `rev2=to`,
+    /// returning a [`CompareResult`] with `ahead_by` and optional `merge_base`.
+    async fn tangled_compare(&self, from: &str, to: &str) -> Result<CompareResult, UpstreamError> {
         let response = self
             .client
             .get(TANGLED_COMPARE_URL)
@@ -264,28 +271,48 @@ impl HttpUpstreamRev {
     }
 }
 
-/// Parses the Tangled compare JSON response, returning the `format_patch`
-/// array length.
-fn parse_tangled_compare_response(body: &[u8]) -> Result<u64, UpstreamError> {
+/// Parses the Tangled compare JSON response, returning a [`CompareResult`]
+/// with `ahead_by` (from `format_patch` array length) and optional `merge_base`.
+fn parse_tangled_compare_response(body: &[u8]) -> Result<CompareResult, UpstreamError> {
     let value: serde_json::Value =
         serde_json::from_slice(body).map_err(|_| UpstreamError::InvalidResponse)?;
     let patches = value
         .get("format_patch")
         .and_then(|v| v.as_array())
         .ok_or(UpstreamError::InvalidResponse)?;
-    Ok(patches.len() as u64)
+    let merge_base = value
+        .get("merge_base")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    Ok(CompareResult {
+        ahead_by: patches.len() as u64,
+        behind_by: 0, // behind_by is computed by the caller via reverse compare
+        merge_base,
+    })
 }
 
 /// Parses a non-success Tangled compare response body, extracting structured
-/// error names (`RevisionNotFound`, `RepoNotFound`) when present. Falls back
-/// to a plain `HttpStatus` error when the body is not JSON or the error name
-/// is unrecognized.
+/// error names (`RevisionNotFound`, `RepoNotFound`, `RateLimitExceeded`) when
+/// present. Falls back to a plain `HttpStatus` error when the body is not JSON
+/// or the error name is unrecognized.
 fn parse_tangled_error_response(
     status: u16,
     body: &[u8],
     from: &str,
     to: &str,
-) -> Result<u64, UpstreamError> {
+) -> Result<CompareResult, UpstreamError> {
+    // Handle 429 rate limiting specially
+    if status == 429 {
+        tracing::warn!(
+            event = "tangled_rate_limited",
+            status,
+            from,
+            to,
+            "Tangled API rate limit exceeded"
+        );
+        return Err(UpstreamError::RateLimited { retry_after: None });
+    }
+
     if let Ok(error_body) = serde_json::from_slice::<serde_json::Value>(body)
         && let Some(error_name) = error_body.get("error").and_then(|e| e.as_str())
     {
@@ -319,6 +346,16 @@ fn parse_tangled_error_response(
                     "Tangled reported RepoNotFound"
                 );
                 return Err(UpstreamError::RepoNotFound);
+            }
+            "RateLimitExceeded" => {
+                tracing::warn!(
+                    event = "tangled_rate_limited",
+                    status,
+                    from,
+                    to,
+                    "Tangled API rate limit exceeded"
+                );
+                return Err(UpstreamError::RateLimited { retry_after: None });
             }
             _ => {
                 tracing::debug!(
@@ -472,28 +509,32 @@ mod tests {
         assert_eq!(
             relation_from_compare(&CompareResult {
                 ahead_by: 0,
-                behind_by: 0
+                behind_by: 0,
+                merge_base: None,
             }),
             RevisionRelation::Current
         );
         assert_eq!(
             relation_from_compare(&CompareResult {
                 ahead_by: 5,
-                behind_by: 0
+                behind_by: 0,
+                merge_base: Some("abc123".to_string()),
             }),
             RevisionRelation::Ahead { commits: 5 }
         );
         assert_eq!(
             relation_from_compare(&CompareResult {
                 ahead_by: 0,
-                behind_by: 3
+                behind_by: 3,
+                merge_base: None,
             }),
             RevisionRelation::Behind { commits: 3 }
         );
         assert_eq!(
             relation_from_compare(&CompareResult {
                 ahead_by: 2,
-                behind_by: 4
+                behind_by: 4,
+                merge_base: None,
             }),
             RevisionRelation::Diverged {
                 ahead: 2,
@@ -504,14 +545,26 @@ mod tests {
 
     #[test]
     fn parses_tangled_compare_response() {
-        let body = br#"{"format_patch":["patch1","patch2","patch3"]}"#;
-        assert_eq!(parse_tangled_compare_response(body).unwrap(), 3);
+        let body = br#"{"format_patch":["patch1","patch2","patch3"],"merge_base":"abc123"}"#;
+        let result = parse_tangled_compare_response(body).unwrap();
+        assert_eq!(result.ahead_by, 3);
+        assert_eq!(result.merge_base, Some("abc123".to_string()));
     }
 
     #[test]
     fn parses_tangled_compare_empty_patches() {
-        let body = br#"{"format_patch":[]}"#;
-        assert_eq!(parse_tangled_compare_response(body).unwrap(), 0);
+        let body = br#"{"format_patch":[],"merge_base":"def456"}"#;
+        let result = parse_tangled_compare_response(body).unwrap();
+        assert_eq!(result.ahead_by, 0);
+        assert_eq!(result.merge_base, Some("def456".to_string()));
+    }
+
+    #[test]
+    fn parses_tangled_compare_without_merge_base() {
+        let body = br#"{"format_patch":["patch1"]}"#;
+        let result = parse_tangled_compare_response(body).unwrap();
+        assert_eq!(result.ahead_by, 1);
+        assert_eq!(result.merge_base, None);
     }
 
     #[test]
