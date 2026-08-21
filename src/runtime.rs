@@ -541,6 +541,10 @@ impl RuntimeState {
                         Ok(compare_result) => {
                             crate::upstream::relation_from_compare(&compare_result)
                         }
+                        Err(crate::upstream::UpstreamError::RevisionNotFound { .. }) => {
+                            // Current commit not published on Tangled.
+                            RevisionRelation::Unavailable
+                        }
                         Err(error) => {
                             tracing::warn!(
                                 event = "upstream_compare_failed",

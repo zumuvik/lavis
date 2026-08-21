@@ -54,11 +54,13 @@ pub fn relation_from_compare(compare: &CompareResult) -> RevisionRelation {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UpstreamError {
     Transport,
     Timeout,
     HttpStatus(u16),
+    RevisionNotFound { revision: String },
+    RepoNotFound,
     InvalidResponse,
     NoMainRef,
 }
@@ -69,6 +71,10 @@ impl std::fmt::Display for UpstreamError {
             Self::Transport => write!(f, "transport"),
             Self::Timeout => write!(f, "timeout"),
             Self::HttpStatus(code) => write!(f, "http_status_{}", code),
+            Self::RevisionNotFound { revision } => {
+                write!(f, "revision_not_found({})", revision)
+            }
+            Self::RepoNotFound => write!(f, "repo_not_found"),
             Self::InvalidResponse => write!(f, "invalid_response"),
             Self::NoMainRef => write!(f, "no_main_ref"),
         }
@@ -78,7 +84,7 @@ impl std::fmt::Display for UpstreamError {
 const UPSTREAM_INFO_REFS_URL: &str =
     "https://tangled.org/zumuvik.tngl.sh/lavis/info/refs?service=git-upload-pack";
 const TANGLED_COMPARE_URL: &str = "https://tangled.org/xrpc/sh.tangled.repo.compare";
-const TANGLED_COMPARE_REPO: &str = "did%3Aplc%3Atrc7yr7p6ikl5fxfupm5mia2%2Flavis";
+const TANGLED_COMPARE_REPO: &str = "did:plc:trc7yr7p6ikl5fxfupm5mia2/lavis";
 const SHA1_HEX_LEN: usize = 40;
 const MAX_INFO_REFS_BODY_BYTES: usize = 64 * 1024;
 const UPSTREAM_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
@@ -193,6 +199,18 @@ impl UpstreamRev for HttpUpstreamRev {
         Box::pin(async move {
             match self.compare_tangled(base, head).await {
                 Ok(result) => Ok(result),
+                Err(UpstreamError::RevisionNotFound { .. }) => {
+                    // Current commit not on Tangled — expected for unpublished commits.
+                    tracing::info!(
+                        event = "upstream_revision_not_on_tangled",
+                        base,
+                        head,
+                        "Current commit not found on Tangled, marking as unavailable"
+                    );
+                    Err(UpstreamError::RevisionNotFound {
+                        revision: head.to_string(),
+                    })
+                }
                 Err(error) => {
                     tracing::warn!(
                         event = "tangled_compare_failed",
@@ -227,16 +245,21 @@ impl HttpUpstreamRev {
     /// Returns the `formatPatch` array length for a single Tangled compare
     /// call with `rev1=from` and `rev2=to`.
     async fn tangled_patch_count(&self, from: &str, to: &str) -> Result<u64, UpstreamError> {
-        let url = format!(
-            "{}?repo={}&rev1={}&rev2={}",
-            TANGLED_COMPARE_URL, TANGLED_COMPARE_REPO, from, to,
-        );
-        let response = self.client.get(&url).send().await.map_err(request_error)?;
+        let response = self
+            .client
+            .get(TANGLED_COMPARE_URL)
+            .query(&[("repo", TANGLED_COMPARE_REPO), ("rev1", from), ("rev2", to)])
+            .send()
+            .await
+            .map_err(request_error)?;
+
         let status = response.status();
-        if !status.is_success() {
-            return Err(UpstreamError::HttpStatus(status.as_u16()));
-        }
         let body = read_bounded_body(response).await?;
+
+        if !status.is_success() {
+            return parse_tangled_error_response(status.as_u16(), &body, from, to);
+        }
+
         parse_tangled_compare_response(&body)
     }
 }
@@ -251,6 +274,72 @@ fn parse_tangled_compare_response(body: &[u8]) -> Result<u64, UpstreamError> {
         .and_then(|v| v.as_array())
         .ok_or(UpstreamError::InvalidResponse)?;
     Ok(patches.len() as u64)
+}
+
+/// Parses a non-success Tangled compare response body, extracting structured
+/// error names (`RevisionNotFound`, `RepoNotFound`) when present. Falls back
+/// to a plain `HttpStatus` error when the body is not JSON or the error name
+/// is unrecognized.
+fn parse_tangled_error_response(
+    status: u16,
+    body: &[u8],
+    from: &str,
+    to: &str,
+) -> Result<u64, UpstreamError> {
+    if let Ok(error_body) = serde_json::from_slice::<serde_json::Value>(body)
+        && let Some(error_name) = error_body.get("error").and_then(|e| e.as_str())
+    {
+        match error_name {
+            "RevisionNotFound" => {
+                // Determine which revision was not found by checking
+                // whether the message mentions `from` (otherwise assume `to`).
+                let revision = if error_body
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .is_some_and(|m| m.contains(from))
+                {
+                    from.to_string()
+                } else {
+                    to.to_string()
+                };
+                tracing::debug!(
+                    event = "tangled_revision_not_found",
+                    status,
+                    revision = %revision,
+                    from,
+                    to,
+                    "Tangled reported RevisionNotFound"
+                );
+                return Err(UpstreamError::RevisionNotFound { revision });
+            }
+            "RepoNotFound" => {
+                tracing::debug!(
+                    event = "tangled_repo_not_found",
+                    status,
+                    "Tangled reported RepoNotFound"
+                );
+                return Err(UpstreamError::RepoNotFound);
+            }
+            _ => {
+                tracing::debug!(
+                    event = "tangled_error_response",
+                    status,
+                    error_name,
+                    from,
+                    to,
+                    "Tangled returned an unrecognized error name"
+                );
+            }
+        }
+    }
+    tracing::debug!(
+        event = "tangled_http_error",
+        status,
+        from,
+        to,
+        "Tangled compare returned a non-success status"
+    );
+    Err(UpstreamError::HttpStatus(status))
 }
 
 #[cfg(test)]
@@ -446,5 +535,85 @@ mod tests {
             mock.compare("base", "head").await,
             Err(UpstreamError::Transport)
         );
+    }
+
+    #[test]
+    fn parses_revision_not_found_error_with_from_revision() {
+        let body = br#"{"error":"RevisionNotFound","message":"revision abc123 not found"}"#;
+        let result = parse_tangled_error_response(400, body, "abc123", "def456");
+        assert_eq!(
+            result,
+            Err(UpstreamError::RevisionNotFound {
+                revision: "abc123".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn parses_revision_not_found_error_defaults_to_to_revision() {
+        let body = br#"{"error":"RevisionNotFound","message":"revision not found"}"#;
+        let result = parse_tangled_error_response(400, body, "abc123", "def456");
+        assert_eq!(
+            result,
+            Err(UpstreamError::RevisionNotFound {
+                revision: "def456".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn parses_revision_not_found_error_without_message() {
+        let body = br#"{"error":"RevisionNotFound"}"#;
+        let result = parse_tangled_error_response(400, body, "abc123", "def456");
+        assert_eq!(
+            result,
+            Err(UpstreamError::RevisionNotFound {
+                revision: "def456".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn parses_repo_not_found_error() {
+        let body = br#"{"error":"RepoNotFound","message":"repo does not exist"}"#;
+        let result = parse_tangled_error_response(400, body, "abc123", "def456");
+        assert_eq!(result, Err(UpstreamError::RepoNotFound));
+    }
+
+    #[test]
+    fn unrecognized_error_name_falls_back_to_http_status() {
+        let body = br#"{"error":"SomeNewError","message":"something"}"#;
+        let result = parse_tangled_error_response(500, body, "abc123", "def456");
+        assert_eq!(result, Err(UpstreamError::HttpStatus(500)));
+    }
+
+    #[test]
+    fn non_json_error_body_falls_back_to_http_status() {
+        let body = b"Internal Server Error";
+        let result = parse_tangled_error_response(500, body, "abc123", "def456");
+        assert_eq!(result, Err(UpstreamError::HttpStatus(500)));
+    }
+
+    #[test]
+    fn upstream_error_display_variants() {
+        assert_eq!(UpstreamError::Transport.to_string(), "transport");
+        assert_eq!(UpstreamError::Timeout.to_string(), "timeout");
+        assert_eq!(
+            UpstreamError::HttpStatus(404).to_string(),
+            "http_status_404"
+        );
+        assert_eq!(
+            UpstreamError::RevisionNotFound {
+                revision: "abc123".to_string()
+            }
+            .to_string(),
+            "revision_not_found(abc123)"
+        );
+        assert_eq!(UpstreamError::RepoNotFound.to_string(), "repo_not_found");
+        assert_eq!(
+            UpstreamError::InvalidResponse.to_string(),
+            "invalid_response"
+        );
+        assert_eq!(UpstreamError::NoMainRef.to_string(), "no_main_ref");
     }
 }
