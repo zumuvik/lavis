@@ -83,8 +83,8 @@ impl std::fmt::Display for UpstreamError {
 
 const UPSTREAM_INFO_REFS_URL: &str =
     "https://tangled.org/zumuvik.tngl.sh/lavis/info/refs?service=git-upload-pack";
-const TANGLED_COMPARE_URL: &str = "https://tangled.org/xrpc/sh.tangled.repo.compare";
-const TANGLED_COMPARE_REPO: &str = "did:plc:trc7yr7p6ikl5fxfupm5mia2/lavis";
+const TANGLED_COMPARE_URL: &str = "https://api.tangled.org/xrpc/sh.tangled.repo.compare";
+const TANGLED_COMPARE_REPO: &str = "at://did:plc:trc7yr7p6ikl5fxfupm5mia2/sh.tangled.repo/lavis";
 const SHA1_HEX_LEN: usize = 40;
 const MAX_INFO_REFS_BODY_BYTES: usize = 64 * 1024;
 const UPSTREAM_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
