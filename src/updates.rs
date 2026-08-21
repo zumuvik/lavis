@@ -223,9 +223,6 @@ pub async fn run(
                                     .context("Telegram update stream ended or failed"));
                             }
                         };
-                        // A BotFather RPC is part of processing this update. Keep it
-                        // structured (rather than detached), but continue to honor
-                        // shutdown and the owned setup deadline while it is pending.
                         let process_timeout = runtime.setup_timeout_deadline();
                         enum ProcessingResult {
                             Completed(Option<ShutdownReason>),
@@ -365,9 +362,6 @@ async fn process_update(
         "Received Telegram message update"
     );
 
-    // Setup is an exclusive interaction. Determine its routing before the
-    // external message.created projection so neither setup replies nor a
-    // resolved BotFather conversation can reach external modules.
     let action = route(authored_by_self, message.text(), runtime);
     let setup_input = if matches!(&action, Some(Action::Setup(_))) {
         None
@@ -400,13 +394,17 @@ async fn process_update(
             }
         }
     };
-    let event_protected = action.is_some()
+    let event_protected = active_prefix_protects_message(
+        authored_by_self,
+        message.text(),
+        runtime.prefix(),
+    ) || action.is_some()
         || setup_input.is_some()
         || runtime.setup_protects_message(peer_id, authored_by_self);
 
-    // New command/setup messages stay private. If an already-projected message is
-    // edited into protected content, emit a redacted edit so modules can reconcile
-    // prior actions without receiving command or setup text.
+    // New active-prefix/command/setup messages stay private. If an already-projected
+    // message is edited into protected content, emit a redacted edit so modules can
+    // reconcile prior actions without receiving control/setup text.
     if should_prepare_message_event(edited, event_protected) {
         let event = if edited {
             crate::external_modules::protocol::MessageEventKind::Edited
@@ -432,11 +430,11 @@ async fn process_update(
         } else if let Some(dispatch) = runtime.prepare_message_event_dispatch(
             peer_id, message_id, event, event_text, outgoing, entities,
         ) {
-            let reaction_message = message.clone();
-            let reaction_client = client.clone();
+            let event_message = message.clone();
+            let event_client = client.clone();
             let spawned = event_dispatches.try_spawn(async move {
                 let result = dispatch.execute().await;
-                handle_event_dispatch(reaction_client, reaction_message, result).await;
+                handle_event_dispatch(event_client, event_message, result).await;
             });
             debug_assert!(
                 spawned,
@@ -474,7 +472,6 @@ async fn process_update(
         return None;
     }
     if setup_input.is_some() {
-        // BotFather replies are setup-private but are not ours to edit.
         if let Some(response) = setup_input {
             send_setup_notification(client, runtime, response).await;
         }
@@ -799,6 +796,10 @@ fn register_reboot_completion_suppression(
     );
 }
 
+fn active_prefix_protects_message(authored_by_self: bool, text: &str, prefix: &str) -> bool {
+    authored_by_self && text.starts_with(prefix)
+}
+
 fn should_prepare_message_event(edited: bool, event_protected: bool) -> bool {
     edited || !event_protected
 }
@@ -817,6 +818,40 @@ async fn handle_event_dispatch(
         );
     }
     for action in result.actions {
+        if let [crate::external_modules::protocol::ReactionSpec::MessageEdit { text }] =
+            action.reactions.as_slice()
+        {
+            if !message.outgoing() {
+                tracing::warn!(
+                    event = "external_edit_rejected",
+                    message_id = message.id(),
+                    "External edit action targeted a non-outgoing message"
+                );
+                continue;
+            }
+            if message.text() == text.as_str() {
+                continue;
+            }
+            let input = grammers_client::message::InputMessage::new().text(text.clone());
+            if let Err(error) = message.edit(input).await {
+                if error.is("MESSAGE_NOT_MODIFIED") {
+                    tracing::debug!(
+                        event = "external_edit_not_modified",
+                        message_id = message.id(),
+                        "External message edit already matched the requested text"
+                    );
+                } else {
+                    tracing::warn!(
+                        event = "external_edit_failed",
+                        message_id = message.id(),
+                        error_category = invocation_error_category(&error),
+                        "External message edit action failed"
+                    );
+                }
+            }
+            continue;
+        }
+
         let mut reactions = Vec::with_capacity(action.reactions.len());
         for reaction in action.reactions {
             match reaction {
@@ -829,6 +864,7 @@ async fn handle_event_dispatch(
                     };
                     reactions.push(tl::types::ReactionCustomEmoji { document_id }.into());
                 }
+                crate::external_modules::protocol::ReactionSpec::MessageEdit { .. } => continue,
             }
         }
         let peer = match message.peer_ref().await {
@@ -951,7 +987,6 @@ fn route(authored_by_self: bool, text: &str, runtime: &RuntimeState) -> Option<A
     let command = authored_by_self
         .then(|| parse(text, runtime.prefix()))
         .flatten()?;
-    // Order: built-in > external namespaced > external default > alias.
     dispatch(&command)
         .or_else(|| runtime.resolve_external(&command.name, &command.args))
         .or_else(|| {
@@ -970,10 +1005,10 @@ mod tests {
 
     use super::{
         EventDispatches, MAX_EVENT_DISPATCH_TASKS, ProvisionTasks, UPDATE_STREAM_RESTART_AFTER,
-        UPDATE_STREAM_RETRY_BASE, UPDATE_STREAM_RETRY_MAX, UpdateOrEvent, is_self_authored,
-        is_temporary_telegram_error, provision_completion_text,
-        register_reboot_completion_suppression, route, should_prepare_message_event,
-        update_stream_retry_delay,
+        UPDATE_STREAM_RETRY_BASE, UPDATE_STREAM_RETRY_MAX, UpdateOrEvent,
+        active_prefix_protects_message, is_self_authored, is_temporary_telegram_error,
+        provision_completion_text, register_reboot_completion_suppression, route,
+        should_prepare_message_event, update_stream_retry_delay,
     };
     use crate::commands::{Action, ExternalInvocation, PrefixRequest};
     use crate::{
@@ -1005,6 +1040,22 @@ mod tests {
     }
 
     #[test]
+    fn active_prefix_is_private_for_self_authored_messages() {
+        assert!(active_prefix_protects_message(true, ",unknown хай", ","));
+        assert!(active_prefix_protects_message(true, ".unknown хай", "."));
+        assert!(!active_prefix_protects_message(true, ",unknown хай", "."));
+        assert!(!active_prefix_protects_message(false, ",unknown хай", ","));
+    }
+
+    #[test]
+    fn protected_command_messages_are_not_projected_to_external_events() {
+        assert!(!should_prepare_message_event(false, true));
+        assert!(should_prepare_message_event(true, true));
+        assert!(should_prepare_message_event(false, false));
+        assert!(should_prepare_message_event(true, false));
+    }
+
+    #[test]
     fn update_stream_retries_transient_transport_errors() {
         assert!(is_temporary_telegram_error(
             &grammers_client::InvocationError::Dropped
@@ -1021,12 +1072,10 @@ mod tests {
     async fn event_dispatches_limit_pending_tasks_and_skip_overload() {
         let mut dispatches = EventDispatches::new();
         assert_eq!(MAX_EVENT_DISPATCH_TASKS, 32);
-
         for _ in 0..MAX_EVENT_DISPATCH_TASKS {
             assert!(dispatches.try_spawn(std::future::pending()));
         }
         assert!(!dispatches.try_spawn(std::future::pending()));
-
         dispatches.abort_and_drain().await;
         assert!(dispatches.is_empty());
     }
@@ -1035,12 +1084,10 @@ mod tests {
     async fn ready_update_is_processed_while_an_event_dispatch_is_pending() {
         let mut dispatches = EventDispatches::new();
         assert!(dispatches.try_spawn(std::future::pending()));
-
         assert!(matches!(
             dispatches.next_update_or_event(async { "update" }).await,
             UpdateOrEvent::Update("update")
         ));
-
         dispatches.abort_and_drain().await;
     }
 
@@ -1049,7 +1096,6 @@ mod tests {
         let mut dispatches = EventDispatches::new();
         assert!(dispatches.try_spawn(std::future::pending()));
         assert!(dispatches.try_spawn(async {}));
-
         assert!(matches!(
             dispatches
                 .next_update_or_event(std::future::pending::<()>())
@@ -1057,14 +1103,12 @@ mod tests {
             UpdateOrEvent::Event(Some(Ok(())))
         ));
         assert_eq!(dispatches.tasks.len(), 1);
-
         dispatches.abort_and_drain().await;
     }
 
     #[tokio::test]
     async fn shutdown_aborts_and_drains_event_dispatches() {
         struct DropSignal(Option<oneshot::Sender<()>>);
-
         impl Drop for DropSignal {
             fn drop(&mut self) {
                 if let Some(sender) = self.0.take() {
@@ -1072,7 +1116,6 @@ mod tests {
                 }
             }
         }
-
         let mut dispatches = EventDispatches::new();
         let (dropped, received_drop) = oneshot::channel();
         assert!(dispatches.try_spawn(async move {
@@ -1080,7 +1123,6 @@ mod tests {
             std::future::pending::<()>().await;
         }));
         tokio::task::yield_now().await;
-
         dispatches.abort_and_drain().await;
         assert!(dispatches.is_empty());
         assert_eq!(received_drop.await, Ok(()));
@@ -1123,7 +1165,6 @@ mod tests {
             receipt: PendingRebootReceipt::new(ReceiptTarget::SelfUser, 42, 1).unwrap(),
             text: reboot_completion_text(crate::i18n::Locale::Russian, 428),
         };
-
         register_reboot_completion_suppression(
             &mut runtime,
             self_user,
@@ -1251,7 +1292,6 @@ mod tests {
     async fn routes_outgoing_false_messages_authored_by_self() {
         let outgoing = false;
         let authored_by_self = true;
-
         assert!(!outgoing);
         assert_eq!(
             route(authored_by_self, ",ping", &runtime().await),
@@ -1259,19 +1299,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn protected_command_messages_are_not_projected_to_external_events() {
-        assert!(!should_prepare_message_event(false, true));
-        assert!(should_prepare_message_event(true, true));
-        assert!(should_prepare_message_event(false, false));
-        assert!(should_prepare_message_event(true, false));
-    }
-
     #[tokio::test]
     async fn rejects_outgoing_true_messages_not_authored_by_self() {
         let outgoing = true;
         let authored_by_self = false;
-
         assert!(outgoing);
         assert_eq!(route(authored_by_self, ",ping", &runtime().await), None);
         assert_eq!(route(authored_by_self, ",reboot", &runtime().await), None);
@@ -1354,7 +1385,6 @@ mod tests {
             settings,
             directory.join("fastfetch.json"),
         );
-
         assert_eq!(
             route(true, ",modules", &runtime),
             Some(Action::Modules(crate::commands::ModulesRequest::Overview))
@@ -1399,7 +1429,6 @@ mod tests {
                 }],
             }
         }
-
         let directory = std::env::temp_dir().join(format!(
             "lavis-updates-routing-priority-{}",
             std::process::id()
@@ -1445,7 +1474,6 @@ mod tests {
             ],
             ..ExternalRuntimeSnapshot::new()
         });
-
         assert_eq!(route(true, ",ping", &runtime), Some(Action::Ping));
         assert_eq!(
             route(true, ",external.run args", &runtime),
@@ -1478,7 +1506,6 @@ mod tests {
         let first_peer = PeerId::user(1).unwrap();
         let second_peer = PeerId::user(2).unwrap();
         runtime.register_expected_self_edit(first_peer, 7, "🏓 Pong: 1 ms".to_owned());
-
         assert!(!runtime.consume_expected_self_edit(first_peer, 7, ",ping"));
         assert_eq!(route(true, ",ping", &runtime), Some(Action::Ping));
         assert!(!runtime.consume_expected_self_edit(second_peer, 7, "🏓 Pong: 1 ms"));
@@ -1490,14 +1517,12 @@ mod tests {
     #[test]
     fn accepts_concrete_self_sender_for_saved_messages() {
         let self_user_id = PeerId::user(1).unwrap();
-
         assert!(is_self_authored(Some(self_user_id), false, self_user_id));
     }
 
     #[test]
     fn accepts_self_sender_sentinel_only_for_outgoing_messages() {
         let self_user_id = PeerId::user(1).unwrap();
-
         assert!(is_self_authored(
             Some(PeerId::self_user()),
             true,
@@ -1509,7 +1534,6 @@ mod tests {
     fn rejects_other_user_sender() {
         let self_user_id = PeerId::user(1).unwrap();
         let other_user_id = PeerId::user(2).unwrap();
-
         assert!(!is_self_authored(Some(other_user_id), true, self_user_id));
     }
 
@@ -1517,14 +1541,12 @@ mod tests {
     fn rejects_outgoing_channel_sender() {
         let self_user_id = PeerId::user(1).unwrap();
         let channel_id = PeerId::channel(1).unwrap();
-
         assert!(!is_self_authored(Some(channel_id), true, self_user_id));
     }
 
     #[test]
     fn rejects_missing_sender() {
         let self_user_id = PeerId::user(1).unwrap();
-
         assert!(!is_self_authored(None, true, self_user_id));
     }
 }
