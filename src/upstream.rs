@@ -8,10 +8,50 @@ use std::{future::Future, pin::Pin, time::Duration};
 pub type UpstreamRevFuture<'a> =
     Pin<Box<dyn Future<Output = Result<String, UpstreamError>> + Send + 'a>>;
 
-/// The deliberately narrow boundary for reading the upstream `main` revision.
-/// Tests can inject a fake without ever constructing the real request URL.
+pub type CompareFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<CompareResult, UpstreamError>> + Send + 'a>>;
+
+/// The deliberately narrow boundary for reading the upstream `main` revision
+/// and comparing two revisions. Tests can inject a fake without ever
+/// constructing the real request URL.
 pub trait UpstreamRev: Send + Sync {
     fn main_rev<'a>(&'a self) -> UpstreamRevFuture<'a>;
+    fn compare<'a>(&'a self, base: &'a str, head: &'a str) -> CompareFuture<'a>;
+}
+
+/// Outcome of comparing two revisions: how many commits `head` is ahead of
+/// and/or behind `base`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompareResult {
+    pub ahead_by: u64,
+    pub behind_by: u64,
+}
+
+/// How the current build relates to the upstream `main` branch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RevisionRelation {
+    Current,
+    Ahead { commits: u64 },
+    Behind { commits: u64 },
+    Diverged { ahead: u64, behind: u64 },
+    Unavailable,
+}
+
+/// A resolved upstream revision together with its relation to the local build.
+#[derive(Clone)]
+pub struct UpstreamRevision {
+    pub revision: String,
+    pub relation: RevisionRelation,
+}
+
+/// Derives the [`RevisionRelation`] from raw ahead/behind counts.
+pub fn relation_from_compare(compare: &CompareResult) -> RevisionRelation {
+    match (compare.ahead_by, compare.behind_by) {
+        (0, 0) => RevisionRelation::Current,
+        (ahead, 0) => RevisionRelation::Ahead { commits: ahead },
+        (0, behind) => RevisionRelation::Behind { commits: behind },
+        (ahead, behind) => RevisionRelation::Diverged { ahead, behind },
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,9 +77,11 @@ impl std::fmt::Display for UpstreamError {
 
 const UPSTREAM_INFO_REFS_URL: &str =
     "https://tangled.org/zumuvik.tngl.sh/lavis/info/refs?service=git-upload-pack";
+const TANGLED_COMPARE_URL: &str = "https://tangled.org/xrpc/sh.tangled.repo.compare";
+const TANGLED_COMPARE_REPO: &str = "did%3Aplc%3Atrc7yr7p6ikl5fxfupm5mia2%2Flavis";
 const SHA1_HEX_LEN: usize = 40;
 const MAX_INFO_REFS_BODY_BYTES: usize = 64 * 1024;
-const UPSTREAM_FETCH_TIMEOUT: Duration = Duration::from_secs(2);
+const UPSTREAM_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Uses Rustls only (via reqwest's `rustls-tls` feature).
 pub struct HttpUpstreamRev {
@@ -146,6 +188,69 @@ impl UpstreamRev for HttpUpstreamRev {
             parse_main_rev_from_info_refs(&body)
         })
     }
+
+    fn compare<'a>(&'a self, base: &'a str, head: &'a str) -> CompareFuture<'a> {
+        Box::pin(async move {
+            match self.compare_tangled(base, head).await {
+                Ok(result) => Ok(result),
+                Err(error) => {
+                    tracing::warn!(
+                        event = "tangled_compare_failed",
+                        %error,
+                        base,
+                        head,
+                        "Tangled compare failed"
+                    );
+                    Err(error)
+                }
+            }
+        })
+    }
+}
+
+impl HttpUpstreamRev {
+    /// Tangled compare: two calls with swapped rev1/rev2 to derive ahead/behind
+    /// from the `formatPatch` array length in each direction.
+    async fn compare_tangled(
+        &self,
+        base: &str,
+        head: &str,
+    ) -> Result<CompareResult, UpstreamError> {
+        let ahead_by = self.tangled_patch_count(head, base).await?;
+        let behind_by = self.tangled_patch_count(base, head).await?;
+        Ok(CompareResult {
+            ahead_by,
+            behind_by,
+        })
+    }
+
+    /// Returns the `formatPatch` array length for a single Tangled compare
+    /// call with `rev1=from` and `rev2=to`.
+    async fn tangled_patch_count(&self, from: &str, to: &str) -> Result<u64, UpstreamError> {
+        let url = format!(
+            "{}?repo={}&rev1={}&rev2={}",
+            TANGLED_COMPARE_URL, TANGLED_COMPARE_REPO, from, to,
+        );
+        let response = self.client.get(&url).send().await.map_err(request_error)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(UpstreamError::HttpStatus(status.as_u16()));
+        }
+        let body = read_bounded_body(response).await?;
+        parse_tangled_compare_response(&body)
+    }
+}
+
+/// Parses the Tangled compare JSON response, returning the `formatPatch`
+/// array length.
+fn parse_tangled_compare_response(body: &[u8]) -> Result<u64, UpstreamError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(body).map_err(|_| UpstreamError::InvalidResponse)?;
+    let patches = value
+        .get("formatPatch")
+        .and_then(|v| v.as_array())
+        .ok_or(UpstreamError::InvalidResponse)?;
+    Ok(patches.len() as u64)
 }
 
 #[cfg(test)]
@@ -160,6 +265,10 @@ mod tests {
         fn main_rev<'a>(&'a self) -> UpstreamRevFuture<'a> {
             let result = self.result.clone();
             Box::pin(async move { result })
+        }
+
+        fn compare<'a>(&'a self, _base: &'a str, _head: &'a str) -> CompareFuture<'a> {
+            Box::pin(async { Err(UpstreamError::Transport) })
         }
     }
 
@@ -248,6 +357,94 @@ mod tests {
         assert_eq!(
             parse_main_rev_from_info_refs(b"003d"),
             Err(UpstreamError::InvalidResponse)
+        );
+    }
+
+    #[test]
+    fn revision_relation_variants_are_distinct() {
+        assert_eq!(RevisionRelation::Current, RevisionRelation::Current);
+        assert_eq!(
+            RevisionRelation::Ahead { commits: 3 },
+            RevisionRelation::Ahead { commits: 3 }
+        );
+        assert_ne!(
+            RevisionRelation::Ahead { commits: 3 },
+            RevisionRelation::Ahead { commits: 4 }
+        );
+        assert_ne!(
+            RevisionRelation::Ahead { commits: 1 },
+            RevisionRelation::Behind { commits: 1 }
+        );
+        assert_ne!(RevisionRelation::Current, RevisionRelation::Unavailable);
+    }
+
+    #[test]
+    fn relation_from_compare_maps_all_cases() {
+        assert_eq!(
+            relation_from_compare(&CompareResult {
+                ahead_by: 0,
+                behind_by: 0
+            }),
+            RevisionRelation::Current
+        );
+        assert_eq!(
+            relation_from_compare(&CompareResult {
+                ahead_by: 5,
+                behind_by: 0
+            }),
+            RevisionRelation::Ahead { commits: 5 }
+        );
+        assert_eq!(
+            relation_from_compare(&CompareResult {
+                ahead_by: 0,
+                behind_by: 3
+            }),
+            RevisionRelation::Behind { commits: 3 }
+        );
+        assert_eq!(
+            relation_from_compare(&CompareResult {
+                ahead_by: 2,
+                behind_by: 4
+            }),
+            RevisionRelation::Diverged {
+                ahead: 2,
+                behind: 4
+            }
+        );
+    }
+
+    #[test]
+    fn parses_tangled_compare_response() {
+        let body = br#"{"formatPatch":["patch1","patch2","patch3"]}"#;
+        assert_eq!(parse_tangled_compare_response(body).unwrap(), 3);
+    }
+
+    #[test]
+    fn parses_tangled_compare_empty_patches() {
+        let body = br#"{"formatPatch":[]}"#;
+        assert_eq!(parse_tangled_compare_response(body).unwrap(), 0);
+    }
+
+    #[test]
+    fn tangled_compare_missing_field_is_invalid() {
+        assert_eq!(
+            parse_tangled_compare_response(b"{}"),
+            Err(UpstreamError::InvalidResponse)
+        );
+        assert_eq!(
+            parse_tangled_compare_response(b"not json"),
+            Err(UpstreamError::InvalidResponse)
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_compare_returns_transport_error() {
+        let mock = Mock {
+            result: Ok("abc123".into()),
+        };
+        assert_eq!(
+            mock.compare("base", "head").await,
+            Err(UpstreamError::Transport)
         );
     }
 }

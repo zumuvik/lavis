@@ -50,8 +50,8 @@ use crate::{
         fastfetch_text, info_text, inspection_warning_text, lm_format, lm_label, lm_runtime_status,
         lm_state_text, lm_text, ping_text, prefix_text, render_info_text,
         render_lm_doctor_missing_catalog, render_lm_doctor_module, render_lm_doctor_report,
-        render_lm_info, render_lm_install_plan, render_stats_text, runtime_text, sensitive_text,
-        setup_text, stats_text, text,
+        render_lm_info, render_lm_install_plan, render_revision_status, render_stats_text,
+        runtime_text, sensitive_text, setup_text, stats_text, text,
     },
     info,
     onboarding::OnboardingProgress,
@@ -60,7 +60,7 @@ use crate::{
     setup::{self, UsernameCandidate},
     setup_store::SetupStore,
     setup_telegram::{BotFatherProgress, CompanionSetup, GrammersTelegramSetup, ProvisionRequest},
-    upstream::UpstreamRev,
+    upstream::{RevisionRelation, UpstreamRev, UpstreamRevision},
 };
 
 pub struct RuntimeState {
@@ -71,7 +71,7 @@ pub struct RuntimeState {
     fastfetch_profile_path: PathBuf,
     self_identity: Option<SelfIdentity>,
     upstream: Option<Box<dyn UpstreamRev>>,
-    upstream_main_rev_cache: Option<(Instant, Option<String>)>,
+    upstream_revision_cache: Option<(Instant, Option<UpstreamRevision>)>,
     external_manager: Option<ExternalManagerHandle>,
     external_snapshot: ExternalRuntimeSnapshot,
     expected_self_edits: VecDeque<ExpectedSelfEdit>,
@@ -300,7 +300,7 @@ impl RuntimeState {
             fastfetch_profile_path,
             self_identity: None,
             upstream: None,
-            upstream_main_rev_cache: None,
+            upstream_revision_cache: None,
             external_manager: None,
             external_snapshot: ExternalRuntimeSnapshot::new(),
             expected_self_edits: VecDeque::new(),
@@ -506,28 +506,58 @@ impl RuntimeState {
         }
     }
 
-    /// Resolves the upstream `main` revision once per TTL. Failures are cached
-    /// as `None` so repeated `info` invocations do not hammer the endpoint;
-    /// the caption renders the localized "unavailable" for it.
-    async fn upstream_main_rev(&mut self) -> Option<String> {
-        const UPSTREAM_MAIN_REV_TTL: Duration = Duration::from_secs(300);
-        if let Some((resolved_at, revision)) = self.upstream_main_rev_cache.as_ref()
-            && resolved_at.elapsed() < UPSTREAM_MAIN_REV_TTL
+    /// Resolves the upstream `main` revision and its relation to the current
+    /// build once per TTL. Failures are cached as `None` so repeated `info`
+    /// invocations do not hammer the endpoint; the caption renders the
+    /// localized "unavailable" for it.
+    async fn upstream_revision(&mut self) -> Option<UpstreamRevision> {
+        const UPSTREAM_REVISION_TTL: Duration = Duration::from_secs(300);
+        if let Some((resolved_at, cached)) = self.upstream_revision_cache.as_ref()
+            && resolved_at.elapsed() < UPSTREAM_REVISION_TTL
         {
-            return revision.clone();
+            return cached.clone();
         }
         let resolved = match &self.upstream {
-            Some(upstream) => match upstream.main_rev().await {
-                Ok(revision) => Some(revision),
-                Err(error) => {
-                    tracing::warn!(
-                        event = "upstream_revision_fetch_failed",
-                        category = %error,
-                        "Could not resolve the upstream main revision"
-                    );
-                    None
-                }
-            },
+            Some(upstream) => {
+                let main_rev = match upstream.main_rev().await {
+                    Ok(revision) => revision,
+                    Err(error) => {
+                        tracing::warn!(
+                            event = "upstream_revision_fetch_failed",
+                            category = %error,
+                            "Could not resolve the upstream main revision"
+                        );
+                        self.upstream_revision_cache = Some((Instant::now(), None));
+                        return None;
+                    }
+                };
+                let current_rev = info::build_rev();
+                let relation = if current_rev == "unknown" {
+                    RevisionRelation::Unavailable
+                } else if current_rev == main_rev {
+                    RevisionRelation::Current
+                } else {
+                    match upstream.compare(&main_rev, current_rev).await {
+                        Ok(compare_result) => {
+                            crate::upstream::relation_from_compare(&compare_result)
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                event = "upstream_compare_failed",
+                                category = %error,
+                                base = %main_rev,
+                                head = %current_rev,
+                                "Could not compare current build with upstream main"
+                            );
+                            RevisionRelation::Unavailable
+                        }
+                    }
+                };
+                Some(UpstreamRevision {
+                    revision: main_rev,
+                    relation,
+                })
+            }
             None => {
                 tracing::warn!(
                     event = "upstream_resolver_unavailable",
@@ -536,7 +566,7 @@ impl RuntimeState {
                 None
             }
         };
-        self.upstream_main_rev_cache = Some((Instant::now(), resolved.clone()));
+        self.upstream_revision_cache = Some((Instant::now(), resolved.clone()));
         resolved
     }
 
@@ -972,10 +1002,14 @@ impl RuntimeState {
             .self_identity()
             .map(info::owner_label)
             .unwrap_or_else(|| info_text(locale, InfoText::Unknown).to_owned());
-        let upstream = self.upstream_main_rev().await;
-        let upstream = match upstream {
-            Some(revision) => info::short_commit(&revision).to_owned(),
+        let upstream_data = self.upstream_revision().await;
+        let upstream = match &upstream_data {
+            Some(data) => info::short_commit(&data.revision).to_owned(),
             None => info_text(locale, InfoText::Unavailable).to_owned(),
+        };
+        let status = match &upstream_data {
+            Some(data) => render_revision_status(locale, data.relation),
+            None => render_revision_status(locale, RevisionRelation::Unavailable),
         };
         let built_in_modules = crate::modules::modules().len();
         let total_modules = built_in_modules + self.external_descriptors().len();
@@ -999,6 +1033,7 @@ impl RuntimeState {
                 version: env!("CARGO_PKG_VERSION"),
                 commit: info::short_commit(info::build_rev()),
                 upstream: &upstream,
+                status: &status,
                 prefix: &prefix,
                 active_modules,
                 total_modules,
@@ -2980,7 +3015,7 @@ mod tests {
             Locale, PingText, RuntimeText, SensitiveText, ping_text, runtime_text, sensitive_text,
         },
         setup_store::{CompanionToken, PersistedSetupState, SetupStore},
-        upstream::{UpstreamError, UpstreamRev, UpstreamRevFuture},
+        upstream::{CompareFuture, UpstreamError, UpstreamRev, UpstreamRevFuture},
     };
     use grammers_session::types::PeerId;
     use std::{
@@ -4627,6 +4662,10 @@ for line in sys.stdin:
     impl UpstreamRev for FakeUpstream {
         fn main_rev<'a>(&'a self) -> UpstreamRevFuture<'a> {
             Box::pin(async move { self.result.clone() })
+        }
+
+        fn compare<'a>(&'a self, _base: &'a str, _head: &'a str) -> CompareFuture<'a> {
+            Box::pin(async { Err(UpstreamError::Transport) })
         }
     }
 

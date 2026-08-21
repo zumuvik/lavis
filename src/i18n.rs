@@ -801,10 +801,10 @@ pub enum InfoText {
 pub fn info_text(locale: Locale, key: InfoText) -> &'static str {
     match (locale, key) {
         (Locale::English, InfoText::Caption) => {
-            "ℹ️ Lavis — really your userbot\n\nOwner: {owner}\nVersion: {version}\nCurrent commit: {commit}\nUpstream main: {upstream}\nPrefix: {prefix}\nModules: {total} ({active} active)\nHost: {host}\nOS: {os}"
+            "ℹ️ Lavis — really your userbot\n\nOwner: {owner}\nVersion: {version}\nCurrent commit: {commit}\nUpstream main: {upstream}\nStatus: {status}\nPrefix: {prefix}\nModules: {total} ({active} active)\nHost: {host}\nOS: {os}"
         }
         (Locale::Russian, InfoText::Caption) => {
-            "ℹ️ Lavis — really your userbot\n\nВладелец: {owner}\nВерсия: {version}\nТекущий коммит: {commit}\nОсновная ветка: {upstream}\nПрефикс: {prefix}\nМодули: {total} ({active} активных)\nХост: {host}\nОС: {os}"
+            "ℹ️ Lavis — really your userbot\n\nВладелец: {owner}\nВерсия: {version}\nТекущий коммит: {commit}\nОсновная ветка: {upstream}\nСтатус: {status}\nПрефикс: {prefix}\nМодули: {total} ({active} активных)\nХост: {host}\nОС: {os}"
         }
         (Locale::English, InfoText::Unknown) => "unknown",
         (Locale::Russian, InfoText::Unknown) => "неизвестно",
@@ -818,6 +818,7 @@ pub struct InfoCaptionData<'a> {
     pub version: &'a str,
     pub commit: &'a str,
     pub upstream: &'a str,
+    pub status: &'a str,
     pub prefix: &'a str,
     pub active_modules: usize,
     pub total_modules: usize,
@@ -831,11 +832,44 @@ pub fn render_info_text(locale: Locale, info: InfoCaptionData<'_>) -> String {
         .replace("{version}", info.version)
         .replace("{commit}", info.commit)
         .replace("{upstream}", info.upstream)
+        .replace("{status}", info.status)
         .replace("{prefix}", info.prefix)
         .replace("{active}", &info.active_modules.to_string())
         .replace("{total}", &info.total_modules.to_string())
         .replace("{host}", info.host)
         .replace("{os}", info.os)
+}
+
+/// Renders the localized status label for a [`RevisionRelation`](crate::upstream::RevisionRelation).
+pub fn render_revision_status(
+    locale: Locale,
+    relation: crate::upstream::RevisionRelation,
+) -> String {
+    use crate::upstream::RevisionRelation;
+    match (locale, relation) {
+        (Locale::English, RevisionRelation::Current) => "current ✓".to_owned(),
+        (Locale::Russian, RevisionRelation::Current) => "актуален ✓".to_owned(),
+        (Locale::English, RevisionRelation::Ahead { commits }) => {
+            format!("{commits} commits ahead")
+        }
+        (Locale::Russian, RevisionRelation::Ahead { commits }) => {
+            format!("на {commits} коммитов впереди")
+        }
+        (Locale::English, RevisionRelation::Behind { commits }) => {
+            format!("{commits} commits behind")
+        }
+        (Locale::Russian, RevisionRelation::Behind { commits }) => {
+            format!("на {commits} коммитов позади")
+        }
+        (Locale::English, RevisionRelation::Diverged { ahead, behind }) => {
+            format!("+{ahead} / -{behind}")
+        }
+        (Locale::Russian, RevisionRelation::Diverged { ahead, behind }) => {
+            format!("+{ahead} / -{behind}")
+        }
+        (Locale::English, RevisionRelation::Unavailable) => "unavailable".to_owned(),
+        (Locale::Russian, RevisionRelation::Unavailable) => "недоступно".to_owned(),
+    }
 }
 
 /// Lavis-owned framing for an external command result. Module-provided text is
@@ -1525,7 +1559,7 @@ mod tests {
     use super::{
         ExternalCommandText, InfoCaptionData, InfoText, LmInstallPlanText, LmText, Locale,
         RebootText, Text, external_command_text, info_text, lm_format, lm_runtime_status, lm_text,
-        reboot_text, render_info_text, render_lm_install_plan, text,
+        reboot_text, render_info_text, render_lm_install_plan, render_revision_status, text,
     };
     use crate::external_modules::manager::ExternalModuleRuntimeStatus;
 
@@ -1730,6 +1764,7 @@ mod tests {
                 version: "0.1.0",
                 commit: "b1d18f8",
                 upstream: "unavailable",
+                status: "unavailable",
                 prefix: ",",
                 active_modules: 3,
                 total_modules: 5,
@@ -1741,6 +1776,7 @@ mod tests {
         assert!(english.contains("Version: 0.1.0"));
         assert!(english.contains("Current commit: b1d18f8"));
         assert!(english.contains("Upstream main: unavailable"));
+        assert!(english.contains("Status: unavailable"));
         assert!(english.contains("Prefix: ,"));
         assert!(english.contains("Modules: 5 (3 active)"));
         assert!(english.contains("Host: standalone"));
@@ -1754,6 +1790,7 @@ mod tests {
                 version: "0.1.0",
                 commit: "b1d18f8",
                 upstream: "недоступно",
+                status: "недоступно",
                 prefix: ",",
                 active_modules: 3,
                 total_modules: 5,
@@ -1764,6 +1801,7 @@ mod tests {
         assert!(russian.contains("Владелец: @owner"));
         assert!(russian.contains("Версия: 0.1.0"));
         assert!(russian.contains("Основная ветка: недоступно"));
+        assert!(russian.contains("Статус: недоступно"));
         assert!(russian.contains("Модули: 5 (3 активных)"));
     }
 
@@ -1775,6 +1813,64 @@ mod tests {
         );
         assert_eq!(
             info_text(Locale::Russian, InfoText::Unavailable),
+            "недоступно"
+        );
+    }
+
+    #[test]
+    fn revision_status_labels_are_localized() {
+        use crate::upstream::RevisionRelation;
+
+        assert_eq!(
+            render_revision_status(Locale::English, RevisionRelation::Current),
+            "current ✓"
+        );
+        assert_eq!(
+            render_revision_status(Locale::Russian, RevisionRelation::Current),
+            "актуален ✓"
+        );
+        assert_eq!(
+            render_revision_status(Locale::English, RevisionRelation::Ahead { commits: 3 }),
+            "3 commits ahead"
+        );
+        assert_eq!(
+            render_revision_status(Locale::Russian, RevisionRelation::Ahead { commits: 3 }),
+            "на 3 коммитов впереди"
+        );
+        assert_eq!(
+            render_revision_status(Locale::English, RevisionRelation::Behind { commits: 5 }),
+            "5 commits behind"
+        );
+        assert_eq!(
+            render_revision_status(Locale::Russian, RevisionRelation::Behind { commits: 5 }),
+            "на 5 коммитов позади"
+        );
+        assert_eq!(
+            render_revision_status(
+                Locale::English,
+                RevisionRelation::Diverged {
+                    ahead: 2,
+                    behind: 4
+                }
+            ),
+            "+2 / -4"
+        );
+        assert_eq!(
+            render_revision_status(
+                Locale::Russian,
+                RevisionRelation::Diverged {
+                    ahead: 2,
+                    behind: 4
+                }
+            ),
+            "+2 / -4"
+        );
+        assert_eq!(
+            render_revision_status(Locale::English, RevisionRelation::Unavailable),
+            "unavailable"
+        );
+        assert_eq!(
+            render_revision_status(Locale::Russian, RevisionRelation::Unavailable),
             "недоступно"
         );
     }
