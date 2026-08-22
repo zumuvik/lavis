@@ -1,338 +1,600 @@
 # AGENTS.md
 
-## Project
+This file defines the operating rules for coding agents working on Lavis.
 
-`lavis` is a personal Telegram userbot written in Rust and packaged with Nix flakes.
+The goal is simple: work autonomously, verify changes thoroughly, keep the repository clean, and do not stop halfway through an obvious task.
 
-The project must remain:
+## 1. Autonomy
 
-- small;
-- statically typed;
-- testable without Telegram where possible;
-- reproducible through Nix;
-- secure by default;
-- understandable without framework-level magic.
+Agents are expected to complete implementation work without waiting for approval at every step.
 
-This is not a line-by-line port of Heroku, Hikka, FTG, or Telethon.
+For a normal coding task, continue through:
 
-## Workspace layout
+1. investigate;
+2. reproduce when practical;
+3. implement;
+4. add or update tests;
+5. run validation;
+6. review the resulting diff;
+7. commit;
+8. push.
 
-Expected local layout:
+Do not stop after:
 
-```text
-~/project/
-├── heroku-reference/
-└── lavis/
+- discovering the root cause;
+- writing a plan;
+- `Thought`;
+- `Preparing edit`;
+- running one test;
+- finding a possible issue;
+- completing only part of the requested work.
+
+A task is complete only when:
+
+- the requested work is implemented and validated, then committed and pushed; or
+- a concrete external or technical blocker makes further progress impossible.
+
+When blocked, report the actual command/error/output that prevents progress.
+
+Do not wait for the user to send `continue`.
+
+---
+
+## 2. Merge policy
+
+Agents may commit and push without asking.
+
+Agents must **never merge a PR without explicit user approval**.
+
+Direct commits to `main` are allowed when the task is already being performed directly on `main`.
+
+Merging a feature/fix branch into `main` still requires explicit approval.
+
+Preferred merge strategy:
+
+- PR containing noisy/intermediate commits:
+  **Squash and merge**
+- PR containing clean, meaningful commits:
+  **Rebase and merge**
+- When preserving the existence/history of the feature branch is useful:
+  **Merge commit**
+
+After a branch has been merged, delete it from:
+
+- the local repository;
+- Tangled;
+- the GitHub mirror.
+
+History rewriting (`rebase`, `amend`, squash, force-push) should only be performed when explicitly requested or clearly required by the task.
+
+When force-pushing, prefer:
+
+```sh
+git push --force-with-lease
 ```
 
-The current repository is `lavis`.
+Never use plain `--force` when `--force-with-lease` is sufficient.
 
-`../heroku-reference` is reference material only.
+---
 
-## Reference repository policy
+## 3. Repository hosting
 
-The agent may inspect `../heroku-reference` to understand:
+### Primary forge
 
-- user-visible behavior;
-- command names and semantics;
-- lifecycle ideas;
-- error handling expectations;
-- useful feature boundaries.
+Tangled is the primary forge and source of truth for Lavis.
 
-The agent must not:
+Use Tangled for:
 
-- modify the reference repository;
-- vendor it into this repository;
-- copy large source fragments;
-- reproduce Python-specific architecture;
-- preserve compatibility with Heroku/Hikka modules unless explicitly requested;
-- assume that Telethon APIs map directly to Rust APIs.
+- primary repository operations;
+- PR lifecycle;
+- Spindle CI;
+- canonical repository state.
 
-Translate behavior into idiomatic Rust. Do not translate class hierarchies mechanically.
+### GitHub mirror
 
-## Current product scope
+GitHub is retained as a backup mirror.
 
-The initial product is:
+Push completed work to both:
 
-- one Telegram user account;
-- one local process;
-- commands accepted only from the authenticated user's own outgoing messages;
-- configurable command prefix;
-- Linux/NixOS as the primary platform;
-- static command registration;
-- local configuration and mutable state outside `/nix/store`;
-- no public module marketplace;
-- no remote code execution;
-- no Python compatibility layer.
+- Tangled;
+- GitHub.
 
-Features outside the current task must not be implemented speculatively.
+GitHub may also be used for:
 
-## Architecture
+- code inspection;
+- diffs;
+- external review tooling;
+- backup visibility;
+- integrations that require GitHub.
 
-Prefer simple modules with explicit responsibilities:
+Do not use GitHub Actions as Lavis CI.
 
-```text
-src/
-├── main.rs
-├── app.rs
-├── auth.rs
-├── client.rs
-├── command.rs
-├── config.rs
-├── error.rs
-└── commands/
-    ├── mod.rs
-    ├── help.rs
-    ├── id.rs
-    └── ping.rs
-```
+If one remote is temporarily unavailable:
 
-Not every file must exist from the first commit. Add files only when their responsibility is real.
+1. push successfully to the other remote;
+2. make a small number of reasonable retries;
+3. report the unsynchronized remote;
+4. do not roll back the successful push.
 
-Core rules:
+---
 
-- Telegram-independent logic must remain Telegram-independent.
-- Command parsing must be testable without a network.
-- Configuration loading must be testable without a Telegram session.
-- Transport-specific types must not leak through the entire application.
-- Prefer explicit data flow over service locators or global registries.
-- Prefer composition over inheritance-like emulation.
-- Prefer enums and structs over stringly typed state.
+## 4. Asking questions
 
-## Rust rules
+Avoid unnecessary clarification.
 
-Use stable Rust.
+If one solution is clearly better, choose it and continue.
 
-Required standards:
+### When running as Build
 
-- no `unsafe`;
-- no global mutable state;
-- no ignored `Result`;
-- no broad `allow` attributes used to silence real problems;
-- no unnecessary cloning to bypass ownership design;
-- no blocking I/O inside async tasks;
-- no `unwrap()` or `expect()` in production paths unless a local invariant is proven and documented;
-- errors must include useful context;
-- public interfaces must be narrow;
-- dependencies must be minimal and justified.
+Ask the user directly only when there is a genuine unresolved decision, such as:
 
-Prefer:
+- two materially different architectural choices;
+- destructive state changes;
+- ambiguity that affects correctness;
+- a decision requiring project-owner intent.
 
-- `thiserror` for typed library/domain errors;
-- `anyhow` at the application boundary;
-- `tracing` for structured diagnostics;
-- `tokio` for the async runtime;
-- immutable values by default;
-- exhaustive matching;
-- small functions with clear ownership.
+### When running under Orchestrator
 
-Do not create traits merely because multiple implementations might exist someday.
+Use Oracle first for difficult architectural or debugging questions.
 
-## Telegram integration rules
+Do not use Oracle for trivial decisions.
 
-The intended Telegram library is `grammers`, but it must only be added when the task explicitly reaches Telegram integration.
+If Oracle cannot resolve a project-owner decision, ask the user.
 
-Before using a `grammers` API:
+---
 
-1. inspect the exact versions in `Cargo.toml` and `Cargo.lock`;
-2. inspect local crate sources or authoritative documentation;
-3. verify method names and return types;
-4. do not guess based on Telethon, Pyrogram, TDLib, or an older `grammers` release.
+## 5. Research discipline
 
-Telegram integration must eventually support:
+Research must answer a concrete open question.
 
-- phone-number login;
-- login code;
-- optional 2FA password;
-- persistent session storage;
-- reconnect behavior;
-- graceful shutdown;
-- filtering to the authenticated user's own outgoing command messages.
+Once that question has been answered with sufficient evidence, move on to implementation.
 
-Session data is secret mutable state and must never be stored in Git or `/nix/store`.
+Do not repeatedly re-investigate an already established fact unless new contradictory evidence appears.
 
-## Command system
+Two independent confirmations are normally enough.
 
-The command system starts with static registration.
+Examples:
 
-Do not introduce:
+- upstream source + reproducible test;
+- protocol definition + empirical behavior;
+- source implementation + official specification.
 
-- dynamic libraries;
-- Python embedding;
-- Lua;
-- WASM plugins;
-- runtime package installation;
-- remote module loading;
-- arbitrary code evaluation.
+Do not repeatedly call an unstable service hoping for a different result.
 
-A command should have a clear interface and must not parse the raw prefix independently when a central parser already exists.
+When an external API begins returning rate limits or transient failures such as:
 
-Parser behavior must be covered by tests, including:
+- `403`;
+- `429`;
+- `500`;
+- `502`;
+- `503`;
 
-- empty input;
-- non-command text;
-- prefix-only input;
-- command without arguments;
-- command with arguments;
-- repeated whitespace;
-- non-default prefix;
-- Unicode arguments.
+make at most a small number of useful attempts, record the limitation, and continue using local/source-level evidence.
 
-## Configuration and secrets
+Do not hammer external APIs.
 
-Configuration and mutable state belong under XDG paths:
+---
 
-```text
-~/.config/lavis/
-~/.local/state/lavis/
-~/.local/share/lavis/
-```
+## 6. Evidence hierarchy
 
-Secrets include:
+Use the strongest relevant source.
 
-- Telegram `api_hash`;
-- authentication/session data;
+For implementation semantics, prefer approximately:
+
+1. upstream source code / protocol implementation;
+2. authoritative specification or schema;
+3. reproducible empirical behavior;
+4. official documentation;
+5. project documentation;
+6. comments;
+7. general web results or third-party explanations.
+
+For runtime behavior, a reproducible real-world test may be stronger evidence than documentation.
+
+Do not blindly trust comments, old documentation, or assumptions when the implementation can be inspected directly.
+
+If the user's assumption conflicts with authoritative evidence, investigate the contradiction instead of silently implementing a known-bad interpretation.
+
+---
+
+## 7. Scope and adjacent bugs
+
+Agents may fix adjacent bugs discovered while working on the requested task.
+
+Do so when the fix is reasonably related and does not create disproportionate scope.
+
+Mention the additional fix either:
+
+- in the commit message; or
+- in the final report.
+
+Do not deliberately leave a clear bug in touched code solely because it was not named in the original request.
+
+---
+
+## 8. Refactoring
+
+Reasonable cleanup is allowed.
+
+Prefer simple code.
+
+Do not introduce abstractions merely because abstraction is possible.
+
+Before keeping a new helper, trait, layer, or abstraction, verify that it materially improves at least one of:
+
+- correctness;
+- testability;
+- reuse;
+- isolation;
+- readability;
+- future maintenance.
+
+Avoid building a large abstraction around a small one-off operation without a concrete reason.
+
+After implementation, re-read the diff as a reviewer and remove:
+
+- unnecessary abstraction;
+- duplicate logic;
+- dead code;
+- speculative code;
+- redundant comments;
+- accidental complexity.
+
+---
+
+## 9. Dependencies
+
+Agents may add dependencies when they are technically justified.
+
+This includes:
+
+- Rust crates;
+- Nix dependencies;
+- development tools;
+- test dependencies.
+
+Prefer existing project dependencies when they already solve the problem adequately.
+
+Do not add a dependency for functionality that can be implemented simply and safely without one.
+
+---
+
+## 10. Rust correctness rules
+
+Avoid `unsafe` unless there is a demonstrated need.
+
+When adding `unsafe`, the invariant must be understood and justified.
+
+`unwrap()` / `expect()` in production paths are acceptable only when the invariant is actually guaranteed.
+
+Do not use them merely because failure is considered unlikely.
+
+Prefer explicit error handling for externally controlled or fallible operations.
+
+---
+
+## 11. API v6
+
+Telegram Module API v6 is still under active development.
+
+Backward compatibility is not currently a hard requirement.
+
+Breaking changes are acceptable when they improve the API, provided the repository is updated consistently.
+
+Do not preserve bad API design solely for compatibility while v6 remains in active development.
+
+---
+
+## 12. Security and privacy invariants
+
+Treat the following as hard constraints.
+
+### Command privacy
+
+Lavis command traffic, setup traffic, and Lavis-owned command responses must not accidentally leak into external-module message event projection.
+
+Self-edits generated by Lavis must be correctly identified and suppressed where required.
+
+### Credentials
+
+Never commit or expose:
+
+- Telegram sessions;
+- auth keys;
+- API hashes;
+- tokens;
 - passwords;
-- future tokens.
+- secret environment variables;
+- private credentials.
 
-Secrets must not appear in:
+Do not print secrets into logs or final reports.
 
-- `flake.nix`;
-- Nix module option defaults;
-- generated Nix store files;
-- committed `.env` files;
-- tests;
-- logs;
-- error messages.
+### External modules
 
-Environment variables may be used during early development. Later secret management may use `sops-nix` or `agenix`, but only when explicitly requested.
+External modules must only receive capabilities and Telegram functionality they are explicitly permitted to use.
 
-## Nix rules
+Do not silently widen module privileges.
 
-The flake is responsible for:
+---
 
-- development shell;
-- package build;
-- application entry point;
-- checks;
-- reproducible dependency closure.
+## 13. Telegram verification
 
-The flake is not responsible for creating mutable session data.
+When correctness depends on Telegram / MTProto behavior, independently verify the behavior with the configured Telethon MCP server.
 
-Required user workflows:
+Use Saved Messages for probes whenever possible.
 
-```bash
-nix develop
-cargo check
-cargo test
+Preferred approach:
+
+1. inspect current state;
+2. perform the narrow test;
+3. read the resulting Telegram state/update;
+4. compare it with Lavis behavior;
+5. remove temporary probe messages.
+
+Do not message unrelated users or chats for tests.
+
+For edits, media, captions, entities, message IDs, update types, and similar Telegram semantics, use Telethon MCP as an independent reference implementation when practical.
+
+If the MCP cannot directly observe a required behavior, state that limitation instead of inventing an observation.
+
+---
+
+## 14. Persistent Telegram / Lavis state
+
+Tests should not leave persistent user configuration changed.
+
+Before testing commands that modify settings such as:
+
+- prefix;
+- aliases;
+- module state;
+- locale;
+- other persistent Lavis configuration;
+
+record the original value.
+
+After the test, restore the original state.
+
+Clean up temporary Telegram probe messages after testing.
+
+---
+
+## 15. Validation
+
+Before committing completed code, run the full relevant validation suite.
+
+For Rust changes, normally run:
+
+```sh
+cargo fmt --check
+cargo test --all-targets --all-features
+cargo clippy --all-targets --all-features -- -D warnings
+cargo check --all-targets --all-features
+```
+
+Do not skip validation merely because targeted tests passed.
+
+For non-trivial bug fixes, add a regression test when reasonably possible.
+
+Prefer a test that would have failed before the fix.
+
+Do not build excessive mocking infrastructure for a tiny bug solely to satisfy test-first dogma.
+
+---
+
+## 16. Flaky tests
+
+One unrelated flaky/environmental failure does not automatically invalidate the change.
+
+When a suspicious unrelated failure occurs:
+
+1. inspect the failure;
+2. run the failing test in isolation;
+3. rerun the relevant suite;
+4. determine whether it is reproducible.
+
+If the failure disappears and evidence shows it was environmental, continue and report it if relevant.
+
+Do not modify unrelated production code merely to make an environmental flake disappear.
+
+---
+
+## 17. Nix validation
+
+When Nix, packaging, service configuration, runtime wrappers, or deployment behavior is affected, also validate through Nix.
+
+Useful checks include, as appropriate:
+
+```sh
+nix flake check
 nix build
 nix run
-nix flake check
 ```
 
-Avoid unnecessary Nix frameworks. Use plain flake outputs unless additional abstraction clearly reduces complexity.
+Prefer real functional verification over only evaluation when practical.
 
-Do not hardcode user-specific absolute paths into the package.
+For changes affecting runtime behavior, `nix run` may be used to launch Lavis and verify functionality with Telegram MCP.
 
-NixOS and Home Manager modules should be added only after the binary and configuration model are stable.
+---
 
-## Security
+## 18. Running Lavis manually
 
-Security takes precedence over feature parity.
+Before starting another Lavis instance with `nix run`, inspect the existing service first.
 
-Never add the following without an explicit, narrowly scoped request:
+For example:
 
-- `.eval`;
-- shell execution commands;
-- remote code download and execution;
-- automatic installation of third-party modules;
-- unauthenticated HTTP endpoints;
-- plaintext secret persistence;
-- logging of session material;
-- permissive file permissions for secrets.
-
-Commands must eventually verify that the message was sent by the authenticated account.
-
-Treat all incoming Telegram content as untrusted input.
-
-## Testing
-
-Every behavior change requires tests where practical.
-
-Minimum local verification:
-
-```bash
-cargo fmt --check
-cargo check --all-targets
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets
+```sh
+systemctl status lavis
 ```
 
-For Nix-related changes also run:
+Use the correct system/user service scope for the installation.
 
-```bash
-nix flake check
-nix build
+Avoid running two Lavis instances against the same Telegram session.
+
+If the service is active and must be stopped for testing:
+
+1. record its original state;
+2. stop it;
+3. perform the test;
+4. restore the previous service state afterward.
+
+Agents may restart or rebuild Lavis without asking when needed for the task.
+
+Do not permanently alter unrelated system state.
+
+---
+
+## 19. Destructive state
+
+Routine cleanup is allowed for:
+
+- temporary build directories;
+- generated test files;
+- merged git branches;
+- disposable probe data.
+
+Do not destructively modify important persistent state without explicit approval.
+
+Examples requiring caution:
+
+- Telegram session state;
+- `/var/lib/lavis` data;
+- authentication material;
+- unrelated Nix generations;
+- user data.
+
+Avoid `git reset --hard`, destructive checkout, or similar commands over unknown user work unless explicitly required.
+
+---
+
+## 20. Untracked files
+
+Do not assume every untracked file is garbage.
+
+In particular, project tooling directories such as:
+
+```text
+.opencode/
+.slim/
 ```
 
-Do not claim that checks passed unless they were actually executed successfully.
+may contain important project state and must not be deleted or ignored automatically.
 
-Do not delete or weaken a test merely to make the suite pass.
+Obvious generated noise such as:
 
-## Change discipline
+```text
+__pycache__/
+result
+temporary build outputs
+```
 
-Before editing:
+may be added to `.gitignore` when appropriate.
 
-1. read this file;
-2. inspect the relevant files;
-3. inspect `../heroku-reference` only if its behavior is relevant;
-4. identify the smallest coherent change;
-5. state a brief plan.
+Do not stage unrelated files.
 
-During editing:
+---
 
-- keep the diff narrow;
-- compile after each meaningful step;
-- fix root causes rather than symptoms;
-- avoid unrelated formatting or refactoring;
-- do not modify generated lock files manually.
+## 21. Comments and documentation
 
-After editing:
+Do not add comments or documentation unless they provide real value.
 
-1. run the required checks;
-2. summarize changed files;
-3. explain architectural decisions;
-4. report failures honestly;
-5. identify the next smallest step.
+Prefer code that explains itself.
 
-## Git policy
+Useful comments should explain:
 
-The agent may inspect Git state and diffs.
+- non-obvious invariants;
+- protocol behavior;
+- security boundaries;
+- surprising implementation constraints;
+- why a seemingly simpler implementation is incorrect.
 
-The agent must not perform these actions unless explicitly requested:
+Avoid comments that merely restate the code.
 
-- commit;
-- amend;
-- rebase;
-- merge;
-- push;
-- force-push;
-- reset;
-- clean;
-- delete branches;
-- change remotes.
+When comments or technical documentation are needed, write them in English.
 
-Never modify `../heroku-reference` even if it has uncommitted changes.
+---
 
-## Completion format
+## 22. Commit messages
 
-Every implementation response must end with:
+Prefer informative Conventional Commit-style subjects.
 
-- summary of implemented behavior;
-- changed files;
-- commands executed;
-- verification results;
-- known limitations;
-- next minimal step.
+Example:
 
-Do not proceed into the next development phase without a separate request.
+```text
+fix(upstream): use canonical Tangled compare identifier
+```
+
+Commit bodies should explain important context when useful, especially:
+
+- why the change was required;
+- non-obvious behavior;
+- architectural decisions;
+- related fixes.
+
+Do not add a boilerplate test list to every commit when it adds no useful information.
+
+Prefer meaningful commits over extremely granular checkpoint commits.
+
+---
+
+## 23. CI and Cachix
+
+Local validation and real-device verification are the primary development checks.
+
+If the complete relevant behavior has already been verified locally and on the real runtime, there is usually no need to wait for Spindle solely to repeat the same checks.
+
+Spindle is especially useful when equivalent local verification is not available.
+
+Cachix is not a normal per-change blocker.
+
+Do not wait for a long Cachix build unnecessarily.
+
+Cachix is primarily relevant to `main` and situations where cache publication itself matters.
+
+---
+
+## 24. Final self-review
+
+Before committing:
+
+1. inspect `git diff`;
+2. verify the fix addresses the root cause;
+3. check for accidental scope;
+4. remove unnecessary complexity;
+5. ensure tests cover the important regression;
+6. verify no secrets or unrelated files are staged.
+
+After committing, push to both configured remotes.
+
+---
+
+## 25. Final report
+
+When the task is complete, report concisely:
+
+### Fixed
+
+What was changed and why.
+
+### Additional fixes
+
+Any adjacent issues fixed along the way.
+
+### Validation
+
+Relevant tests, local runtime checks, Nix validation, and Telegram MCP verification.
+
+### Git
+
+Branch and commit SHA.
+
+Confirm pushes to:
+
+- Tangled;
+- GitHub mirror.
+
+### Remaining risks
+
+Only genuine unresolved issues or external limitations.
+
+Do not fill the final report with a transcript of the reasoning process.
