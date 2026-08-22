@@ -801,10 +801,10 @@ pub enum InfoText {
 pub fn info_text(locale: Locale, key: InfoText) -> &'static str {
     match (locale, key) {
         (Locale::English, InfoText::Caption) => {
-            "ℹ️ Lavis — really your userbot\n\nOwner: {owner}\nVersion: {version}\nCurrent commit: {commit}\nUpstream main: {upstream}\nPrefix: {prefix}\nModules: {total} ({active} active)\nHost: {host}\nOS: {os}"
+            "┌ ℹ️ Lavis — really your userbot\n├ Owner: {owner}\n└ Version: {version} ({version_status})\n\n┌ Source\n├ Current commit: {commit}\n└ Upstream main: {upstream} ({upstream_status})\n\n┌ Runtime\n├ Prefix: {prefix}\n└ Modules: {total} ({active} active)\n\n┌ Environment\n├ Host: {host}\n└ OS: {os}"
         }
         (Locale::Russian, InfoText::Caption) => {
-            "ℹ️ Lavis — really your userbot\n\nВладелец: {owner}\nВерсия: {version}\nТекущий коммит: {commit}\nОсновная ветка: {upstream}\nПрефикс: {prefix}\nМодули: {total} ({active} активных)\nХост: {host}\nОС: {os}"
+            "┌ ℹ️ Lavis — really your userbot\n├ Владелец: {owner}\n└ Версия: {version} ({version_status})\n\n┌ Источник\n├ Текущий коммит: {commit}\n└ Основная ветка: {upstream} ({upstream_status})\n\n┌ Среда\n├ Префикс: {prefix}\n└ Модули: {total} ({active} активных)\n\n┌ Окружение\n├ Хост: {host}\n└ ОС: {os}"
         }
         (Locale::English, InfoText::Unknown) => "unknown",
         (Locale::Russian, InfoText::Unknown) => "неизвестно",
@@ -816,8 +816,10 @@ pub fn info_text(locale: Locale, key: InfoText) -> &'static str {
 pub struct InfoCaptionData<'a> {
     pub owner: &'a str,
     pub version: &'a str,
+    pub version_status: &'a str,
     pub commit: &'a str,
     pub upstream: &'a str,
+    pub upstream_status: &'a str,
     pub prefix: &'a str,
     pub active_modules: usize,
     pub total_modules: usize,
@@ -863,8 +865,10 @@ pub fn render_info_text(locale: Locale, info: InfoCaptionData<'_>) -> String {
         &[
             ("{owner}", info.owner),
             ("{version}", info.version),
+            ("{version_status}", info.version_status),
             ("{commit}", info.commit),
             ("{upstream}", info.upstream),
+            ("{upstream_status}", info.upstream_status),
             ("{prefix}", info.prefix),
             ("{active}", &active_modules),
             ("{total}", &total_modules),
@@ -1797,8 +1801,10 @@ mod tests {
             InfoCaptionData {
                 owner: "@owner",
                 version: "0.1.0",
+                version_status: "current",
                 commit: "b1d18f8",
                 upstream: "unavailable",
+                upstream_status: "unavailable",
                 prefix: ",",
                 active_modules: 3,
                 total_modules: 5,
@@ -1821,8 +1827,10 @@ mod tests {
             InfoCaptionData {
                 owner: "@owner",
                 version: "0.1.0",
+                version_status: "актуальна",
                 commit: "b1d18f8",
                 upstream: "недоступно",
+                upstream_status: "недоступно",
                 prefix: ",",
                 active_modules: 3,
                 total_modules: 5,
@@ -1859,8 +1867,10 @@ mod tests {
             InfoCaptionData {
                 owner: "{version}",
                 version: "0.1.0",
+                version_status: "current",
                 commit: "b1d18f8",
                 upstream: "b1d18f8",
+                upstream_status: "current",
                 prefix: ",",
                 active_modules: 1,
                 total_modules: 2,

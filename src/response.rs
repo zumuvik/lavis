@@ -16,6 +16,33 @@ pub struct RenderedResponse {
 }
 
 impl Response {
+    pub fn four_blockquotes_with_locale(locale: Locale, text: String) -> Self {
+        let text = truncate_utf16_with_locale(locale, &text);
+        let mut entities = Vec::with_capacity(4);
+        let mut offset = 0usize;
+        for section in text.split("\n\n") {
+            if let (Some(offset), Some(length)) =
+                (utf16_i32_len(&text[..offset]), utf16_i32_len(section))
+                && length > 0
+            {
+                entities.push(
+                    grammers_client::tl::types::MessageEntityBlockquote {
+                        offset,
+                        length,
+                        collapsed: false,
+                    }
+                    .into(),
+                );
+            }
+            offset += section.len() + 2;
+        }
+        if entities.len() == 4 {
+            Self { text, entities }
+        } else {
+            Self::plain_with_locale(locale, text)
+        }
+    }
+
     pub fn plain(text: impl Into<String>) -> Self {
         Self::plain_with_locale(Locale::English, text)
     }
@@ -390,6 +417,34 @@ mod tests {
         assert!(output.ends_with(TRUNCATION_SUFFIX));
         assert!(output.encode_utf16().count() <= MAX_UTF16_UNITS);
         assert!(std::str::from_utf8(output.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn four_blockquotes_use_utf16_offsets_for_each_section() {
+        let text = [
+            "┌ first 🦀\n├ owner\n└ version",
+            "┌ source\n├ commit\n└ upstream",
+            "┌ runtime\n├ prefix\n└ modules",
+            "┌ environment\n├ host\n└ os",
+        ]
+        .join("\n\n");
+        let response = Response::four_blockquotes_with_locale(Locale::English, text.clone());
+
+        assert_eq!(response.text, text);
+        assert_eq!(response.entities.len(), 4);
+        let mut byte_offset = 0;
+        for (entity, section) in response.entities.iter().zip(text.split("\n\n")) {
+            let grammers_client::tl::enums::MessageEntity::Blockquote(entity) = entity else {
+                panic!("expected blockquote entity");
+            };
+            assert_eq!(
+                entity.offset,
+                text[..byte_offset].encode_utf16().count() as i32
+            );
+            assert_eq!(entity.length, section.encode_utf16().count() as i32);
+            assert!(!entity.collapsed);
+            byte_offset += section.len() + 2;
+        }
     }
 
     #[test]

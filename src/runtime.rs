@@ -60,7 +60,9 @@ use crate::{
     setup::{self, UsernameCandidate},
     setup_store::SetupStore,
     setup_telegram::{BotFatherProgress, CompanionSetup, GrammersTelegramSetup, ProvisionRequest},
-    upstream::{RevisionRelation, UpstreamRev, UpstreamRevision},
+    upstream::{
+        RevisionRelation, UpstreamRev, UpstreamRevision, VersionRelation, version_relation,
+    },
 };
 
 pub struct RuntimeState {
@@ -163,6 +165,7 @@ async fn resolve_upstream_relation_for(
                 return Ok(UpstreamRevision {
                     revision: main_rev,
                     relation: RevisionRelation::Unavailable,
+                    version: None,
                 });
             }
             Err(crate::upstream::UpstreamError::RateLimited { .. }) => {
@@ -210,6 +213,7 @@ async fn resolve_upstream_relation_for(
     Ok(UpstreamRevision {
         revision: main_rev,
         relation,
+        version: None,
     })
 }
 
@@ -628,6 +632,18 @@ impl RuntimeState {
     pub(crate) fn publish_upstream_revision(&mut self, revision: Option<UpstreamRevision>) {
         if let Some(revision) = revision {
             self.upstream_revision_cache = UpstreamSnapshot::Success(revision);
+        }
+    }
+
+    pub(crate) fn publish_upstream_version(&mut self, version: Option<String>) {
+        match &mut self.upstream_revision_cache {
+            UpstreamSnapshot::Success(revision) => revision.version = version,
+            UpstreamSnapshot::LastFailure { stale, .. } => {
+                if let Some(revision) = stale {
+                    revision.version = version;
+                }
+            }
+            UpstreamSnapshot::Never => {}
         }
     }
 
@@ -1084,6 +1100,32 @@ impl RuntimeState {
             Some(data) => info::short_commit(&data.revision).to_owned(),
             None => info_text(locale, InfoText::Unavailable).to_owned(),
         };
+        let upstream_status = upstream_data
+            .as_ref()
+            .map(|data| render_revision_status(locale, data.relation))
+            .unwrap_or_else(|| info_text(locale, InfoText::Unavailable).to_owned());
+        let version_status = match version_relation(
+            env!("CARGO_PKG_VERSION"),
+            upstream_data
+                .as_ref()
+                .and_then(|data| data.version.as_deref()),
+        ) {
+            VersionRelation::Current => match locale {
+                Locale::English => "current".to_owned(),
+                Locale::Russian => "актуальна".to_owned(),
+            },
+            VersionRelation::NewerAvailable => {
+                let upstream_version = upstream_data
+                    .as_ref()
+                    .and_then(|data| data.version.as_deref())
+                    .unwrap_or_default();
+                match locale {
+                    Locale::English => format!("newer available: {upstream_version}"),
+                    Locale::Russian => format!("доступна новая: {upstream_version}"),
+                }
+            }
+            VersionRelation::Unavailable => info_text(locale, InfoText::Unavailable).to_owned(),
+        };
         let built_in_modules = crate::modules::modules().len();
         let total_modules = built_in_modules + self.external_descriptors().len();
         let active_modules = built_in_modules
@@ -1098,8 +1140,10 @@ impl RuntimeState {
             InfoCaptionData {
                 owner: &owner,
                 version: env!("CARGO_PKG_VERSION"),
+                version_status: &version_status,
                 commit: info::short_commit(info::build_rev()),
                 upstream: &upstream,
+                upstream_status: &upstream_status,
                 prefix: &prefix,
                 active_modules,
                 total_modules,
@@ -1107,42 +1151,8 @@ impl RuntimeState {
                 os: &self.info_local_metadata.os,
             },
         );
-        // Insert Status line after "Upstream main:" only if relation is known
-        let caption = match &upstream_data {
-            Some(data) if data.relation != RevisionRelation::Unavailable => {
-                let status_line = match locale {
-                    Locale::English => {
-                        format!("Status: {}", render_revision_status(locale, data.relation))
-                    }
-                    Locale::Russian => {
-                        format!("Статус: {}", render_revision_status(locale, data.relation))
-                    }
-                };
-                // Insert after "Upstream main: ..." line
-                let upstream_prefix = match locale {
-                    Locale::English => "Upstream main: ",
-                    Locale::Russian => "Основная ветка: ",
-                };
-                if let Some(pos) = caption.find(upstream_prefix) {
-                    if let Some(newline_pos) = caption[pos..].find('\n') {
-                        let insert_pos = pos + newline_pos + 1;
-                        format!(
-                            "{}{}\n{}",
-                            &caption[..insert_pos],
-                            status_line,
-                            &caption[insert_pos..]
-                        )
-                    } else {
-                        caption
-                    }
-                } else {
-                    caption
-                }
-            }
-            _ => caption,
-        };
         RuntimeExecution {
-            response: Response::plain_with_locale(locale, caption),
+            response: Response::four_blockquotes_with_locale(locale, caption),
             media: self.info_local_metadata.media.clone(),
             provision: None,
             shutdown: None,
@@ -4691,15 +4701,18 @@ for line in sys.stdin:
         runtime.publish_upstream_revision(Some(crate::upstream::UpstreamRevision {
             revision: "b1d18f8ef407d043506c983b0d68e96c282eb1c9".to_owned(),
             relation: crate::upstream::RevisionRelation::Current,
+            version: Some("0.1.0".to_owned()),
         }));
 
         let execution = runtime.execute_info();
 
         assert!(execution.response.text.contains("Owner: @owner"));
+        assert!(execution.response.text.contains("Version: 0.1.0 (current)"));
         assert!(execution.response.text.contains("Current commit: "));
         assert!(execution.response.text.contains("Upstream main: b1d18f8"));
         assert!(execution.response.text.contains("Prefix: "));
         assert!(execution.response.text.contains("Modules: "));
+        assert_eq!(execution.response.entities.len(), 4);
         assert_eq!(
             execution.media.as_deref(),
             Some(crate::info::INFO_MEDIA_URL)
@@ -4744,6 +4757,7 @@ for line in sys.stdin:
         runtime.publish_upstream_revision(Some(crate::upstream::UpstreamRevision {
             revision: "b1d18f8ef407d043506c983b0d68e96c282eb1c9".to_owned(),
             relation: crate::upstream::RevisionRelation::Current,
+            version: Some("0.1.0".to_owned()),
         }));
         runtime.publish_upstream_failure("timeout");
 
@@ -4777,6 +4791,7 @@ for line in sys.stdin:
         let revision = crate::upstream::UpstreamRevision {
             revision: "b1d18f8ef407d043506c983b0d68e96c282eb1c9".to_owned(),
             relation: crate::upstream::RevisionRelation::Current,
+            version: Some("0.1.0".to_owned()),
         };
         runtime.publish_upstream_revision(Some(revision.clone()));
         runtime.publish_upstream_failure("timeout");

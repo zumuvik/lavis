@@ -38,6 +38,7 @@ const UPSTREAM_REFRESH_DEADLINE: Duration = Duration::from_secs(5);
 
 enum UpstreamRefresh {
     Success(crate::upstream::UpstreamRevision),
+    Version(Option<String>),
     Failed(String),
 }
 
@@ -100,6 +101,27 @@ async fn upstream_refresh_task_with(
                 tracing::info!(event = "upstream_refresh_succeeded", elapsed_ms, main = %revision.revision, relation = ?revision.relation, "Upstream snapshot refreshed");
                 if sender.send(UpstreamRefresh::Success(revision)).is_err() {
                     return;
+                }
+                match tokio::time::timeout(deadline, resolver.version()).await {
+                    Ok(Ok(version)) => {
+                        if sender.send(UpstreamRefresh::Version(version)).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            event = "upstream_version_refresh_failed",
+                            category = %error,
+                            "Could not refresh upstream package version; retaining the previous version"
+                        );
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            event = "upstream_version_refresh_failed",
+                            category = "timeout",
+                            "Upstream package version refresh exceeded its deadline; retaining the previous version"
+                        );
+                    }
                 }
             }
             Ok(Err(crate::runtime::UpstreamResolveFailure::MainRev(error))) => {
@@ -313,6 +335,9 @@ async fn run_loop(
                     Some(UpstreamRefresh::Success(revision)) => {
                         runtime.publish_upstream_revision(Some(revision));
                     }
+                    Some(UpstreamRefresh::Version(version)) => {
+                        runtime.publish_upstream_version(version);
+                    }
                     Some(UpstreamRefresh::Failed(category)) => {
                         runtime.publish_upstream_failure(category);
                     }
@@ -521,9 +546,11 @@ async fn deliver_photo(
     command_message: &Message,
     media_url: &str,
     caption: String,
+    entities: Vec<grammers_client::tl::enums::MessageEntity>,
 ) -> anyhow::Result<()> {
     let input = grammers_client::message::InputMessage::new()
         .text(caption)
+        .fmt_entities(entities)
         .photo_url(media_url.to_owned());
     command_message
         .edit(input)
@@ -541,6 +568,7 @@ trait CommandMediaEdits {
         &mut self,
         media_url: &str,
         caption: &str,
+        entities: Vec<grammers_client::tl::enums::MessageEntity>,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
 
     fn edit_text(
@@ -555,8 +583,13 @@ struct TelegramCommandMediaEdits<'a> {
 }
 
 impl CommandMediaEdits for TelegramCommandMediaEdits<'_> {
-    async fn edit_photo(&mut self, media_url: &str, caption: &str) -> anyhow::Result<()> {
-        deliver_photo(self.message, media_url, caption.to_owned()).await
+    async fn edit_photo(
+        &mut self,
+        media_url: &str,
+        caption: &str,
+        entities: Vec<grammers_client::tl::enums::MessageEntity>,
+    ) -> anyhow::Result<()> {
+        deliver_photo(self.message, media_url, caption.to_owned(), entities).await
     }
 
     async fn edit_text(
@@ -621,7 +654,14 @@ async fn deliver_media_with_suppression<E: CommandMediaEdits>(
         plan.message_id,
         plan.media_caption.to_owned(),
     );
-    match edits.edit_photo(plan.media_url, plan.media_caption).await {
+    match edits
+        .edit_photo(
+            plan.media_url,
+            plan.media_caption,
+            plan.fallback_entities.clone(),
+        )
+        .await
+    {
         Ok(()) => return MediaDeliveryOutcome::PhotoDelivered,
         Err(error) => {
             // Fail closed on ambiguous transport/read failures: the photo edit
@@ -1948,7 +1988,12 @@ mod tests {
     }
 
     impl CommandMediaEdits for ScriptedMediaEdits {
-        async fn edit_photo(&mut self, _media_url: &str, caption: &str) -> anyhow::Result<()> {
+        async fn edit_photo(
+            &mut self,
+            _media_url: &str,
+            caption: &str,
+            _entities: Vec<grammers_client::tl::enums::MessageEntity>,
+        ) -> anyhow::Result<()> {
             self.photo_calls.push(caption.to_owned());
             match self.photo_results.pop_front() {
                 Some(result) => result,

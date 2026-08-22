@@ -12,6 +12,8 @@ pub type UpstreamRevFuture<'a> =
 
 pub type CompareFuture<'a> =
     Pin<Box<dyn Future<Output = Result<CompareResult, UpstreamError>> + Send + 'a>>;
+pub type VersionFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<String>, UpstreamError>> + Send + 'a>>;
 
 /// Raw result of one Tangled compare HTTP round trip: the response status
 /// plus the bounded body, read before any status interpretation because the
@@ -34,6 +36,9 @@ trait RawCompareTransport: Send + Sync {
 pub trait UpstreamRev: Send + Sync {
     fn main_rev<'a>(&'a self) -> UpstreamRevFuture<'a>;
     fn compare<'a>(&'a self, base: &'a str, head: &'a str) -> CompareFuture<'a>;
+    fn version<'a>(&'a self) -> VersionFuture<'a> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 /// Outcome of comparing two revisions: how many commits `head` carries that
@@ -60,6 +65,53 @@ pub enum RevisionRelation {
 pub struct UpstreamRevision {
     pub revision: String,
     pub relation: RevisionRelation,
+    pub version: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VersionRelation {
+    Current,
+    NewerAvailable,
+    Unavailable,
+}
+
+pub fn version_relation(installed: &str, upstream: Option<&str>) -> VersionRelation {
+    let Some(upstream) = upstream else {
+        return VersionRelation::Unavailable;
+    };
+    match (
+        parse_dotted_version(installed),
+        parse_dotted_version(upstream),
+    ) {
+        (Some(installed), Some(upstream)) if upstream > installed => {
+            VersionRelation::NewerAvailable
+        }
+        (Some(_), Some(_)) => VersionRelation::Current,
+        _ => VersionRelation::Unavailable,
+    }
+}
+
+fn parse_dotted_version(value: &str) -> Option<Vec<u64>> {
+    let parts: Vec<_> = value.split('.').collect();
+    if parts.is_empty()
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || !part.chars().all(|c| c.is_ascii_digit()))
+    {
+        return None;
+    }
+    let mut parsed: Vec<u64> = parts
+        .into_iter()
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    while parsed.last() == Some(&0) {
+        parsed.pop();
+    }
+    if parsed.is_empty() {
+        parsed.push(0);
+    }
+    Some(parsed)
 }
 
 /// Derives the [`RevisionRelation`] from raw ahead/behind counts.
@@ -111,6 +163,8 @@ impl std::fmt::Display for UpstreamError {
 
 const UPSTREAM_INFO_REFS_URL: &str =
     "https://tangled.org/zumuvik.tngl.sh/lavis/info/refs?service=git-upload-pack";
+const UPSTREAM_CARGO_TOML_URL: &str =
+    "https://tangled.org/zumuvik.tngl.sh/lavis/raw/main/Cargo.toml";
 const TANGLED_COMPARE_URL: &str = "https://knot1.tangled.sh/xrpc/sh.tangled.repo.compare";
 /// Repo identifier passed to `sh.tangled.repo.compare` as the `repo` query
 /// parameter.
@@ -268,6 +322,22 @@ impl UpstreamRev for HttpUpstreamRev {
         })
     }
 
+    fn version<'a>(&'a self) -> VersionFuture<'a> {
+        Box::pin(async move {
+            let response = self
+                .client
+                .get(UPSTREAM_CARGO_TOML_URL)
+                .send()
+                .await
+                .map_err(request_error)?;
+            if !response.status().is_success() {
+                return Err(UpstreamError::HttpStatus(response.status().as_u16()));
+            }
+            let body = read_bounded_body(response, MAX_INFO_REFS_BODY_BYTES).await?;
+            Ok(parse_package_version(&body))
+        })
+    }
+
     fn compare<'a>(&'a self, base: &'a str, head: &'a str) -> CompareFuture<'a> {
         Box::pin(async move {
             match perform_compare(self, base, head).await {
@@ -297,6 +367,30 @@ impl UpstreamRev for HttpUpstreamRev {
             }
         })
     }
+}
+
+/// Extracts only the `[package]` `version` value from Cargo.toml without
+/// introducing a TOML parser for this small, bounded response.
+pub fn parse_package_version(body: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(body).ok()?;
+    let mut in_package = false;
+    for line in text.lines() {
+        let line = line.split('#').next()?.trim();
+        if line.starts_with('[') {
+            in_package = line == "[package]";
+            continue;
+        }
+        if in_package {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            if key.trim() == "version" {
+                let value = value.trim().trim_matches('"');
+                return parse_dotted_version(value).map(|_| value.to_owned());
+            }
+        }
+    }
+    None
 }
 
 impl RawCompareTransport for HttpUpstreamRev {
@@ -592,6 +686,38 @@ mod tests {
             result: Err(UpstreamError::Timeout),
         };
         assert_eq!(mock.main_rev().await, Err(UpstreamError::Timeout));
+    }
+
+    #[test]
+    fn parses_package_version_from_cargo_toml() {
+        assert_eq!(
+            parse_package_version(b"[package]\nname = \"lavis\"\nversion = \"1.2.3\"\n"),
+            Some("1.2.3".to_owned())
+        );
+        assert_eq!(
+            parse_package_version(b"[dependencies]\nversion = \"9.9.9\""),
+            None
+        );
+    }
+
+    #[test]
+    fn compares_installed_and_upstream_versions_conservatively() {
+        assert_eq!(
+            version_relation("1.2.3", Some("1.2.3")),
+            VersionRelation::Current
+        );
+        assert_eq!(
+            version_relation("1.2.3", Some("1.3.0")),
+            VersionRelation::NewerAvailable
+        );
+        assert_eq!(
+            version_relation("1.2.3", None),
+            VersionRelation::Unavailable
+        );
+        assert_eq!(
+            version_relation("1.2.3", Some("next")),
+            VersionRelation::Unavailable
+        );
     }
 
     /// Byte-for-byte shape of the real Tangled `info/refs` response
