@@ -356,14 +356,14 @@ async fn deliver_photo(
     let uploaded = client
         .upload_file(media_path)
         .await
-        .map_err(|error| anyhow::anyhow!("upload info image: {error}"))?;
+        .context("upload info image")?;
     let input = grammers_client::message::InputMessage::new()
         .text(caption)
         .photo(uploaded);
     command_message
         .edit(input)
         .await
-        .map_err(|error| anyhow::anyhow!("edit message with photo: {error}"))?;
+        .context("edit message with photo")?;
     Ok(())
 }
 
@@ -1904,6 +1904,46 @@ mod tests {
         assert!(!runtime.consume_expected_self_edit(peer, 43, "ℹ️ text fallback"));
     }
 
+    /// When media and fallback render the same text, an ambiguous media failure
+    /// followed by a definitive fallback rejection leaves exactly one token.
+    #[tokio::test]
+    async fn ambiguous_media_and_rejected_same_text_fallback_leave_one_token() {
+        let mut runtime = runtime().await;
+        let peer = PeerId::user(1).unwrap();
+        let rpc = grammers_client::InvocationError::Rpc(grammers_mtsender::RpcError {
+            code: 400,
+            name: "MESSAGE_ID_INVALID".to_owned(),
+            value: None,
+            caused_by: None,
+        });
+        let mut edits =
+            ScriptedMediaEdits::new(vec![ScriptedMediaEdits::io_error()], vec![Err(rpc)]);
+
+        assert_eq!(
+            deliver(&mut runtime, &mut edits, 47, "same text", "same text").await,
+            MediaDeliveryOutcome::TextFallbackApplied { delivered: false }
+        );
+        assert!(runtime.consume_expected_self_edit(peer, 47, "same text"));
+        assert!(!runtime.consume_expected_self_edit(peer, 47, "same text"));
+    }
+
+    /// When media and fallback render the same text, an ambiguous media failure
+    /// followed by a successful fallback preserves both mutation-attempt tokens.
+    #[tokio::test]
+    async fn ambiguous_media_and_successful_same_text_fallback_leave_two_tokens() {
+        let mut runtime = runtime().await;
+        let peer = PeerId::user(1).unwrap();
+        let mut edits = ScriptedMediaEdits::new(vec![ScriptedMediaEdits::io_error()], vec![Ok(())]);
+
+        assert_eq!(
+            deliver(&mut runtime, &mut edits, 48, "same text", "same text").await,
+            MediaDeliveryOutcome::TextFallbackApplied { delivered: true }
+        );
+        assert!(runtime.consume_expected_self_edit(peer, 48, "same text"));
+        assert!(runtime.consume_expected_self_edit(peer, 48, "same text"));
+        assert!(!runtime.consume_expected_self_edit(peer, 48, "same text"));
+    }
+
     /// Media delivery fails with a DEFINITIVE server rejection (`Rpc`): the
     /// mutation provably was not applied, so its suppression is released and
     /// the text fallback arms only its own expectation.
@@ -1940,6 +1980,27 @@ mod tests {
         // The fallback's own expectation suppresses its MessageEdited once.
         assert!(runtime.consume_expected_self_edit(peer, 46, "ℹ️ text fallback"));
         assert!(!runtime.consume_expected_self_edit(peer, 46, "ℹ️ text fallback"));
+    }
+
+    #[tokio::test]
+    async fn wrapped_media_invocation_error_remains_classifiable_as_rpc() {
+        let mut runtime = runtime().await;
+        let peer = PeerId::user(1).unwrap();
+        let media_rejection = anyhow::anyhow!(grammers_client::InvocationError::Rpc(
+            grammers_mtsender::RpcError {
+                code: 400,
+                name: "MESSAGE_ID_INVALID".to_owned(),
+                value: None,
+                caused_by: None,
+            }
+        ))
+        .context("edit message with photo");
+        let mut edits = ScriptedMediaEdits::new(vec![Err(media_rejection)], vec![Ok(())]);
+
+        deliver(&mut runtime, &mut edits, 49, "media", "fallback").await;
+
+        assert!(!runtime.consume_expected_self_edit(peer, 49, "media"));
+        assert!(runtime.consume_expected_self_edit(peer, 49, "fallback"));
     }
 
     /// Both edits failing with AMBIGUOUS errors must leave BOTH suppressions

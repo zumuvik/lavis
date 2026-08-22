@@ -109,16 +109,10 @@ impl std::fmt::Display for UpstreamError {
 
 const UPSTREAM_INFO_REFS_URL: &str =
     "https://tangled.org/zumuvik.tngl.sh/lavis/info/refs?service=git-upload-pack";
-const TANGLED_COMPARE_URL: &str = "https://api.tangled.org/xrpc/sh.tangled.repo.compare";
+const TANGLED_COMPARE_URL: &str = "https://knot1.tangled.sh/xrpc/sh.tangled.repo.compare";
 /// Repo identifier passed to `sh.tangled.repo.compare` as the `repo` query
-/// parameter. The Lexicon requires the `did:plc:.../repoName` form (an
-/// `at://` / AT-URI is rejected by the schema). Per the knotserver,
-/// `resolveRepo` splits the identifier into `ownerDid / repoName` and resolves
-/// it through the `repo_aliases(owner_did, rkey)` table, so the `did:plc:...`
-/// prefix is the repository's **owner** DID (`zumuvik.tngl.sh` =
-/// `did:plc:trc7yr7p6ikl5fxfupm5mia2`), not the auto-generated repo DID that
-/// appears in the git remote / clone permalink.
-const TANGLED_COMPARE_REPO: &str = "did:plc:trc7yr7p6ikl5fxfupm5mia2/lavis";
+/// parameter.
+const TANGLED_COMPARE_REPO: &str = "did:plc:xhzbac5le4gwflk4t6stjjgf";
 const SHA1_HEX_LEN: usize = 40;
 /// `info/refs` advertises refs only, so its bodies stay tiny.
 const MAX_INFO_REFS_BODY_BYTES: usize = 64 * 1024;
@@ -325,16 +319,27 @@ async fn perform_compare<T: RawCompareTransport + ?Sized>(
 fn parse_tangled_compare_response(body: &[u8]) -> Result<CompareResult, UpstreamError> {
     let value: serde_json::Value =
         serde_json::from_slice(body).map_err(|_| UpstreamError::InvalidResponse)?;
-    let patches = value
-        .get("format_patch")
-        .and_then(|v| v.as_array())
-        .ok_or(UpstreamError::InvalidResponse)?;
+    if value
+        .get("merge_base")
+        .is_some_and(|value| !value.is_string())
+    {
+        return Err(UpstreamError::InvalidResponse);
+    }
     let merge_base = value
         .get("merge_base")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    let ahead_by = match value.get("format_patch") {
+        Some(value) => value
+            .as_array()
+            .ok_or(UpstreamError::InvalidResponse)?
+            .len() as u64,
+        // BASE==BASE responses legitimately omit the patch list.
+        None if merge_base.is_some() => 0,
+        None => return Err(UpstreamError::InvalidResponse),
+    };
     Ok(CompareResult {
-        ahead_by: patches.len() as u64,
+        ahead_by,
         behind_by: 0,
         merge_base,
     })
@@ -482,7 +487,14 @@ mod tests {
 
         fn with_pair(mut self, rev1: &str, rev2: &str, patches: &[&str], merge_base: &str) -> Self {
             let body = serde_json::json!({
-                "format_patch": patches,
+                "format_patch": patches
+                    .iter()
+                    .map(|sha| serde_json::json!({
+                        "SHA": sha,
+                        "Title": "fixture commit",
+                        "Files": [],
+                    }))
+                    .collect::<Vec<_>>(),
                 "merge_base": merge_base,
             })
             .to_string();
@@ -673,10 +685,17 @@ mod tests {
 
     #[test]
     fn parses_tangled_compare_response() {
-        let body = br#"{"format_patch":["patch1","patch2","patch3"],"merge_base":"abc123"}"#;
+        let body = br#"{
+            "merge_base":"BASE",
+            "format_patch":[
+                {"SHA":"HEAD1","Title":"first commit","Files":[]},
+                {"SHA":"HEAD2","Title":"second commit","Files":[]},
+                {"SHA":"HEAD3","Title":"third commit","Files":[]}
+            ]
+        }"#;
         let result = parse_tangled_compare_response(body).unwrap();
         assert_eq!(result.ahead_by, 3);
-        assert_eq!(result.merge_base, Some("abc123".to_string()));
+        assert_eq!(result.merge_base, Some("BASE".to_string()));
     }
 
     #[test]
@@ -702,9 +721,22 @@ mod tests {
             Err(UpstreamError::InvalidResponse)
         );
         assert_eq!(
+            parse_tangled_compare_response(
+                br#"{"merge_base":"BASE","format_patch":"not-an-array"}"#
+            ),
+            Err(UpstreamError::InvalidResponse)
+        );
+        assert_eq!(
             parse_tangled_compare_response(b"not json"),
             Err(UpstreamError::InvalidResponse)
         );
+    }
+
+    #[test]
+    fn missing_format_patch_is_valid_zero_diff() {
+        let result = parse_tangled_compare_response(br#"{"merge_base":"BASE"}"#).unwrap();
+        assert_eq!(result.ahead_by, 0);
+        assert_eq!(result.merge_base.as_deref(), Some("BASE"));
     }
 
     #[tokio::test]
@@ -994,10 +1026,9 @@ mod tests {
         assert_eq!(ordered, RevisionRelation::Behind { commits: 1 });
     }
 
-    /// The `repo` query parameter must be the Lexicon's `did:plc:.../repoName`
-    /// form (an `at://` AT-URI is rejected by the schema) pinned to the
-    /// canonical owner DID. A regression here fails if the client ever sends
-    /// an `at://` identifier or a wrong owner DID again.
+    /// The `repo` query parameter must be the canonical repository DID. A
+    /// regression here fails if the client ever sends an `at://` identifier,
+    /// an owner-DID/repo-name form, or another wrong repository identifier.
     #[test]
     fn compare_query_uses_canonical_did_repo_identifier() {
         let params = compare_query_params("main", "feat/info-command");
@@ -1006,14 +1037,14 @@ mod tests {
             .iter()
             .find(|(key, _)| *key == "repo")
             .expect("compare query must carry a repo parameter");
-        assert_eq!(repo.1, "did:plc:trc7yr7p6ikl5fxfupm5mia2/lavis");
+        assert_eq!(repo.1, "did:plc:xhzbac5le4gwflk4t6stjjgf");
         assert!(
             !repo.1.starts_with("at://"),
             "repo must not be an at:// AT-URI: {repo:?}"
         );
         assert!(
             repo.1.starts_with("did:plc:"),
-            "repo must be a did:plc: ... /repoName identifier: {repo:?}"
+            "repo must be a did:plc repository identifier: {repo:?}"
         );
 
         let rev1 = params

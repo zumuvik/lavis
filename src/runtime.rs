@@ -776,11 +776,6 @@ impl RuntimeState {
     }
 
     pub fn register_expected_self_edit(&mut self, peer_id: PeerId, message_id: i32, text: String) {
-        self.expected_self_edits.retain(|expected| {
-            expected.peer_id != peer_id
-                || expected.message_id != message_id
-                || expected.text != text
-        });
         if self.expected_self_edits.len() == MAX_EXPECTED_SELF_EDITS {
             self.expected_self_edits.pop_front();
         }
@@ -4098,6 +4093,12 @@ mod tests {
         runtime.register_expected_self_edit(peer, 43, "failed response".to_owned());
         runtime.remove_expected_self_edit(peer, 43, "failed response");
         assert!(!runtime.consume_expected_self_edit(peer, 43, "failed response"));
+
+        runtime.register_expected_self_edit(peer, 44, "duplicate response".to_owned());
+        runtime.register_expected_self_edit(peer, 44, "duplicate response".to_owned());
+        assert!(runtime.consume_expected_self_edit(peer, 44, "duplicate response"));
+        assert!(runtime.consume_expected_self_edit(peer, 44, "duplicate response"));
+        assert!(!runtime.consume_expected_self_edit(peer, 44, "duplicate response"));
         fs::remove_dir_all(directory).unwrap();
     }
 
