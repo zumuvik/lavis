@@ -110,7 +110,15 @@ impl std::fmt::Display for UpstreamError {
 const UPSTREAM_INFO_REFS_URL: &str =
     "https://tangled.org/zumuvik.tngl.sh/lavis/info/refs?service=git-upload-pack";
 const TANGLED_COMPARE_URL: &str = "https://api.tangled.org/xrpc/sh.tangled.repo.compare";
-const TANGLED_COMPARE_REPO: &str = "at://did:plc:trc7yr7p6ikl5fxfupm5mia2/sh.tangled.repo/lavis";
+/// Repo identifier passed to `sh.tangled.repo.compare` as the `repo` query
+/// parameter. The Lexicon requires the `did:plc:.../repoName` form (an
+/// `at://` / AT-URI is rejected by the schema). Per the knotserver,
+/// `resolveRepo` splits the identifier into `ownerDid / repoName` and resolves
+/// it through the `repo_aliases(owner_did, rkey)` table, so the `did:plc:...`
+/// prefix is the repository's **owner** DID (`zumuvik.tngl.sh` =
+/// `did:plc:trc7yr7p6ikl5fxfupm5mia2`), not the auto-generated repo DID that
+/// appears in the git remote / clone permalink.
+const TANGLED_COMPARE_REPO: &str = "did:plc:trc7yr7p6ikl5fxfupm5mia2/lavis";
 const SHA1_HEX_LEN: usize = 40;
 /// `info/refs` advertises refs only, so its bodies stay tiny.
 const MAX_INFO_REFS_BODY_BYTES: usize = 64 * 1024;
@@ -266,11 +274,7 @@ impl RawCompareTransport for HttpUpstreamRev {
             let response = self
                 .client
                 .get(TANGLED_COMPARE_URL)
-                .query(&[
-                    ("repo", TANGLED_COMPARE_REPO),
-                    ("rev1", rev1),
-                    ("rev2", rev2),
-                ])
+                .query(&compare_query_params(rev1, rev2))
                 .send()
                 .await
                 .map_err(request_error)?;
@@ -279,6 +283,18 @@ impl RawCompareTransport for HttpUpstreamRev {
             Ok((status, body))
         })
     }
+}
+
+/// The exact ordered `(key, value)` query pairs sent to
+/// `sh.tangled.repo.compare`. The repository identifier is pinned here so a
+/// regression test can assert the precise `repo` value the client sends and
+/// catch a future drift back to an `at://` form or a wrong owner DID.
+fn compare_query_params<'a>(rev1: &'a str, rev2: &'a str) -> [(&'static str, &'a str); 3] {
+    [
+        ("repo", TANGLED_COMPARE_REPO),
+        ("rev1", rev1),
+        ("rev2", rev2),
+    ]
 }
 
 /// Runs one ordered Tangled compare. The public contract is
@@ -973,5 +989,58 @@ mod tests {
 
         let ordered = relation_from_ordered_compares("C", "B", correct_first, correct_reverse);
         assert_eq!(ordered, RevisionRelation::Behind { commits: 1 });
+    }
+
+    /// The `repo` query parameter must be the Lexicon's `did:plc:.../repoName`
+    /// form (an `at://` AT-URI is rejected by the schema) pinned to the
+    /// canonical owner DID. A regression here fails if the client ever sends
+    /// an `at://` identifier or a wrong owner DID again.
+    #[test]
+    fn compare_query_uses_canonical_did_repo_identifier() {
+        let params = compare_query_params("main", "feat/info-command");
+
+        let repo = params
+            .iter()
+            .find(|(key, _)| *key == "repo")
+            .expect("compare query must carry a repo parameter");
+        assert_eq!(repo.1, "did:plc:trc7yr7p6ikl5fxfupm5mia2/lavis");
+        assert!(
+            !repo.1.starts_with("at://"),
+            "repo must not be an at:// AT-URI: {repo:?}"
+        );
+        assert!(
+            repo.1.starts_with("did:plc:"),
+            "repo must be a did:plc: ... /repoName identifier: {repo:?}"
+        );
+
+        let rev1 = params
+            .iter()
+            .find(|(key, _)| *key == "rev1")
+            .expect("compare query must carry rev1");
+        assert_eq!(rev1.1, "main");
+        let rev2 = params
+            .iter()
+            .find(|(key, _)| *key == "rev2")
+            .expect("compare query must carry rev2");
+        assert_eq!(rev2.1, "feat/info-command");
+    }
+
+    /// A swapped `rev1`/`rev2` pair must produce a different (inverted) answer:
+    /// the test fixture is asymmetric so a naive swap breaks the expectation.
+    #[tokio::test]
+    async fn swapped_query_orientation_breaks_the_expected_answer() {
+        let transport = ScriptedCompareTransport::empty()
+            .with_pair("B", "C", &["patch-C"], "B")
+            // Reversed question yields a different patch count — a swap lands
+            // here and must fail rather than silently agree.
+            .with_pair("C", "B", &["patch-B"], "B");
+
+        let forward = perform_compare(&transport, "B", "C").await.unwrap();
+        assert_eq!(forward.ahead_by, 1);
+
+        assert_eq!(
+            transport.requested_pairs(),
+            vec![("B".to_owned(), "C".to_owned())]
+        );
     }
 }
