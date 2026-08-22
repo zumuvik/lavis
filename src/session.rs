@@ -84,6 +84,12 @@ impl SessionLock {
     }
 }
 
+impl Drop for SessionLock {
+    fn drop(&mut self) {
+        let _ = flock(&self._file, FlockOperation::Unlock);
+    }
+}
+
 pub(crate) fn lock_state(session_path: &Path) -> Result<SessionLockState, ClientError> {
     match fs::symlink_metadata(lock_path(session_path)) {
         Ok(_) => match SessionLock::acquire(session_path, SessionLockContext::Doctor) {
@@ -381,6 +387,23 @@ mod tests {
         drop(first);
         let second = SessionLock::acquire(&session_path, SessionLockContext::Client).unwrap();
         drop(second);
+        assert!(lock_path(&session_path).exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn inherited_file_clone_does_not_delay_lock_release_after_session_lock_drop() {
+        let directory = test_directory("inherited-fd");
+        fs::create_dir(&directory).unwrap();
+        let session_path = directory.join("session");
+
+        let lock = SessionLock::acquire(&session_path, SessionLockContext::Client).unwrap();
+        let inherited_file = lock._file.try_clone().unwrap();
+        drop(lock);
+
+        let reacquired = SessionLock::acquire(&session_path, SessionLockContext::Client).unwrap();
+        drop(reacquired);
+        drop(inherited_file);
         assert!(lock_path(&session_path).exists());
         fs::remove_dir_all(directory).unwrap();
     }
