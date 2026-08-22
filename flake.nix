@@ -33,13 +33,9 @@
           pkgs.python3 # JSON-line external-process fixtures (test-only)
           pkgs.util-linux # `flock` session-lock test helper
         ];
-        postInstall = ''
-          install -Dm644 assets/lavis-info.png $out/share/lavis/lavis-info.png
-        '';
         postFixup = ''
           wrapProgram $out/bin/lavis \
             --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.fastfetch ]} \
-            --set LAVIS_INFO_IMAGE $out/share/lavis/lavis-info.png \
             --set-default LAVIS_HOST nix-package
         '';
         meta = {

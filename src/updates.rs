@@ -512,23 +512,19 @@ fn as_invocation_error(error: &anyhow::Error) -> Option<&grammers_client::Invoca
         .find_map(|cause| cause.downcast_ref::<grammers_client::InvocationError>())
 }
 
-/// Edits the outgoing command message in place to carry the static media
-/// asset with `caption`. The MTProto `messages.editMessage` call supports
+/// Edits the outgoing command message in place to carry the static media URL
+/// with `caption`. Telegram fetches the URL server-side, avoiding a local
+/// upload on every invocation. The MTProto `messages.editMessage` call supports
 /// the `media` parameter, so we replace the command text with the photo
 /// rather than sending a new message and deleting the original.
 async fn deliver_photo(
-    client: &grammers_client::Client,
     command_message: &Message,
-    media_path: &std::path::Path,
+    media_url: &str,
     caption: String,
 ) -> anyhow::Result<()> {
-    let uploaded = client
-        .upload_file(media_path)
-        .await
-        .context("upload info image")?;
     let input = grammers_client::message::InputMessage::new()
         .text(caption)
-        .photo(uploaded);
+        .photo_url(media_url.to_owned());
     command_message
         .edit(input)
         .await
@@ -543,7 +539,7 @@ async fn deliver_photo(
 trait CommandMediaEdits {
     fn edit_photo(
         &mut self,
-        media_path: &std::path::Path,
+        media_url: &str,
         caption: &str,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
 
@@ -555,17 +551,12 @@ trait CommandMediaEdits {
 }
 
 struct TelegramCommandMediaEdits<'a> {
-    client: &'a grammers_client::Client,
     message: &'a Message,
 }
 
 impl CommandMediaEdits for TelegramCommandMediaEdits<'_> {
-    async fn edit_photo(
-        &mut self,
-        media_path: &std::path::Path,
-        caption: &str,
-    ) -> anyhow::Result<()> {
-        deliver_photo(self.client, self.message, media_path, caption.to_owned()).await
+    async fn edit_photo(&mut self, media_url: &str, caption: &str) -> anyhow::Result<()> {
+        deliver_photo(self.message, media_url, caption.to_owned()).await
     }
 
     async fn edit_text(
@@ -606,7 +597,7 @@ struct MediaDeliveryPlan<'a> {
     /// Text for the fallback edit; it arms its own suppression entry.
     fallback_text: &'a str,
     fallback_entities: Vec<grammers_client::tl::enums::MessageEntity>,
-    media_path: &'a std::path::Path,
+    media_url: &'a str,
 }
 
 /// Delivers a media response while keeping the expected-self-edit ledger
@@ -630,7 +621,7 @@ async fn deliver_media_with_suppression<E: CommandMediaEdits>(
         plan.message_id,
         plan.media_caption.to_owned(),
     );
-    match edits.edit_photo(plan.media_path, plan.media_caption).await {
+    match edits.edit_photo(plan.media_url, plan.media_caption).await {
         Ok(()) => return MediaDeliveryOutcome::PhotoDelivered,
         Err(error) => {
             // Fail closed on ambiguous transport/read failures: the photo edit
@@ -937,15 +928,12 @@ async fn process_update(
     };
     let rendered_text = execution.response.text;
     let mut source_edit_succeeded = false;
-    if let Some(media_path) = execution.media {
+    if let Some(media_url) = execution.media {
         // The media edit must be suppressed like any other Lavis-owned edit,
         // and its suppression entry is transactional: dropped when the photo
         // edit fails, re-armed by the text fallback, dropped again if the
         // fallback fails.
-        let mut edits = TelegramCommandMediaEdits {
-            client,
-            message: &message,
-        };
+        let mut edits = TelegramCommandMediaEdits { message: &message };
         let plan = MediaDeliveryPlan {
             peer_id,
             message_id,
@@ -953,7 +941,7 @@ async fn process_update(
             media_caption: &rendered_text,
             fallback_text: &rendered_text,
             fallback_entities: execution.response.entities,
-            media_path: &media_path,
+            media_url: &media_url,
         };
         match deliver_media_with_suppression(&mut edits, runtime, plan).await {
             MediaDeliveryOutcome::PhotoDelivered => {
@@ -1960,11 +1948,7 @@ mod tests {
     }
 
     impl CommandMediaEdits for ScriptedMediaEdits {
-        async fn edit_photo(
-            &mut self,
-            _media_path: &std::path::Path,
-            caption: &str,
-        ) -> anyhow::Result<()> {
+        async fn edit_photo(&mut self, _media_url: &str, caption: &str) -> anyhow::Result<()> {
             self.photo_calls.push(caption.to_owned());
             match self.photo_results.pop_front() {
                 Some(result) => result,
@@ -2005,7 +1989,7 @@ mod tests {
                 media_caption,
                 fallback_text,
                 fallback_entities: Vec::new(),
-                media_path: std::path::Path::new("/nonexistent/lavis-info.png"),
+                media_url: "https://example.invalid/lavis-info.png",
             },
         )
         .await

@@ -118,7 +118,7 @@ pub(crate) enum UpstreamSnapshot {
 struct InfoLocalMetadata {
     host: &'static str,
     os: String,
-    media: Option<PathBuf>,
+    media: Option<String>,
 }
 
 #[derive(Debug)]
@@ -344,7 +344,7 @@ pub(crate) struct RuntimeExecution {
     /// Static media to deliver alongside `response` instead of editing the
     /// command message. Only `info` sets this today; when present, the update
     /// layer sends the media and falls back to a text edit on failure.
-    pub media: Option<PathBuf>,
+    pub media: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -414,10 +414,7 @@ impl RuntimeState {
                 host: info::deployment_label(std::env::var("LAVIS_HOST").ok().as_deref()),
                 os: info::read_os_release_pretty_name()
                     .unwrap_or_else(|| std::env::consts::OS.to_owned()),
-                media: info::info_asset_path(
-                    std::env::var_os("LAVIS_INFO_IMAGE").as_deref(),
-                    env!("CARGO_MANIFEST_DIR"),
-                ),
+                media: Some(info::INFO_MEDIA_URL.to_owned()),
             },
             external_manager: None,
             external_snapshot: ExternalRuntimeSnapshot::new(),
@@ -1074,8 +1071,7 @@ impl RuntimeState {
     }
 
     /// Builds the `info` reply: a dynamic caption plus the static branding
-    /// image when it is available. `media` is left `None` for a text-only card
-    /// when the packaged image cannot be resolved.
+    /// image URL.
     fn execute_info(&mut self) -> RuntimeExecution {
         let locale = self.locale();
         let prefix = self.prefix().to_owned();
@@ -1145,16 +1141,9 @@ impl RuntimeState {
             }
             _ => caption,
         };
-        let media = self.info_local_metadata.media.clone();
-        if media.is_none() {
-            tracing::warn!(
-                event = "info_image_unavailable",
-                "Info image is missing; replying with a text-only card"
-            );
-        }
         RuntimeExecution {
             response: Response::plain_with_locale(locale, caption),
-            media,
+            media: self.info_local_metadata.media.clone(),
             provision: None,
             shutdown: None,
             post_edit: None,
@@ -4711,6 +4700,10 @@ for line in sys.stdin:
         assert!(execution.response.text.contains("Upstream main: b1d18f8"));
         assert!(execution.response.text.contains("Prefix: "));
         assert!(execution.response.text.contains("Modules: "));
+        assert_eq!(
+            execution.media.as_deref(),
+            Some(crate::info::INFO_MEDIA_URL)
+        );
         fs::remove_dir_all(directory).ok();
     }
 

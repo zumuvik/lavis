@@ -1,8 +1,11 @@
 //! Telegram-independent helpers backing the `info` command caption.
 
-use std::{ffi::OsStr, io::Read, path::PathBuf};
+use std::io::Read;
 
 use crate::auth::SelfIdentity;
+
+pub const INFO_MEDIA_URL: &str =
+    "https://tangled.org/zumuvik.tngl.sh/lavis/raw/main/assets/lavis-info.png";
 
 /// Picks the most readable owner label in order: username, display name, then
 /// the numeric account id.
@@ -78,20 +81,6 @@ pub fn read_os_release_pretty_name() -> Option<String> {
         .read_to_end(&mut contents)
         .ok()?;
     parse_pretty_name(&contents)
-}
-
-/// Resolves the static info image shipped with the package. The Nix wrapper
-/// sets `LAVIS_INFO_IMAGE`; development builds fall back to the tracked asset
-/// next to the manifest. `None` means no usable image exists and the caller
-/// must reply with a text-only card.
-pub fn info_asset_path(env_value: Option<&OsStr>, manifest_dir: &str) -> Option<PathBuf> {
-    let candidate = match env_value {
-        Some(value) => PathBuf::from(value),
-        None => PathBuf::from(manifest_dir)
-            .join("assets")
-            .join("lavis-info.png"),
-    };
-    candidate.is_file().then_some(candidate)
 }
 
 /// Truncates a revision to the conventional short form used by git UIs.
@@ -172,32 +161,5 @@ mod tests {
     fn build_rev_is_never_empty_or_oversized() {
         assert!(!build_rev().is_empty());
         assert!(build_rev().len() <= 40);
-    }
-
-    #[test]
-    fn asset_path_prefers_environment_value() {
-        let existing = std::env::temp_dir().join("lavis-info-test.png");
-        std::fs::write(&existing, b"png").expect("test fixture");
-        let result = info_asset_path(Some(existing.as_os_str()), env!("CARGO_MANIFEST_DIR"));
-        std::fs::remove_file(&existing).ok();
-        assert_eq!(result.as_deref(), Some(existing.as_path()));
-    }
-
-    #[test]
-    fn asset_path_env_pointing_nowhere_is_none() {
-        assert_eq!(
-            info_asset_path(
-                Some(std::ffi::OsStr::new("/nonexistent/lavis-info.png")),
-                env!("CARGO_MANIFEST_DIR"),
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn asset_path_falls_back_to_manifest_asset() {
-        let result = info_asset_path(None, env!("CARGO_MANIFEST_DIR"));
-        assert!(result.is_some());
-        assert!(result.unwrap().ends_with("assets/lavis-info.png"));
     }
 }
