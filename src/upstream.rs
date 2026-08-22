@@ -117,9 +117,9 @@ const SHA1_HEX_LEN: usize = 40;
 /// `info/refs` advertises refs only, so its bodies stay tiny.
 const MAX_INFO_REFS_BODY_BYTES: usize = 64 * 1024;
 /// Compare responses embed `format_patch` (and friends), which grows with
-/// the diff; the limit must leave room for that instead of reusing the
-/// `info/refs` budget.
-const MAX_COMPARE_BODY_BYTES: usize = 512 * 1024;
+/// the diff. A production response with 26 commits measured 1,587,598 bytes;
+/// 4 MiB keeps that response bounded while allowing reasonable diff growth.
+const MAX_COMPARE_BODY_BYTES: usize = 4 * 1024 * 1024;
 const UPSTREAM_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Uses Rustls only (via reqwest's `rustls-tls` feature).
@@ -696,6 +696,13 @@ mod tests {
         let result = parse_tangled_compare_response(body).unwrap();
         assert_eq!(result.ahead_by, 3);
         assert_eq!(result.merge_base, Some("BASE".to_string()));
+    }
+
+    #[test]
+    fn compare_body_bound_covers_production_response_size() {
+        let max_bytes = std::hint::black_box(MAX_COMPARE_BODY_BYTES);
+        let production_response_bytes = std::hint::black_box(1_587_598usize);
+        assert!(max_bytes >= production_response_bytes);
     }
 
     #[test]
