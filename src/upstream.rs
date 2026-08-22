@@ -1,7 +1,9 @@
 //! Minimal Git smart-HTTP `info/refs` client used by the `info` command to
-//! resolve the upstream repository's `main` revision. Network access is
-//! confined behind a trait so parsing and failure behavior stay deterministic
-//! and testable without opening a socket.
+//! resolve the upstream repository's `main` revision, plus the Tangled
+//! `sh.tangled.repo.compare` client that derives the ahead/behind relation.
+//! Network access is confined behind narrow traits so parsing, request
+//! orientation, and failure behavior stay deterministic and testable without
+//! opening a socket.
 
 use std::{future::Future, pin::Pin, time::Duration};
 
@@ -11,6 +13,21 @@ pub type UpstreamRevFuture<'a> =
 pub type CompareFuture<'a> =
     Pin<Box<dyn Future<Output = Result<CompareResult, UpstreamError>> + Send + 'a>>;
 
+/// Raw result of one Tangled compare HTTP round trip: the response status
+/// plus the bounded body, read before any status interpretation because the
+/// error mapping needs the JSON payload of failed responses.
+type RawCompareResponse = Result<(u16, Vec<u8>), UpstreamError>;
+
+type RawCompareFuture<'a> = Pin<Box<dyn Future<Output = RawCompareResponse> + Send + 'a>>;
+
+/// The HTTP boundary of a single Tangled compare request. Split out from the
+/// parsing logic so the argument orientation is unit-testable without a
+/// socket: tests script per-direction responses and observe which ordered
+/// pair was requested.
+trait RawCompareTransport: Send + Sync {
+    fn fetch_compare<'a>(&'a self, rev1: &'a str, rev2: &'a str) -> RawCompareFuture<'a>;
+}
+
 /// The deliberately narrow boundary for reading the upstream `main` revision
 /// and comparing two revisions. Tests can inject a fake without ever
 /// constructing the real request URL.
@@ -19,8 +36,8 @@ pub trait UpstreamRev: Send + Sync {
     fn compare<'a>(&'a self, base: &'a str, head: &'a str) -> CompareFuture<'a>;
 }
 
-/// Outcome of comparing two revisions: how many commits `head` is ahead of
-/// and/or behind `base`, plus the merge base if available.
+/// Outcome of comparing two revisions: how many commits `head` carries that
+/// `base` lacks, plus the merge base if available.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompareResult {
     pub ahead_by: u64,
@@ -95,7 +112,12 @@ const UPSTREAM_INFO_REFS_URL: &str =
 const TANGLED_COMPARE_URL: &str = "https://api.tangled.org/xrpc/sh.tangled.repo.compare";
 const TANGLED_COMPARE_REPO: &str = "at://did:plc:trc7yr7p6ikl5fxfupm5mia2/sh.tangled.repo/lavis";
 const SHA1_HEX_LEN: usize = 40;
+/// `info/refs` advertises refs only, so its bodies stay tiny.
 const MAX_INFO_REFS_BODY_BYTES: usize = 64 * 1024;
+/// Compare responses embed `format_patch` (and friends), which grows with
+/// the diff; the limit must leave room for that instead of reusing the
+/// `info/refs` budget.
+const MAX_COMPARE_BODY_BYTES: usize = 512 * 1024;
 const UPSTREAM_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Uses Rustls only (via reqwest's `rustls-tls` feature).
@@ -165,10 +187,13 @@ fn request_error(error: reqwest::Error) -> UpstreamError {
     }
 }
 
-async fn read_bounded_body(mut response: reqwest::Response) -> Result<Vec<u8>, UpstreamError> {
+async fn read_bounded_body(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, UpstreamError> {
     if response
         .content_length()
-        .is_some_and(|length| length > MAX_INFO_REFS_BODY_BYTES as u64)
+        .is_some_and(|length| length > max_bytes as u64)
     {
         return Err(UpstreamError::Transport);
     }
@@ -178,7 +203,7 @@ async fn read_bounded_body(mut response: reqwest::Response) -> Result<Vec<u8>, U
         .await
         .map_err(|_| UpstreamError::Transport)?
     {
-        if body.len().saturating_add(chunk.len()) > MAX_INFO_REFS_BODY_BYTES {
+        if body.len().saturating_add(chunk.len()) > max_bytes {
             return Err(UpstreamError::Transport);
         }
         body.extend_from_slice(&chunk);
@@ -199,14 +224,14 @@ impl UpstreamRev for HttpUpstreamRev {
             if !status.is_success() {
                 return Err(UpstreamError::HttpStatus(status.as_u16()));
             }
-            let body = read_bounded_body(response).await?;
+            let body = read_bounded_body(response, MAX_INFO_REFS_BODY_BYTES).await?;
             parse_main_rev_from_info_refs(&body)
         })
     }
 
     fn compare<'a>(&'a self, base: &'a str, head: &'a str) -> CompareFuture<'a> {
         Box::pin(async move {
-            match self.compare_tangled(base, head).await {
+            match perform_compare(self, base, head).await {
                 Ok(result) => Ok(result),
                 Err(UpstreamError::RevisionNotFound { .. }) => {
                     // Current commit not on Tangled — expected for unpublished commits.
@@ -235,44 +260,49 @@ impl UpstreamRev for HttpUpstreamRev {
     }
 }
 
-impl HttpUpstreamRev {
-    /// Tangled compare: two calls with swapped rev1/rev2 to derive ahead/behind
-    /// from the `format_patch` array length in each direction.
-    async fn compare_tangled(
-        &self,
-        base: &str,
-        head: &str,
-    ) -> Result<CompareResult, UpstreamError> {
-        // Single compare call: main -> current
-        // The caller (runtime.rs) will determine the relation from merge_base
-        // and make a reverse call if needed for Behind/Diverged cases.
-        self.tangled_compare(head, base).await
-    }
-
-    /// Performs a single Tangled compare call with `rev1=from` and `rev2=to`,
-    /// returning a [`CompareResult`] with `ahead_by` and optional `merge_base`.
-    async fn tangled_compare(&self, from: &str, to: &str) -> Result<CompareResult, UpstreamError> {
-        let response = self
-            .client
-            .get(TANGLED_COMPARE_URL)
-            .query(&[("repo", TANGLED_COMPARE_REPO), ("rev1", from), ("rev2", to)])
-            .send()
-            .await
-            .map_err(request_error)?;
-
-        let status = response.status();
-        let body = read_bounded_body(response).await?;
-
-        if !status.is_success() {
-            return parse_tangled_error_response(status.as_u16(), &body, from, to);
-        }
-
-        parse_tangled_compare_response(&body)
+impl RawCompareTransport for HttpUpstreamRev {
+    fn fetch_compare<'a>(&'a self, rev1: &'a str, rev2: &'a str) -> RawCompareFuture<'a> {
+        Box::pin(async move {
+            let response = self
+                .client
+                .get(TANGLED_COMPARE_URL)
+                .query(&[
+                    ("repo", TANGLED_COMPARE_REPO),
+                    ("rev1", rev1),
+                    ("rev2", rev2),
+                ])
+                .send()
+                .await
+                .map_err(request_error)?;
+            let status = response.status().as_u16();
+            let body = read_bounded_body(response, MAX_COMPARE_BODY_BYTES).await?;
+            Ok((status, body))
+        })
     }
 }
 
-/// Parses the Tangled compare JSON response, returning a [`CompareResult`]
-/// with `ahead_by` (from `format_patch` array length) and optional `merge_base`.
+/// Runs one ordered Tangled compare. The public contract is
+/// `compare(base, head)` → "how many commits does `head` carry that `base`
+/// lacks". Verified against the live Tangled API (2026-08): `format_patch`
+/// lists the commits reachable from `rev2` but not from `rev1`, so `rev1`
+/// must be the base and `rev2` the head — swapping them inverts the answer.
+async fn perform_compare<T: RawCompareTransport + ?Sized>(
+    transport: &T,
+    base: &str,
+    head: &str,
+) -> Result<CompareResult, UpstreamError> {
+    let (status, body) = transport.fetch_compare(base, head).await?;
+    if !(200..300).contains(&status) {
+        return parse_tangled_error_response(status, &body, base, head);
+    }
+    parse_tangled_compare_response(&body)
+}
+
+/// Parses the Tangled compare JSON response. `format_patch` lists the
+/// commits reachable from `rev2` but not from `rev1`, so with the
+/// [`perform_compare`](crate::upstream) orientation (`rev1=base`,
+/// `rev2=head`) its length is exactly `ahead_by`. `behind_by` stays zero:
+/// callers derive it from the reverse ordered compare.
 fn parse_tangled_compare_response(body: &[u8]) -> Result<CompareResult, UpstreamError> {
     let value: serde_json::Value =
         serde_json::from_slice(body).map_err(|_| UpstreamError::InvalidResponse)?;
@@ -286,28 +316,59 @@ fn parse_tangled_compare_response(body: &[u8]) -> Result<CompareResult, Upstream
         .map(|s| s.to_string());
     Ok(CompareResult {
         ahead_by: patches.len() as u64,
-        behind_by: 0, // behind_by is computed by the caller via reverse compare
+        behind_by: 0,
         merge_base,
     })
+}
+
+/// Derives the [`RevisionRelation`] of the local build (`current_rev`)
+/// relative to upstream `main` (`main_rev`) from the ordered compare pair:
+/// `first` answers what the local build carries beyond `main`
+/// (`compare(main_rev, current_rev)`) and `reverse` answers the opposite
+/// question (`compare(current_rev, main_rev)`).
+///
+/// Asymmetric by construction: swapping the two results flips Ahead/Behind,
+/// and a merge base equal to `main` short-circuits to Ahead without needing
+/// the reverse result at all.
+pub fn relation_from_ordered_compares(
+    main_rev: &str,
+    current_rev: &str,
+    first: CompareResult,
+    reverse: CompareResult,
+) -> RevisionRelation {
+    match first.merge_base.as_deref() {
+        Some(base) if base == main_rev => RevisionRelation::Ahead {
+            commits: first.ahead_by,
+        },
+        Some(base) if base == current_rev => RevisionRelation::Behind {
+            commits: reverse.ahead_by,
+        },
+        // Diverged, or an API response without a merge base: the only safe
+        // interpretation left uses both directions.
+        _ => RevisionRelation::Diverged {
+            ahead: first.ahead_by,
+            behind: reverse.ahead_by,
+        },
+    }
 }
 
 /// Parses a non-success Tangled compare response body, extracting structured
 /// error names (`RevisionNotFound`, `RepoNotFound`, `RateLimitExceeded`) when
 /// present. Falls back to a plain `HttpStatus` error when the body is not JSON
-/// or the error name is unrecognized.
+/// or the error name is unrecognized. `rev1`/`rev2` mirror the request order.
 fn parse_tangled_error_response(
     status: u16,
     body: &[u8],
-    from: &str,
-    to: &str,
+    rev1: &str,
+    rev2: &str,
 ) -> Result<CompareResult, UpstreamError> {
     // Handle 429 rate limiting specially
     if status == 429 {
         tracing::warn!(
             event = "tangled_rate_limited",
             status,
-            from,
-            to,
+            rev1,
+            rev2,
             "Tangled API rate limit exceeded"
         );
         return Err(UpstreamError::RateLimited { retry_after: None });
@@ -319,22 +380,22 @@ fn parse_tangled_error_response(
         match error_name {
             "RevisionNotFound" => {
                 // Determine which revision was not found by checking
-                // whether the message mentions `from` (otherwise assume `to`).
+                // whether the message mentions `rev1` (otherwise assume `rev2`).
                 let revision = if error_body
                     .get("message")
                     .and_then(|m| m.as_str())
-                    .is_some_and(|m| m.contains(from))
+                    .is_some_and(|m| m.contains(rev1))
                 {
-                    from.to_string()
+                    rev1.to_string()
                 } else {
-                    to.to_string()
+                    rev2.to_string()
                 };
                 tracing::debug!(
                     event = "tangled_revision_not_found",
                     status,
                     revision = %revision,
-                    from,
-                    to,
+                    rev1,
+                    rev2,
                     "Tangled reported RevisionNotFound"
                 );
                 return Err(UpstreamError::RevisionNotFound { revision });
@@ -351,8 +412,8 @@ fn parse_tangled_error_response(
                 tracing::warn!(
                     event = "tangled_rate_limited",
                     status,
-                    from,
-                    to,
+                    rev1,
+                    rev2,
                     "Tangled API rate limit exceeded"
                 );
                 return Err(UpstreamError::RateLimited { retry_after: None });
@@ -362,8 +423,8 @@ fn parse_tangled_error_response(
                     event = "tangled_error_response",
                     status,
                     error_name,
-                    from,
-                    to,
+                    rev1,
+                    rev2,
                     "Tangled returned an unrecognized error name"
                 );
             }
@@ -372,8 +433,8 @@ fn parse_tangled_error_response(
     tracing::debug!(
         event = "tangled_http_error",
         status,
-        from,
-        to,
+        rev1,
+        rev2,
         "Tangled compare returned a non-success status"
     );
     Err(UpstreamError::HttpStatus(status))
@@ -382,6 +443,54 @@ fn parse_tangled_error_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    /// Records the exact ordered `(rev1, rev2)` pair of every request and
+    /// serves a canned status/body per pair, so tests can distinguish which
+    /// direction the client actually asked for.
+    struct ScriptedCompareTransport {
+        responses: HashMap<(String, String), (u16, Vec<u8>)>,
+        requested: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl ScriptedCompareTransport {
+        fn empty() -> Self {
+            Self {
+                responses: HashMap::new(),
+                requested: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_pair(mut self, rev1: &str, rev2: &str, patches: &[&str], merge_base: &str) -> Self {
+            let body = serde_json::json!({
+                "format_patch": patches,
+                "merge_base": merge_base,
+            })
+            .to_string();
+            self.responses
+                .insert((rev1.to_owned(), rev2.to_owned()), (200, body.into_bytes()));
+            self
+        }
+
+        fn requested_pairs(&self) -> Vec<(String, String)> {
+            self.requested.lock().unwrap().clone()
+        }
+    }
+
+    impl RawCompareTransport for ScriptedCompareTransport {
+        fn fetch_compare<'a>(&'a self, rev1: &'a str, rev2: &'a str) -> RawCompareFuture<'a> {
+            self.requested
+                .lock()
+                .unwrap()
+                .push((rev1.to_owned(), rev2.to_owned()));
+            let outcome = self
+                .responses
+                .get(&(rev1.to_owned(), rev2.to_owned()))
+                .cloned()
+                .ok_or(UpstreamError::InvalidResponse);
+            Box::pin(async move { outcome })
+        }
+    }
 
     struct Mock {
         result: Result<String, UpstreamError>,
@@ -668,5 +777,201 @@ mod tests {
             "invalid_response"
         );
         assert_eq!(UpstreamError::NoMainRef.to_string(), "no_main_ref");
+    }
+
+    // Regression coverage for the compare orientation (blocker: the client
+    // used to swap rev1/rev2, turning Ahead{N} into Ahead{0}). Every fixture
+    // below is asymmetric on purpose: forward and reverse directions carry
+    // different patch counts, so swapping the arguments breaks the tests.
+
+    /// ```text
+    /// A -- B -- C
+    ///      main  current
+    /// ```
+    #[tokio::test]
+    async fn ahead_graph_counts_head_commits_only() {
+        let transport = ScriptedCompareTransport::empty()
+            .with_pair("B", "C", &["patch-C"], "B")
+            // The reversed question ("what does main have beyond current")
+            // has a different answer — a swap must land here and fail.
+            .with_pair("C", "B", &[], "B");
+
+        let result = perform_compare(&transport, "B", "C").await.unwrap();
+
+        assert_eq!(
+            result,
+            CompareResult {
+                ahead_by: 1,
+                behind_by: 0,
+                merge_base: Some("B".to_owned()),
+            }
+        );
+        assert_eq!(
+            transport.requested_pairs(),
+            vec![("B".to_owned(), "C".to_owned())]
+        );
+    }
+
+    /// Same graph, opposite call: `compare(current, main)` must count zero
+    /// head commits. Together with
+    /// [`ahead_graph_counts_head_commits_only`] this pins which argument is
+    /// the base and which is the head.
+    #[tokio::test]
+    async fn reverse_ahead_graph_counts_zero_head_commits() {
+        let transport = ScriptedCompareTransport::empty()
+            .with_pair("B", "C", &["patch-C"], "B")
+            .with_pair("C", "B", &[], "B");
+
+        let result = perform_compare(&transport, "C", "B").await.unwrap();
+
+        assert_eq!(
+            result,
+            CompareResult {
+                ahead_by: 0,
+                behind_by: 0,
+                merge_base: Some("B".to_owned()),
+            }
+        );
+    }
+
+    /// ```text
+    /// A -- B -- C
+    ///   current  main
+    /// ```
+    /// `compare(main, current)` asks what `current` carries beyond `main`:
+    /// nothing; only the reverse direction sees the commit.
+    #[tokio::test]
+    async fn behind_graph_directions_answer_differently() {
+        let transport = ScriptedCompareTransport::empty()
+            .with_pair("C", "B", &[], "B")
+            .with_pair("B", "C", &["patch-C"], "B");
+
+        let first = perform_compare(&transport, "C", "B").await.unwrap();
+        let reverse = perform_compare(&transport, "B", "C").await.unwrap();
+
+        assert_eq!(first.ahead_by, 0);
+        assert_eq!(reverse.ahead_by, 1);
+        assert_ne!(first.ahead_by, reverse.ahead_by);
+        assert_eq!(
+            transport.requested_pairs(),
+            vec![
+                ("C".to_owned(), "B".to_owned()),
+                ("B".to_owned(), "C".to_owned()),
+            ]
+        );
+    }
+
+    /// ```text
+    ///       C -- D   current
+    ///      /
+    /// A -- B
+    ///      \
+    ///       E -- F -- G   main
+    /// ```
+    #[tokio::test]
+    async fn diverged_graph_directions_count_two_and_three() {
+        let transport = ScriptedCompareTransport::empty()
+            .with_pair("G", "D", &["patch-C", "patch-D"], "B")
+            .with_pair("D", "G", &["patch-E", "patch-F", "patch-G"], "B");
+
+        let first = perform_compare(&transport, "G", "D").await.unwrap();
+        let reverse = perform_compare(&transport, "D", "G").await.unwrap();
+
+        assert_eq!(first.ahead_by, 2);
+        assert_eq!(first.merge_base.as_deref(), Some("B"));
+        assert_eq!(reverse.ahead_by, 3);
+        assert_eq!(reverse.merge_base.as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn ahead_relation_ignores_the_reverse_result() {
+        let first = CompareResult {
+            ahead_by: 1,
+            behind_by: 0,
+            merge_base: Some("B".to_owned()),
+        };
+        let reverse = CompareResult {
+            ahead_by: 99,
+            behind_by: 0,
+            merge_base: Some("B".to_owned()),
+        };
+
+        assert_eq!(
+            relation_from_ordered_compares("B", "C", first, reverse),
+            RevisionRelation::Ahead { commits: 1 }
+        );
+    }
+
+    #[test]
+    fn behind_relation_counts_the_reverse_compare() {
+        // A -- B -- C: current=B, main=C.
+        let first = CompareResult {
+            ahead_by: 0,
+            behind_by: 0,
+            merge_base: Some("B".to_owned()),
+        };
+        let reverse = CompareResult {
+            ahead_by: 1,
+            behind_by: 0,
+            merge_base: Some("B".to_owned()),
+        };
+
+        assert_eq!(
+            relation_from_ordered_compares("C", "B", first, reverse),
+            RevisionRelation::Behind { commits: 1 }
+        );
+    }
+
+    #[test]
+    fn diverged_relation_combines_both_directions() {
+        let first = CompareResult {
+            ahead_by: 2,
+            behind_by: 0,
+            merge_base: Some("B".to_owned()),
+        };
+        let reverse = CompareResult {
+            ahead_by: 3,
+            behind_by: 0,
+            merge_base: Some("B".to_owned()),
+        };
+
+        assert_eq!(
+            relation_from_ordered_compares("G", "D", first, reverse),
+            RevisionRelation::Diverged {
+                ahead: 2,
+                behind: 3
+            }
+        );
+    }
+
+    /// Swapping the ordered results flips Behind to an incorrect zero:
+    /// the derivation must consume them in call order.
+    #[test]
+    fn swapped_relation_results_break_the_behind_count() {
+        let correct_first = CompareResult {
+            ahead_by: 0,
+            behind_by: 0,
+            merge_base: Some("B".to_owned()),
+        };
+        let correct_reverse = CompareResult {
+            ahead_by: 1,
+            behind_by: 0,
+            merge_base: Some("B".to_owned()),
+        };
+
+        let swapped = relation_from_ordered_compares(
+            "C",
+            "B",
+            correct_reverse.clone(),
+            correct_first.clone(),
+        );
+        assert_ne!(
+            swapped,
+            RevisionRelation::Behind { commits: 1 },
+            "swapped results accidentally produced the right answer"
+        );
+
+        let ordered = relation_from_ordered_compares("C", "B", correct_first, correct_reverse);
+        assert_eq!(ordered, RevisionRelation::Behind { commits: 1 });
     }
 }

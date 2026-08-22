@@ -825,17 +825,53 @@ pub struct InfoCaptionData<'a> {
     pub os: &'a str,
 }
 
+/// Replaces `{placeholder}` tokens in a single pass: substituted values are
+/// never rescanned, so user-controlled text that itself contains
+/// `{version}`-shaped content stays literal instead of being expanded by a
+/// later replacement.
+fn interpolate(template: &str, placeholders: &[(&str, &str)]) -> String {
+    let mut output = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        output.push_str(&rest[..open]);
+        let tail = &rest[open..];
+        match tail.find('}') {
+            Some(close) => {
+                let token = &tail[..=close];
+                match placeholders.iter().find(|(key, _)| *key == token) {
+                    Some((_, value)) => output.push_str(value),
+                    None => output.push_str(token),
+                }
+                rest = &tail[close + 1..];
+            }
+            // Unterminated `{`: keep it verbatim and stop scanning.
+            None => {
+                output.push_str(tail);
+                return output;
+            }
+        }
+    }
+    output.push_str(rest);
+    output
+}
+
 pub fn render_info_text(locale: Locale, info: InfoCaptionData<'_>) -> String {
-    info_text(locale, InfoText::Caption)
-        .replace("{owner}", info.owner)
-        .replace("{version}", info.version)
-        .replace("{commit}", info.commit)
-        .replace("{upstream}", info.upstream)
-        .replace("{prefix}", info.prefix)
-        .replace("{active}", &info.active_modules.to_string())
-        .replace("{total}", &info.total_modules.to_string())
-        .replace("{host}", info.host)
-        .replace("{os}", info.os)
+    let active_modules = info.active_modules.to_string();
+    let total_modules = info.total_modules.to_string();
+    interpolate(
+        info_text(locale, InfoText::Caption),
+        &[
+            ("{owner}", info.owner),
+            ("{version}", info.version),
+            ("{commit}", info.commit),
+            ("{upstream}", info.upstream),
+            ("{prefix}", info.prefix),
+            ("{active}", &active_modules),
+            ("{total}", &total_modules),
+            ("{host}", info.host),
+            ("{os}", info.os),
+        ],
+    )
 }
 
 /// Renders the localized status label for a [`RevisionRelation`](crate::upstream::RevisionRelation).
@@ -1556,8 +1592,9 @@ pub fn bilingual(key: Text, prefix: &str) -> String {
 mod tests {
     use super::{
         ExternalCommandText, InfoCaptionData, InfoText, LmInstallPlanText, LmText, Locale,
-        RebootText, Text, external_command_text, info_text, lm_format, lm_runtime_status, lm_text,
-        reboot_text, render_info_text, render_lm_install_plan, render_revision_status, text,
+        RebootText, Text, external_command_text, info_text, interpolate, lm_format,
+        lm_runtime_status, lm_text, reboot_text, render_info_text, render_lm_install_plan,
+        render_revision_status, text,
     };
     use crate::external_modules::manager::ExternalModuleRuntimeStatus;
 
@@ -1809,6 +1846,50 @@ mod tests {
             info_text(Locale::Russian, InfoText::Unavailable),
             "недоступно"
         );
+    }
+
+    /// Regression coverage for multi-pass interpolation: a Telegram display
+    /// name shaped like `{version}` used to be expanded into the Lavis
+    /// version by the subsequent `.replace()` chain. Single-pass rendering
+    /// must keep it literal.
+    #[test]
+    fn placeholder_shaped_owner_and_os_stay_literal() {
+        let rendered = render_info_text(
+            Locale::English,
+            InfoCaptionData {
+                owner: "{version}",
+                version: "0.1.0",
+                commit: "b1d18f8",
+                upstream: "b1d18f8",
+                prefix: ",",
+                active_modules: 1,
+                total_modules: 2,
+                host: "standalone",
+                os: "{owner} on {host}",
+            },
+        );
+
+        assert!(rendered.contains("Owner: {version}"));
+        assert!(!rendered.contains("Version: {version}"));
+        assert_eq!(rendered.matches("0.1.0").count(), 1);
+        // Values substituted earlier must not re-enter later placeholders.
+        assert!(rendered.contains("OS: {owner} on {host}"));
+        assert!(!rendered.contains("Owner: Owner:"));
+        assert_eq!(rendered.matches("{version}").count(), 1);
+    }
+
+    #[test]
+    fn interpolate_preserves_unknown_and_unterminated_tokens() {
+        assert_eq!(interpolate("no tokens", &[]), "no tokens");
+        assert_eq!(
+            interpolate("{known} and {unknown}", &[("{known}", "ok")]),
+            "ok and {unknown}"
+        );
+        assert_eq!(
+            interpolate("dangling {brace", &[("{brace", "nope")]),
+            "dangling {brace"
+        );
+        assert_eq!(interpolate("empty {}", &[]), "empty {}");
     }
 
     #[test]

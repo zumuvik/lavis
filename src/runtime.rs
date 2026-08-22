@@ -104,6 +104,113 @@ const MODULE_APPROVAL_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_EXPECTED_SELF_EDITS: usize = 128;
 const SETUP_STAGE_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// How long a resolved upstream revision (or its confirmed absence) stays
+/// cached before the next `,info` hits Tangled again.
+const UPSTREAM_REVISION_TTL: Duration = Duration::from_secs(300);
+/// Short negative-cache lease used after rate limiting, so a throttled
+/// endpoint is retried soon but not on every command.
+const RATE_LIMITED_UPSTREAM_CACHE_TTL: Duration = Duration::from_secs(60);
+/// One short overall budget for a full upstream-resolution operation (the
+/// `info/refs` lookup plus up to two ordered compares). An informational
+/// endpoint must never freeze the Telegram update consumer for the sum of
+/// several per-request timeouts.
+const UPSTREAM_RESOLVE_TIMEOUT: Duration = Duration::from_secs(4);
+
+#[derive(Debug)]
+enum UpstreamResolveFailure {
+    /// The `info/refs` lookup for upstream `main` itself failed.
+    MainRev(crate::upstream::UpstreamError),
+    /// Tangled answered with a rate limit.
+    RateLimited,
+}
+
+/// Resolves the upstream `main` revision together with the current build's
+/// relation to it: one `info/refs` request plus at most two ordered compares
+/// (`compare(main, current)` first, then the reverse only when the merge base
+/// does not already prove an Ahead relation).
+///
+/// Deliberately free of caching and deadlines — those live in
+/// [`RuntimeState::upstream_revision`] so tests can drive the network shape
+/// directly.
+async fn resolve_upstream_revision(
+    upstream: &dyn UpstreamRev,
+) -> Result<UpstreamRevision, UpstreamResolveFailure> {
+    resolve_upstream_relation_for(upstream, info::build_rev()).await
+}
+
+async fn resolve_upstream_relation_for(
+    upstream: &dyn UpstreamRev,
+    current_rev: &str,
+) -> Result<UpstreamRevision, UpstreamResolveFailure> {
+    let main_rev = upstream
+        .main_rev()
+        .await
+        .map_err(UpstreamResolveFailure::MainRev)?;
+    let relation = if current_rev == "unknown" {
+        RevisionRelation::Unavailable
+    } else if current_rev == main_rev {
+        RevisionRelation::Current
+    } else {
+        let first_compare = match upstream.compare(&main_rev, current_rev).await {
+            Ok(first_compare) => first_compare,
+            Err(crate::upstream::UpstreamError::RevisionNotFound { .. }) => {
+                // Current commit not published on Tangled
+                return Ok(UpstreamRevision {
+                    revision: main_rev,
+                    relation: RevisionRelation::Unavailable,
+                });
+            }
+            Err(crate::upstream::UpstreamError::RateLimited { .. }) => {
+                return Err(UpstreamResolveFailure::RateLimited);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    event = "upstream_compare_failed",
+                    category = %error,
+                    base = %main_rev,
+                    head = %current_rev,
+                    "Could not compare current build with upstream main"
+                );
+                return Ok(UpstreamRevision {
+                    revision: main_rev,
+                    relation: RevisionRelation::Unavailable,
+                });
+            }
+        };
+        match first_compare.merge_base.as_deref() {
+            Some(base) if base == main_rev => {
+                // merge_base == main: current is ahead of main; the reverse
+                // question is already answered by construction.
+                RevisionRelation::Ahead {
+                    commits: first_compare.ahead_by,
+                }
+            }
+            _ => match upstream.compare(current_rev, &main_rev).await {
+                Ok(reverse_compare) => crate::upstream::relation_from_ordered_compares(
+                    &main_rev,
+                    current_rev,
+                    first_compare,
+                    reverse_compare,
+                ),
+                Err(error) => {
+                    tracing::warn!(
+                        event = "upstream_compare_failed",
+                        category = %error,
+                        base = %current_rev,
+                        head = %main_rev,
+                        "Reverse compare failed"
+                    );
+                    RevisionRelation::Unavailable
+                }
+            },
+        }
+    };
+    Ok(UpstreamRevision {
+        revision: main_rev,
+        relation,
+    })
+}
+
 pub struct CreatedEventDispatch {
     handle: ExternalManagerHandle,
     requests: Vec<CreatedEventRequest>,
@@ -507,13 +614,9 @@ impl RuntimeState {
     }
 
     /// Resolves the upstream `main` revision and its relation to the current
-    /// build once per TTL. Uses an optimized compare algorithm that minimizes
-    /// API calls by leveraging merge_base information. Handles rate limiting
-    /// by preserving stale successful values.
+    /// build once per TTL, under one short overall deadline. Handles rate
+    /// limiting and deadline overruns by preserving stale successful values.
     async fn upstream_revision(&mut self) -> Option<UpstreamRevision> {
-        const UPSTREAM_REVISION_TTL: Duration = Duration::from_secs(300);
-        const RATE_LIMIT_CACHE_TTL: Duration = Duration::from_secs(60);
-
         // Check cache
         if let Some((resolved_at, cached)) = self.upstream_revision_cache.as_ref()
             && resolved_at.elapsed() < UPSTREAM_REVISION_TTL
@@ -521,133 +624,71 @@ impl RuntimeState {
             return cached.clone();
         }
 
-        let resolved = match &self.upstream {
-            Some(upstream) => {
-                let main_rev = match upstream.main_rev().await {
-                    Ok(revision) => revision,
-                    Err(error) => {
-                        tracing::warn!(
-                            event = "upstream_revision_fetch_failed",
-                            category = %error,
-                            "Could not resolve the upstream main revision"
-                        );
-                        self.upstream_revision_cache = Some((Instant::now(), None));
-                        return None;
-                    }
-                };
+        let Some(upstream) = self.upstream.as_ref() else {
+            tracing::warn!(
+                event = "upstream_resolver_unavailable",
+                "No upstream resolver is configured"
+            );
+            return None;
+        };
 
-                let current_rev = info::build_rev();
-                let relation = if current_rev == "unknown" {
-                    RevisionRelation::Unavailable
-                } else if current_rev == main_rev {
-                    // Current == main: no compare needed
-                    RevisionRelation::Current
-                } else {
-                    // First compare: main -> current
-                    match upstream.compare(&main_rev, current_rev).await {
-                        Ok(first_compare) => {
-                            // Determine relation from merge_base
-                            match first_compare.merge_base.as_deref() {
-                                Some(base) if base == main_rev => {
-                                    // merge_base == main: current is ahead of main
-                                    RevisionRelation::Ahead {
-                                        commits: first_compare.ahead_by,
-                                    }
-                                }
-                                Some(base) if base == current_rev => {
-                                    // merge_base == current: current is behind main
-                                    // Need reverse compare to get behind count
-                                    match upstream.compare(current_rev, &main_rev).await {
-                                        Ok(reverse_compare) => RevisionRelation::Behind {
-                                            commits: reverse_compare.ahead_by,
-                                        },
-                                        Err(error) => {
-                                            tracing::warn!(
-                                                event = "upstream_compare_failed",
-                                                category = %error,
-                                                base = %current_rev,
-                                                head = %main_rev,
-                                                "Reverse compare failed"
-                                            );
-                                            RevisionRelation::Unavailable
-                                        }
-                                    }
-                                }
-                                _ => {
-                                    // Diverged or no merge_base: need reverse compare
-                                    match upstream.compare(current_rev, &main_rev).await {
-                                        Ok(reverse_compare) => RevisionRelation::Diverged {
-                                            ahead: first_compare.ahead_by,
-                                            behind: reverse_compare.ahead_by,
-                                        },
-                                        Err(error) => {
-                                            tracing::warn!(
-                                                event = "upstream_compare_failed",
-                                                category = %error,
-                                                base = %current_rev,
-                                                head = %main_rev,
-                                                "Reverse compare failed"
-                                            );
-                                            RevisionRelation::Unavailable
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Err(crate::upstream::UpstreamError::RevisionNotFound { .. }) => {
-                            // Current commit not published on Tangled
-                            RevisionRelation::Unavailable
-                        }
-                        Err(crate::upstream::UpstreamError::RateLimited { .. }) => {
-                            // Rate limited: preserve stale value if available
-                            tracing::warn!(
-                                event = "upstream_rate_limited",
-                                "Tangled API rate limit exceeded, preserving stale value"
-                            );
-                            // Clone stale value before modifying cache
-                            let stale_value = self
-                                .upstream_revision_cache
-                                .as_ref()
-                                .and_then(|(_, cached)| cached.clone());
-                            
-                            if let Some(stale) = stale_value {
-                                // Use stale value, extend cache briefly
-                                self.upstream_revision_cache =
-                                    Some((Instant::now(), Some(stale.clone())));
-                                return Some(stale);
-                            }
-                            // No stale value: negative-cache briefly
-                            self.upstream_revision_cache =
-                                Some((Instant::now() - UPSTREAM_REVISION_TTL + RATE_LIMIT_CACHE_TTL, None));
-                            return None;
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                event = "upstream_compare_failed",
-                                category = %error,
-                                base = %main_rev,
-                                head = %current_rev,
-                                "Could not compare current build with upstream main"
-                            );
-                            RevisionRelation::Unavailable
-                        }
-                    }
-                };
-                Some(UpstreamRevision {
-                    revision: main_rev,
-                    relation,
-                })
-            }
-            None => {
+        let resolution = tokio::time::timeout(
+            UPSTREAM_RESOLVE_TIMEOUT,
+            resolve_upstream_revision(upstream.as_ref()),
+        )
+        .await;
+        let resolved = match resolution {
+            Ok(Ok(revision)) => Some(revision),
+            Ok(Err(UpstreamResolveFailure::RateLimited)) => {
                 tracing::warn!(
-                    event = "upstream_resolver_unavailable",
-                    "No upstream resolver is configured"
+                    event = "upstream_rate_limited",
+                    "Tangled API rate limit exceeded, preserving stale value"
                 );
-                None
+                return self.stale_upstream_or_negative_cache();
+            }
+            Ok(Err(UpstreamResolveFailure::MainRev(error))) => {
+                tracing::warn!(
+                    event = "upstream_revision_fetch_failed",
+                    category = %error,
+                    "Could not resolve the upstream main revision"
+                );
+                self.upstream_revision_cache = Some((Instant::now(), None));
+                return None;
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    event = "upstream_resolution_timeout",
+                    timeout_ms = UPSTREAM_RESOLVE_TIMEOUT.as_millis() as u64,
+                    "Upstream resolution exceeded its overall deadline"
+                );
+                return self.stale_upstream_or_negative_cache();
             }
         };
         self.upstream_revision_cache = Some((Instant::now(), resolved.clone()));
         resolved
+    }
+
+    /// Serves the last successful resolution (extending its lease so a
+    /// degraded or throttled endpoint cannot thrash on every `,info`), or
+    /// installs a short negative-cache lease when nothing was ever resolved.
+    fn stale_upstream_or_negative_cache(&mut self) -> Option<UpstreamRevision> {
+        let stale = self
+            .upstream_revision_cache
+            .as_ref()
+            .and_then(|(_, cached)| cached.clone());
+        match stale {
+            Some(stale) => {
+                self.upstream_revision_cache = Some((Instant::now(), Some(stale.clone())));
+                Some(stale)
+            }
+            None => {
+                self.upstream_revision_cache = Some((
+                    Instant::now() - UPSTREAM_REVISION_TTL + RATE_LIMITED_UPSTREAM_CACHE_TTL,
+                    None,
+                ));
+                None
+            }
+        }
     }
 
     pub async fn refresh_snapshot(&mut self) {
@@ -1120,8 +1161,12 @@ impl RuntimeState {
         let caption = match &upstream_data {
             Some(data) if data.relation != RevisionRelation::Unavailable => {
                 let status_line = match locale {
-                    Locale::English => format!("Status: {}", render_revision_status(locale, data.relation)),
-                    Locale::Russian => format!("Статус: {}", render_revision_status(locale, data.relation)),
+                    Locale::English => {
+                        format!("Status: {}", render_revision_status(locale, data.relation))
+                    }
+                    Locale::Russian => {
+                        format!("Статус: {}", render_revision_status(locale, data.relation))
+                    }
                 };
                 // Insert after "Upstream main: ..." line
                 let upstream_prefix = match locale {
@@ -1131,7 +1176,12 @@ impl RuntimeState {
                 if let Some(pos) = caption.find(upstream_prefix) {
                     if let Some(newline_pos) = caption[pos..].find('\n') {
                         let insert_pos = pos + newline_pos + 1;
-                        format!("{}{}\n{}", &caption[..insert_pos], status_line, &caption[insert_pos..])
+                        format!(
+                            "{}{}\n{}",
+                            &caption[..insert_pos],
+                            status_line,
+                            &caption[insert_pos..]
+                        )
                     } else {
                         caption
                     }
@@ -3092,10 +3142,11 @@ fn format_stats(
 #[cfg(test)]
 mod tests {
     use super::{
-        ProcStats, SensitiveCommandDenial, SensitiveCommandPolicy, authorize_sensitive_message,
-        bounded_list, external_event_error_category, fastfetch_response, format_duration,
-        format_latency, format_stats, lm_usage, missing_descriptor_response, parse_memory_kib,
-        parse_system_uptime, render_install_plan, setup_status_label, setup_status_response,
+        ProcStats, SensitiveCommandDenial, SensitiveCommandPolicy, UpstreamResolveFailure,
+        authorize_sensitive_message, bounded_list, external_event_error_category,
+        fastfetch_response, format_duration, format_latency, format_stats, lm_usage,
+        missing_descriptor_response, parse_memory_kib, parse_system_uptime, render_install_plan,
+        resolve_upstream_relation_for, setup_status_label, setup_status_response,
     };
     use crate::external_modules::manager::{
         ExternalModuleRuntimeStatus, ExternalModuleStatus, ExternalRuntimeSnapshot,
@@ -3119,6 +3170,7 @@ mod tests {
     };
     use grammers_session::types::PeerId;
     use std::{
+        collections::HashMap,
         fs,
         path::PathBuf,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -4767,6 +4819,231 @@ for line in sys.stdin:
         fn compare<'a>(&'a self, _base: &'a str, _head: &'a str) -> CompareFuture<'a> {
             Box::pin(async { Err(UpstreamError::Transport) })
         }
+    }
+
+    /// Regression coverage for blocker 1 at the resolution level: scripts a
+    /// per-direction compare answer and records every ordered `(rev1, rev2)`
+    /// pair requested, so a swapped orientation fails the exact call-order
+    /// assertions instead of silently producing inverted relations.
+    struct ScriptedRelationUpstream {
+        main_rev: Result<String, UpstreamError>,
+        compares: HashMap<(String, String), Result<crate::upstream::CompareResult, UpstreamError>>,
+        requested: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl ScriptedRelationUpstream {
+        fn requested_pairs(&self) -> Vec<(String, String)> {
+            self.requested.lock().unwrap().clone()
+        }
+    }
+
+    impl UpstreamRev for ScriptedRelationUpstream {
+        fn main_rev<'a>(&'a self) -> UpstreamRevFuture<'a> {
+            Box::pin(async move { self.main_rev.clone() })
+        }
+
+        fn compare<'a>(&'a self, base: &'a str, head: &'a str) -> CompareFuture<'a> {
+            self.requested
+                .lock()
+                .unwrap()
+                .push((base.to_owned(), head.to_owned()));
+            let outcome = self
+                .compares
+                .get(&(base.to_owned(), head.to_owned()))
+                .cloned()
+                .unwrap_or(Err(UpstreamError::InvalidResponse));
+            Box::pin(async move { outcome })
+        }
+    }
+
+    /// ```text
+    /// A -- B -- C
+    ///      main  current
+    /// ```
+    #[tokio::test]
+    async fn resolves_ahead_from_a_single_ordered_compare() {
+        let upstream = ScriptedRelationUpstream {
+            main_rev: Ok("B".to_owned()),
+            compares: HashMap::from([(
+                ("B".to_owned(), "C".to_owned()),
+                Ok(crate::upstream::CompareResult {
+                    ahead_by: 1,
+                    behind_by: 0,
+                    merge_base: Some("B".to_owned()),
+                }),
+            )]),
+            requested: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let resolved = resolve_upstream_relation_for(&upstream, "C").await.unwrap();
+
+        assert_eq!(resolved.revision, "B");
+        assert_eq!(
+            resolved.relation,
+            crate::upstream::RevisionRelation::Ahead { commits: 1 }
+        );
+        // merge_base == main proves Ahead: the reverse question must not even
+        // be asked, and certainly not with swapped arguments.
+        assert_eq!(
+            upstream.requested_pairs(),
+            vec![("B".to_owned(), "C".to_owned())]
+        );
+    }
+
+    /// ```text
+    /// A -- B -- C
+    ///   current  main
+    /// ```
+    #[tokio::test]
+    async fn resolves_behind_via_the_reverse_ordered_compare() {
+        let upstream = ScriptedRelationUpstream {
+            main_rev: Ok("C".to_owned()),
+            compares: HashMap::from([
+                (
+                    ("C".to_owned(), "B".to_owned()),
+                    Ok(crate::upstream::CompareResult {
+                        ahead_by: 0,
+                        behind_by: 0,
+                        merge_base: Some("B".to_owned()),
+                    }),
+                ),
+                (
+                    ("B".to_owned(), "C".to_owned()),
+                    Ok(crate::upstream::CompareResult {
+                        ahead_by: 1,
+                        behind_by: 0,
+                        merge_base: Some("B".to_owned()),
+                    }),
+                ),
+            ]),
+            requested: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let resolved = resolve_upstream_relation_for(&upstream, "B").await.unwrap();
+
+        assert_eq!(resolved.revision, "C");
+        assert_eq!(
+            resolved.relation,
+            crate::upstream::RevisionRelation::Behind { commits: 1 }
+        );
+        assert_eq!(
+            upstream.requested_pairs(),
+            vec![
+                ("C".to_owned(), "B".to_owned()),
+                ("B".to_owned(), "C".to_owned()),
+            ]
+        );
+    }
+
+    /// ```text
+    ///       C -- D   current
+    ///      /
+    /// A -- B
+    ///      \
+    ///       E -- F -- G   main
+    /// ```
+    #[tokio::test]
+    async fn resolves_divergence_as_ahead_two_behind_three() {
+        let upstream = ScriptedRelationUpstream {
+            main_rev: Ok("G".to_owned()),
+            compares: HashMap::from([
+                (
+                    ("G".to_owned(), "D".to_owned()),
+                    Ok(crate::upstream::CompareResult {
+                        ahead_by: 2,
+                        behind_by: 0,
+                        merge_base: Some("B".to_owned()),
+                    }),
+                ),
+                (
+                    ("D".to_owned(), "G".to_owned()),
+                    Ok(crate::upstream::CompareResult {
+                        ahead_by: 3,
+                        behind_by: 0,
+                        merge_base: Some("B".to_owned()),
+                    }),
+                ),
+            ]),
+            requested: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let resolved = resolve_upstream_relation_for(&upstream, "D").await.unwrap();
+
+        assert_eq!(
+            resolved.relation,
+            crate::upstream::RevisionRelation::Diverged {
+                ahead: 2,
+                behind: 3
+            }
+        );
+        assert_eq!(
+            upstream.requested_pairs(),
+            vec![
+                ("G".to_owned(), "D".to_owned()),
+                ("D".to_owned(), "G".to_owned()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn identical_and_unknown_revisions_skip_compare_entirely() {
+        let mut upstream = ScriptedRelationUpstream {
+            main_rev: Ok("M".to_owned()),
+            compares: HashMap::new(),
+            requested: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let current = resolve_upstream_relation_for(&upstream, "M").await.unwrap();
+        assert_eq!(current.relation, crate::upstream::RevisionRelation::Current);
+
+        upstream.main_rev = Ok("N".to_owned());
+        let unknown = resolve_upstream_relation_for(&upstream, "unknown")
+            .await
+            .unwrap();
+        assert_eq!(
+            unknown.relation,
+            crate::upstream::RevisionRelation::Unavailable
+        );
+        assert!(upstream.requested_pairs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unpublished_current_revision_reports_unavailable() {
+        let upstream = ScriptedRelationUpstream {
+            main_rev: Ok("M".to_owned()),
+            compares: HashMap::from([(
+                ("M".to_owned(), "local".to_owned()),
+                Err(UpstreamError::RevisionNotFound {
+                    revision: "local".to_owned(),
+                }),
+            )]),
+            requested: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let resolved = resolve_upstream_relation_for(&upstream, "local")
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved.relation,
+            crate::upstream::RevisionRelation::Unavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limited_compare_surfaces_rate_limit_failure() {
+        let upstream = ScriptedRelationUpstream {
+            main_rev: Ok("M".to_owned()),
+            compares: HashMap::from([(
+                ("M".to_owned(), "local".to_owned()),
+                Err(UpstreamError::RateLimited { retry_after: None }),
+            )]),
+            requested: std::sync::Mutex::new(Vec::new()),
+        };
+
+        assert!(matches!(
+            resolve_upstream_relation_for(&upstream, "local").await,
+            Err(UpstreamResolveFailure::RateLimited)
+        ));
     }
 
     #[test]

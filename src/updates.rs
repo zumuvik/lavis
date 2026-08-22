@@ -343,6 +343,139 @@ async fn deliver_photo(
     Ok(())
 }
 
+/// The two edits a media-capable command response performs against the source
+/// command message: replacing it with a photo, or falling back to a plain
+/// text edit. Split out so the expected-self-edit bookkeeping around them is
+/// unit-testable without a Telegram connection.
+trait CommandMediaEdits {
+    fn edit_photo(
+        &mut self,
+        media_path: &std::path::Path,
+        caption: &str,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
+
+    fn edit_text(
+        &mut self,
+        text: &str,
+        entities: Vec<grammers_client::tl::enums::MessageEntity>,
+    ) -> impl Future<Output = Result<(), grammers_client::InvocationError>> + Send;
+}
+
+struct TelegramCommandMediaEdits<'a> {
+    client: &'a grammers_client::Client,
+    message: &'a Message,
+}
+
+impl CommandMediaEdits for TelegramCommandMediaEdits<'_> {
+    async fn edit_photo(
+        &mut self,
+        media_path: &std::path::Path,
+        caption: &str,
+    ) -> anyhow::Result<()> {
+        deliver_photo(self.client, self.message, media_path, caption.to_owned()).await
+    }
+
+    async fn edit_text(
+        &mut self,
+        text: &str,
+        entities: Vec<grammers_client::tl::enums::MessageEntity>,
+    ) -> Result<(), grammers_client::InvocationError> {
+        self.message
+            .edit(
+                grammers_client::message::InputMessage::new()
+                    .text(text.to_owned())
+                    .fmt_entities(entities),
+            )
+            .await
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaDeliveryOutcome {
+    /// The photo edit succeeded. Its `MessageEdited` carries the media
+    /// caption, which no longer parses as a command, so the matching
+    /// suppression entry must stay armed.
+    PhotoDelivered,
+    /// The photo edit failed and the text fallback ran; `delivered` reports
+    /// whether that fallback edit itself succeeded.
+    TextFallbackApplied { delivered: bool },
+}
+
+/// Everything one media-capable response needs to edit the source command
+/// message: where to suppress, what to deliver, and what to fall back to.
+struct MediaDeliveryPlan<'a> {
+    peer_id: PeerId,
+    message_id: i32,
+    command: &'a str,
+    /// Caption for the photo edit; its suppression entry is armed before the
+    /// round trip and removed when the photo edit fails.
+    media_caption: &'a str,
+    /// Text for the fallback edit; it arms its own suppression entry.
+    fallback_text: &'a str,
+    fallback_entities: Vec<grammers_client::tl::enums::MessageEntity>,
+    media_path: &'a std::path::Path,
+}
+
+/// Delivers a media response while keeping the expected-self-edit ledger
+/// transactional:
+///
+/// 1. register the expected media caption BEFORE the Telegram round trip, so
+///    the resulting `MessageEdited` can never be projected into external
+///    modules as a user edit;
+/// 2. when the photo edit fails, drop that registration first — no media
+///    `MessageEdited` will ever arrive and the unfulfilled entry would linger
+///    as stale suppression bound to this peer/message pair;
+/// 3. arm the text fallback with its own expectation, and drop it again if
+///    that edit fails too.
+async fn deliver_media_with_suppression<E: CommandMediaEdits>(
+    edits: &mut E,
+    runtime: &mut RuntimeState,
+    plan: MediaDeliveryPlan<'_>,
+) -> MediaDeliveryOutcome {
+    runtime.register_expected_self_edit(
+        plan.peer_id,
+        plan.message_id,
+        plan.media_caption.to_owned(),
+    );
+    match edits.edit_photo(plan.media_path, plan.media_caption).await {
+        Ok(()) => return MediaDeliveryOutcome::PhotoDelivered,
+        Err(error) => {
+            runtime.remove_expected_self_edit(plan.peer_id, plan.message_id, plan.media_caption);
+            tracing::warn!(
+                event = "command_media_delivery_failed",
+                command = plan.command,
+                message_id = plan.message_id,
+                error_category = delivery_error_category(&error),
+                error = %error,
+                "Falling back to a text edit"
+            );
+        }
+    }
+    runtime.register_expected_self_edit(
+        plan.peer_id,
+        plan.message_id,
+        plan.fallback_text.to_owned(),
+    );
+    match edits
+        .edit_text(plan.fallback_text, plan.fallback_entities)
+        .await
+    {
+        Ok(()) => MediaDeliveryOutcome::TextFallbackApplied { delivered: true },
+        Err(error) => {
+            runtime.remove_expected_self_edit(plan.peer_id, plan.message_id, plan.fallback_text);
+            tracing::warn!(
+                event = "command_edit_failed",
+                command = plan.command,
+                message_id = plan.message_id,
+                error_category = invocation_error_category(&error),
+                error = %error,
+                "Failed to edit outgoing command message after a media delivery failure"
+            );
+            MediaDeliveryOutcome::TextFallbackApplied { delivered: false }
+        }
+    }
+}
+
 async fn send_setup_notification(
     client: &grammers_client::Client,
     runtime: &mut RuntimeState,
@@ -586,10 +719,27 @@ async fn process_update(
         None
     };
     let rendered_text = execution.response.text;
+    let mut source_edit_succeeded = false;
     if let Some(media_path) = execution.media {
-        let caption = rendered_text.clone();
-        match deliver_photo(client, &message, &media_path, caption).await {
-            Ok(()) => {
+        // The media edit must be suppressed like any other Lavis-owned edit,
+        // and its suppression entry is transactional: dropped when the photo
+        // edit fails, re-armed by the text fallback, dropped again if the
+        // fallback fails.
+        let mut edits = TelegramCommandMediaEdits {
+            client,
+            message: &message,
+        };
+        let plan = MediaDeliveryPlan {
+            peer_id,
+            message_id,
+            command: action.name(),
+            media_caption: &rendered_text,
+            fallback_text: &rendered_text,
+            fallback_entities: execution.response.entities,
+            media_path: &media_path,
+        };
+        match deliver_media_with_suppression(&mut edits, runtime, plan).await {
+            MediaDeliveryOutcome::PhotoDelivered => {
                 tracing::info!(
                     event = "command_media_delivered",
                     command = action.name(),
@@ -598,45 +748,46 @@ async fn process_update(
                 );
                 return shutdown_reason;
             }
-            Err(error) => {
-                tracing::warn!(
-                    event = "command_media_delivery_failed",
+            MediaDeliveryOutcome::TextFallbackApplied { delivered: true } => {
+                tracing::debug!(
+                    event = "command_edit_succeeded",
                     command = action.name(),
                     message_id,
-                    error_category = delivery_error_category(&error),
-                    error = %error,
-                    "Falling back to a text edit"
+                    "Edited outgoing command message after a failed media delivery"
                 );
+                source_edit_succeeded = true;
             }
+            MediaDeliveryOutcome::TextFallbackApplied { delivered: false } => {}
         }
+    } else {
+        let input = grammers_client::message::InputMessage::new()
+            .text(rendered_text.clone())
+            .fmt_entities(execution.response.entities);
+        runtime.register_expected_self_edit(peer_id, message_id, rendered_text.clone());
+        source_edit_succeeded = match message.edit(input).await {
+            Ok(()) => {
+                tracing::debug!(
+                    event = "command_edit_succeeded",
+                    command = action.name(),
+                    message_id,
+                    "Edited outgoing command message"
+                );
+                true
+            }
+            Err(error) => {
+                runtime.remove_expected_self_edit(peer_id, message_id, &rendered_text);
+                tracing::warn!(
+                    event = "command_edit_failed",
+                    command = action.name(),
+                    message_id,
+                    error_category = invocation_error_category(&error),
+                    error = %error,
+                    "Failed to edit outgoing command message"
+                );
+                false
+            }
+        };
     }
-    let input = grammers_client::message::InputMessage::new()
-        .text(rendered_text.clone())
-        .fmt_entities(execution.response.entities);
-    runtime.register_expected_self_edit(peer_id, message_id, rendered_text.clone());
-    let source_edit_succeeded = match message.edit(input).await {
-        Ok(()) => {
-            tracing::debug!(
-                event = "command_edit_succeeded",
-                command = action.name(),
-                message_id,
-                "Edited outgoing command message"
-            );
-            true
-        }
-        Err(error) => {
-            runtime.remove_expected_self_edit(peer_id, message_id, &rendered_text);
-            tracing::warn!(
-                event = "command_edit_failed",
-                command = action.name(),
-                message_id,
-                error_category = invocation_error_category(&error),
-                error = %error,
-                "Failed to edit outgoing command message"
-            );
-            false
-        }
-    };
     if source_edit_succeeded && onboarding_page {
         runtime.mark_onboarding_delivered().await;
     }
@@ -1031,8 +1182,9 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::{
-        EventDispatches, MAX_EVENT_DISPATCH_TASKS, ProvisionTasks, UPDATE_STREAM_RESTART_AFTER,
-        UPDATE_STREAM_RETRY_BASE, UPDATE_STREAM_RETRY_MAX, UpdateOrEvent, is_self_authored,
+        CommandMediaEdits, EventDispatches, MAX_EVENT_DISPATCH_TASKS, MediaDeliveryOutcome,
+        MediaDeliveryPlan, ProvisionTasks, UPDATE_STREAM_RESTART_AFTER, UPDATE_STREAM_RETRY_BASE,
+        UPDATE_STREAM_RETRY_MAX, UpdateOrEvent, deliver_media_with_suppression, is_self_authored,
         is_temporary_telegram_error, provision_completion_text,
         register_reboot_completion_suppression, route, should_prepare_message_event,
         update_stream_retry_delay,
@@ -1547,6 +1699,206 @@ mod tests {
         assert_eq!(route(true, ",ping", &runtime), Some(Action::Ping));
         assert!(runtime.consume_expected_self_edit(first_peer, 7, "🏓 Pong: 1 ms"));
         assert!(!runtime.consume_expected_self_edit(first_peer, 7, "🏓 Pong: 1 ms"));
+    }
+
+    /// Scripted [`CommandMediaEdits`] recording every call so the tests can
+    /// assert the exact edit sequence without a Telegram connection.
+    struct ScriptedMediaEdits {
+        photo_results: std::collections::VecDeque<anyhow::Result<()>>,
+        text_results: std::collections::VecDeque<Result<(), grammers_client::InvocationError>>,
+        photo_calls: Vec<String>,
+        text_calls: Vec<String>,
+    }
+
+    impl ScriptedMediaEdits {
+        fn new(
+            photo_results: Vec<anyhow::Result<()>>,
+            text_results: Vec<Result<(), grammers_client::InvocationError>>,
+        ) -> Self {
+            Self {
+                photo_results: photo_results.into(),
+                text_results: text_results.into(),
+                photo_calls: Vec::new(),
+                text_calls: Vec::new(),
+            }
+        }
+
+        fn io_error() -> anyhow::Result<()> {
+            Err(anyhow::anyhow!("upload failed"))
+        }
+    }
+
+    impl CommandMediaEdits for ScriptedMediaEdits {
+        async fn edit_photo(
+            &mut self,
+            _media_path: &std::path::Path,
+            caption: &str,
+        ) -> anyhow::Result<()> {
+            self.photo_calls.push(caption.to_owned());
+            match self.photo_results.pop_front() {
+                Some(result) => result,
+                None => Err(anyhow::anyhow!("unexpected extra photo call")),
+            }
+        }
+
+        async fn edit_text(
+            &mut self,
+            text: &str,
+            _entities: Vec<grammers_client::tl::enums::MessageEntity>,
+        ) -> Result<(), grammers_client::InvocationError> {
+            self.text_calls.push(text.to_owned());
+            match self.text_results.pop_front() {
+                Some(result) => result,
+                None => Err(grammers_client::InvocationError::Io(std::io::Error::other(
+                    "unexpected extra text call",
+                ))),
+            }
+        }
+    }
+
+    /// Runs the transactional media delivery against a scripted seam.
+    async fn deliver(
+        runtime: &mut RuntimeState,
+        edits: &mut ScriptedMediaEdits,
+        message_id: i32,
+        media_caption: &str,
+        fallback_text: &str,
+    ) -> MediaDeliveryOutcome {
+        deliver_media_with_suppression(
+            edits,
+            runtime,
+            MediaDeliveryPlan {
+                peer_id: PeerId::user(1).unwrap(),
+                message_id,
+                command: "info",
+                media_caption,
+                fallback_text,
+                fallback_entities: Vec::new(),
+                media_path: std::path::Path::new("/nonexistent/lavis-info.png"),
+            },
+        )
+        .await
+    }
+
+    /// `,info` → media response edits the source message → the arriving
+    /// MessageEdited matches the registered expectation and is suppressed,
+    /// so it never reaches the external module projection.
+    #[tokio::test]
+    async fn successful_media_delivery_suppresses_its_message_edited_update() {
+        let mut runtime = runtime().await;
+        let peer = PeerId::user(1).unwrap();
+        assert_eq!(
+            route(true, ",info", &runtime),
+            Some(crate::commands::Action::Info),
+            "the flow under test starts at an authenticated ,info command"
+        );
+
+        let mut edits = ScriptedMediaEdits::new(vec![Ok(())], vec![]);
+        let outcome = deliver(
+            &mut runtime,
+            &mut edits,
+            42,
+            "ℹ️ Lavis info card",
+            "ℹ️ Lavis info card",
+        )
+        .await;
+
+        assert_eq!(outcome, MediaDeliveryOutcome::PhotoDelivered);
+        assert_eq!(edits.photo_calls, vec!["ℹ️ Lavis info card"]);
+        assert!(edits.text_calls.is_empty());
+
+        // The Telegram MessageEdited for the photo edit arrives afterwards;
+        // process_update consults this before routing or projecting, so
+        // `true` here means zero external message events for that update.
+        assert!(runtime.consume_expected_self_edit(peer, 42, "ℹ️ Lavis info card"));
+        // Exactly one suppression: a second identical edit is not ours.
+        assert!(!runtime.consume_expected_self_edit(peer, 42, "ℹ️ Lavis info card"));
+    }
+
+    /// Media delivery fails → the stale media suppression entry is removed →
+    /// the text fallback runs and arms its own expectation, which also
+    /// suppresses the matching MessageEdited.
+    #[tokio::test]
+    async fn failed_media_delivery_drops_stale_entry_and_arms_fallback() {
+        let mut runtime = runtime().await;
+        let peer = PeerId::user(1).unwrap();
+
+        let mut edits = ScriptedMediaEdits::new(vec![ScriptedMediaEdits::io_error()], vec![Ok(())]);
+        let outcome = deliver(
+            &mut runtime,
+            &mut edits,
+            43,
+            "ℹ️ media caption",
+            "ℹ️ text fallback",
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            MediaDeliveryOutcome::TextFallbackApplied { delivered: true }
+        );
+        assert_eq!(edits.photo_calls, vec!["ℹ️ media caption"]);
+        assert_eq!(edits.text_calls, vec!["ℹ️ text fallback"]);
+
+        // The media edit never happened: its expectation must be gone, not
+        // lingering as a stale suppression for later updates on this message.
+        assert!(!runtime.consume_expected_self_edit(peer, 43, "ℹ️ media caption"));
+        // The fallback's own expectation suppresses its MessageEdited once.
+        assert!(runtime.consume_expected_self_edit(peer, 43, "ℹ️ text fallback"));
+        assert!(!runtime.consume_expected_self_edit(peer, 43, "ℹ️ text fallback"));
+    }
+
+    /// Both edits failing must leave no suppression entries behind.
+    #[tokio::test]
+    async fn double_failure_leaves_no_suppression_entries() {
+        let mut runtime = runtime().await;
+        let peer = PeerId::user(1).unwrap();
+
+        let mut edits = ScriptedMediaEdits::new(
+            vec![ScriptedMediaEdits::io_error()],
+            vec![Err(grammers_client::InvocationError::Io(
+                std::io::Error::other("edit rejected"),
+            ))],
+        );
+        let outcome = deliver(
+            &mut runtime,
+            &mut edits,
+            44,
+            "ℹ️ media caption",
+            "ℹ️ text fallback",
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            MediaDeliveryOutcome::TextFallbackApplied { delivered: false }
+        );
+        assert!(!runtime.consume_expected_self_edit(peer, 44, "ℹ️ media caption"));
+        assert!(!runtime.consume_expected_self_edit(peer, 44, "ℹ️ text fallback"));
+    }
+
+    /// A foreign edit of the same message id must not be swallowed by a
+    /// pending media suppression entry: content, peer, and id all bind.
+    #[tokio::test]
+    async fn foreign_edited_update_is_not_masked_by_media_suppression() {
+        let mut runtime = runtime().await;
+        let peer = PeerId::user(1).unwrap();
+
+        let mut edits = ScriptedMediaEdits::new(vec![Ok(())], vec![]);
+        deliver(
+            &mut runtime,
+            &mut edits,
+            45,
+            "ℹ️ media caption",
+            "ℹ️ media caption",
+        )
+        .await;
+
+        assert!(!runtime.consume_expected_self_edit(peer, 45, "user typed this themselves"));
+        assert!(
+            runtime.consume_expected_self_edit(peer, 45, "ℹ️ media caption"),
+            "the genuine media caption still suppresses"
+        );
     }
 
     #[test]

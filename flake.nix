@@ -35,7 +35,8 @@
         postFixup = ''
           wrapProgram $out/bin/lavis \
             --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.fastfetch ]} \
-            --set LAVIS_INFO_IMAGE $out/share/lavis/lavis-info.png
+            --set LAVIS_INFO_IMAGE $out/share/lavis/lavis-info.png \
+            --set-default LAVIS_HOST nix-package
         '';
         meta = {
           description = "Personal Telegram userbot written in Rust";
