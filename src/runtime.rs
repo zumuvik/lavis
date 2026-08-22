@@ -71,7 +71,8 @@ pub struct RuntimeState {
     fastfetch_profile_path: PathBuf,
     self_identity: Option<SelfIdentity>,
     upstream: Option<Box<dyn UpstreamRev>>,
-    upstream_revision_cache: Option<(Instant, Option<UpstreamRevision>)>,
+    upstream_revision_cache: UpstreamSnapshot,
+    info_local_metadata: InfoLocalMetadata,
     external_manager: Option<ExternalManagerHandle>,
     external_snapshot: ExternalRuntimeSnapshot,
     expected_self_edits: VecDeque<ExpectedSelfEdit>,
@@ -104,20 +105,24 @@ const MODULE_APPROVAL_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_EXPECTED_SELF_EDITS: usize = 128;
 const SETUP_STAGE_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// How long a resolved upstream revision (or its confirmed absence) stays
-/// cached before the next `,info` hits Tangled again.
-const UPSTREAM_REVISION_TTL: Duration = Duration::from_secs(300);
-/// Short negative-cache lease used after rate limiting, so a throttled
-/// endpoint is retried soon but not on every command.
-const RATE_LIMITED_UPSTREAM_CACHE_TTL: Duration = Duration::from_secs(60);
-/// One short overall budget for a full upstream-resolution operation (the
-/// `info/refs` lookup plus up to two ordered compares). An informational
-/// endpoint must never freeze the Telegram update consumer for the sum of
-/// several per-request timeouts.
-const UPSTREAM_RESOLVE_TIMEOUT: Duration = Duration::from_secs(8);
+#[derive(Clone)]
+pub(crate) enum UpstreamSnapshot {
+    Never,
+    Success(UpstreamRevision),
+    LastFailure {
+        stale: Option<UpstreamRevision>,
+        category: String,
+    },
+}
+
+struct InfoLocalMetadata {
+    host: &'static str,
+    os: String,
+    media: Option<PathBuf>,
+}
 
 #[derive(Debug)]
-enum UpstreamResolveFailure {
+pub(crate) enum UpstreamResolveFailure {
     /// The `info/refs` lookup for upstream `main` itself failed.
     MainRev(crate::upstream::UpstreamError),
     /// Tangled answered with a rate limit.
@@ -129,10 +134,10 @@ enum UpstreamResolveFailure {
 /// (`compare(main, current)` first, then the reverse only when the merge base
 /// does not already prove an Ahead relation).
 ///
-/// Deliberately free of caching and deadlines — those live in
-/// [`RuntimeState::upstream_revision`] so tests can drive the network shape
-/// directly.
-async fn resolve_upstream_revision(
+/// Deliberately free of caching and deadlines. The refresh worker owns the
+/// overall deadline, while this function remains directly testable for the
+/// network shape.
+pub(crate) async fn resolve_upstream_revision(
     upstream: &dyn UpstreamRev,
 ) -> Result<UpstreamRevision, UpstreamResolveFailure> {
     resolve_upstream_relation_for(upstream, info::build_rev()).await
@@ -171,10 +176,7 @@ async fn resolve_upstream_relation_for(
                     head = %current_rev,
                     "Could not compare current build with upstream main"
                 );
-                return Ok(UpstreamRevision {
-                    revision: main_rev,
-                    relation: RevisionRelation::Unavailable,
-                });
+                return Err(UpstreamResolveFailure::MainRev(error));
             }
         };
         match first_compare.merge_base.as_deref() {
@@ -200,7 +202,7 @@ async fn resolve_upstream_relation_for(
                         head = %main_rev,
                         "Reverse compare failed"
                     );
-                    RevisionRelation::Unavailable
+                    return Err(UpstreamResolveFailure::MainRev(error));
                 }
             },
         }
@@ -407,7 +409,16 @@ impl RuntimeState {
             fastfetch_profile_path,
             self_identity: None,
             upstream: None,
-            upstream_revision_cache: None,
+            upstream_revision_cache: UpstreamSnapshot::Never,
+            info_local_metadata: InfoLocalMetadata {
+                host: info::deployment_label(std::env::var("LAVIS_HOST").ok().as_deref()),
+                os: info::read_os_release_pretty_name()
+                    .unwrap_or_else(|| std::env::consts::OS.to_owned()),
+                media: info::info_asset_path(
+                    std::env::var_os("LAVIS_INFO_IMAGE").as_deref(),
+                    env!("CARGO_MANIFEST_DIR"),
+                ),
+            },
             external_manager: None,
             external_snapshot: ExternalRuntimeSnapshot::new(),
             expected_self_edits: VecDeque::new(),
@@ -613,84 +624,36 @@ impl RuntimeState {
         }
     }
 
-    /// Resolves the upstream `main` revision and its relation to the current
-    /// build once per TTL, under one short overall deadline. Handles rate
-    /// limiting and deadline overruns by preserving stale successful values.
-    async fn upstream_revision(&mut self) -> Option<UpstreamRevision> {
-        // Check cache
-        if let Some((resolved_at, cached)) = self.upstream_revision_cache.as_ref()
-            && resolved_at.elapsed() < UPSTREAM_REVISION_TTL
-        {
-            return cached.clone();
-        }
-
-        let Some(upstream) = self.upstream.as_ref() else {
-            tracing::warn!(
-                event = "upstream_resolver_unavailable",
-                "No upstream resolver is configured"
-            );
-            return None;
-        };
-
-        let resolution = tokio::time::timeout(
-            UPSTREAM_RESOLVE_TIMEOUT,
-            resolve_upstream_revision(upstream.as_ref()),
-        )
-        .await;
-        let resolved = match resolution {
-            Ok(Ok(revision)) => Some(revision),
-            Ok(Err(UpstreamResolveFailure::RateLimited)) => {
-                tracing::warn!(
-                    event = "upstream_rate_limited",
-                    "Tangled API rate limit exceeded, preserving stale value"
-                );
-                return self.stale_upstream_or_negative_cache();
-            }
-            Ok(Err(UpstreamResolveFailure::MainRev(error))) => {
-                tracing::warn!(
-                    event = "upstream_revision_fetch_failed",
-                    category = %error,
-                    "Could not resolve the upstream main revision"
-                );
-                // A transient `info/refs` failure should not poison the cache
-                // for the full UPSTREAM_REVISION_TTL. Reuse the short
-                // negative-cache lease (or serve the last successful value),
-                // matching the rate-limit and timeout paths.
-                return self.stale_upstream_or_negative_cache();
-            }
-            Err(_elapsed) => {
-                tracing::warn!(
-                    event = "upstream_resolution_timeout",
-                    timeout_ms = UPSTREAM_RESOLVE_TIMEOUT.as_millis() as u64,
-                    "Upstream resolution exceeded its overall deadline"
-                );
-                return self.stale_upstream_or_negative_cache();
-            }
-        };
-        self.upstream_revision_cache = Some((Instant::now(), resolved.clone()));
-        resolved
+    pub(crate) fn take_upstream(&mut self) -> Option<Box<dyn UpstreamRev>> {
+        self.upstream.take()
     }
 
-    /// Serves the last successful resolution (extending its lease so a
-    /// degraded or throttled endpoint cannot thrash on every `,info`), or
-    /// installs a short negative-cache lease when nothing was ever resolved.
-    fn stale_upstream_or_negative_cache(&mut self) -> Option<UpstreamRevision> {
-        let stale = self
-            .upstream_revision_cache
-            .as_ref()
-            .and_then(|(_, cached)| cached.clone());
-        match stale {
-            Some(stale) => {
-                self.upstream_revision_cache = Some((Instant::now(), Some(stale.clone())));
-                Some(stale)
+    pub(crate) fn publish_upstream_revision(&mut self, revision: Option<UpstreamRevision>) {
+        if let Some(revision) = revision {
+            self.upstream_revision_cache = UpstreamSnapshot::Success(revision);
+        }
+    }
+
+    pub(crate) fn publish_upstream_failure(&mut self, category: impl Into<String>) {
+        let stale = match &self.upstream_revision_cache {
+            UpstreamSnapshot::Success(revision) => Some(revision.clone()),
+            UpstreamSnapshot::LastFailure { stale, .. } => stale.clone(),
+            UpstreamSnapshot::Never => None,
+        };
+        self.upstream_revision_cache = UpstreamSnapshot::LastFailure {
+            stale,
+            category: category.into(),
+        };
+    }
+
+    fn upstream_revision(&self) -> Option<UpstreamRevision> {
+        match &self.upstream_revision_cache {
+            UpstreamSnapshot::Success(revision) => Some(revision.clone()),
+            UpstreamSnapshot::LastFailure { stale, category } => {
+                tracing::debug!(category = %category, "Serving upstream snapshot after refresh failure");
+                stale.clone()
             }
-            None => {
-                self.upstream_revision_cache = Some((
-                    Instant::now() - UPSTREAM_REVISION_TTL + RATE_LIMITED_UPSTREAM_CACHE_TTL,
-                    None,
-                ));
-                None
-            }
+            UpstreamSnapshot::Never => None,
         }
     }
 
@@ -1036,7 +999,7 @@ impl RuntimeState {
             return self.execute_setup(client, request, peer_id).await;
         }
         if let Action::Info = action {
-            return self.execute_info().await;
+            return self.execute_info();
         }
         match action {
             Action::Language(request) => self.execute_language(request).await,
@@ -1113,15 +1076,14 @@ impl RuntimeState {
     /// Builds the `info` reply: a dynamic caption plus the static branding
     /// image when it is available. `media` is left `None` for a text-only card
     /// when the packaged image cannot be resolved.
-    async fn execute_info(&mut self) -> RuntimeExecution {
-        self.refresh_snapshot().await;
+    fn execute_info(&mut self) -> RuntimeExecution {
         let locale = self.locale();
         let prefix = self.prefix().to_owned();
         let owner = self
             .self_identity()
             .map(info::owner_label)
             .unwrap_or_else(|| info_text(locale, InfoText::Unknown).to_owned());
-        let upstream_data = self.upstream_revision().await;
+        let upstream_data = self.upstream_revision();
         let upstream = match &upstream_data {
             Some(data) => info::short_commit(&data.revision).to_owned(),
             None => info_text(locale, InfoText::Unavailable).to_owned(),
@@ -1135,12 +1097,6 @@ impl RuntimeState {
                 .iter()
                 .filter(|status| status.status == ExternalModuleRuntimeStatus::Running)
                 .count();
-        let host = info::deployment_label(std::env::var("LAVIS_HOST").ok().as_deref());
-        let os = tokio::task::spawn_blocking(info::read_os_release_pretty_name)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| std::env::consts::OS.to_owned());
         let caption = render_info_text(
             locale,
             InfoCaptionData {
@@ -1151,8 +1107,8 @@ impl RuntimeState {
                 prefix: &prefix,
                 active_modules,
                 total_modules,
-                host,
-                os: &os,
+                host: self.info_local_metadata.host,
+                os: &self.info_local_metadata.os,
             },
         );
         // Insert Status line after "Upstream main:" only if relation is known
@@ -1189,10 +1145,7 @@ impl RuntimeState {
             }
             _ => caption,
         };
-        let media = info::info_asset_path(
-            std::env::var_os("LAVIS_INFO_IMAGE").as_deref(),
-            env!("CARGO_MANIFEST_DIR"),
-        );
+        let media = self.info_local_metadata.media.clone();
         if media.is_none() {
             tracing::warn!(
                 event = "info_image_unavailable",
@@ -3141,7 +3094,7 @@ fn format_stats(
 mod tests {
     use super::{
         ProcStats, SensitiveCommandDenial, SensitiveCommandPolicy, UpstreamResolveFailure,
-        authorize_sensitive_message, bounded_list, external_event_error_category,
+        UpstreamSnapshot, authorize_sensitive_message, bounded_list, external_event_error_category,
         fastfetch_response, format_duration, format_latency, format_stats, lm_usage,
         missing_descriptor_response, parse_memory_kib, parse_system_uptime, render_install_plan,
         resolve_upstream_relation_for, setup_status_label, setup_status_response,
@@ -4720,7 +4673,7 @@ for line in sys.stdin:
             .set_locale(Some(crate::i18n::Locale::English))
             .await
             .unwrap();
-        let execution = runtime.execute_info().await;
+        let execution = runtime.execute_info();
 
         assert!(execution.response.text.contains(&format!(
             "Modules: {} ({} active)",
@@ -4746,11 +4699,12 @@ for line in sys.stdin:
             display_name: None,
             id: PeerId::self_user(),
         });
-        runtime.set_upstream(Box::new(FakeUpstream::new(
-            "b1d18f8ef407d043506c983b0d68e96c282eb1c9",
-        )));
+        runtime.publish_upstream_revision(Some(crate::upstream::UpstreamRevision {
+            revision: "b1d18f8ef407d043506c983b0d68e96c282eb1c9".to_owned(),
+            relation: crate::upstream::RevisionRelation::Current,
+        }));
 
-        let execution = runtime.execute_info().await;
+        let execution = runtime.execute_info();
 
         assert!(execution.response.text.contains("Owner: @owner"));
         assert!(execution.response.text.contains("Current commit: "));
@@ -4768,9 +4722,12 @@ for line in sys.stdin:
             .set_locale(Some(crate::i18n::Locale::English))
             .await
             .unwrap();
-        runtime.set_upstream(Box::new(FakeUpstream::new_err()));
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        runtime.set_upstream(Box::new(PanickingUpstream {
+            calls: calls.clone(),
+        }));
 
-        let execution = runtime.execute_info().await;
+        let execution = runtime.execute_info();
 
         assert!(
             execution
@@ -4778,35 +4735,67 @@ for line in sys.stdin:
                 .text
                 .contains("Upstream main: unavailable")
         );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(execution.media.is_some());
         fs::remove_dir_all(directory).ok();
     }
 
-    /// A TRANSIENT upstream `main` failure must not poison the cache for the
-    /// full [`UPSTREAM_REVISION_TTL`]; it reuses the short negative-cache lease
-    /// so the next `,info` retries soon instead of reporting `unavailable` for
-    /// five minutes.
     #[tokio::test]
-    async fn transient_main_rev_failure_uses_short_negative_cache() {
+    async fn upstream_failure_retains_the_last_successful_info_value() {
         let (mut runtime, directory) = runtime_with_alias().await;
-        runtime.set_upstream(Box::new(FakeUpstream::new_err()));
+        runtime
+            .settings
+            .set_locale(Some(crate::i18n::Locale::English))
+            .await
+            .unwrap();
+        runtime.publish_upstream_revision(Some(crate::upstream::UpstreamRevision {
+            revision: "b1d18f8ef407d043506c983b0d68e96c282eb1c9".to_owned(),
+            relation: crate::upstream::RevisionRelation::Current,
+        }));
+        runtime.publish_upstream_failure("timeout");
 
-        assert!(runtime.upstream_revision().await.is_none());
-        let (resolved_at, cached) = runtime
-            .upstream_revision_cache
-            .as_ref()
-            .expect("a negative-cache entry must be installed after a transient failure");
-        assert!(
-            cached.is_none(),
-            "freshly resolved failure must cache a None (no stale value to serve)"
-        );
+        let execution = runtime.execute_info();
 
-        let lease = super::UPSTREAM_REVISION_TTL.saturating_sub(resolved_at.elapsed());
-        assert!(
-            lease <= super::RATE_LIMITED_UPSTREAM_CACHE_TTL,
-            "transient failures must use the short {}s lease, got a {lease:?} lease",
-            super::RATE_LIMITED_UPSTREAM_CACHE_TTL.as_secs()
-        );
+        assert!(execution.response.text.contains("b1d18f8"));
+        assert!(matches!(
+            &runtime.upstream_revision_cache,
+            UpstreamSnapshot::LastFailure {
+                stale: Some(_),
+                category
+            } if category == "timeout"
+        ));
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[tokio::test]
+    async fn upstream_snapshot_failure_and_recovery_transitions_are_explicit() {
+        let (mut runtime, directory) = runtime_with_alias().await;
+        assert!(matches!(
+            &runtime.upstream_revision_cache,
+            UpstreamSnapshot::Never
+        ));
+
+        runtime.publish_upstream_failure("transport");
+        assert!(matches!(
+            &runtime.upstream_revision_cache,
+            UpstreamSnapshot::LastFailure { stale: None, .. }
+        ));
+
+        let revision = crate::upstream::UpstreamRevision {
+            revision: "b1d18f8ef407d043506c983b0d68e96c282eb1c9".to_owned(),
+            relation: crate::upstream::RevisionRelation::Current,
+        };
+        runtime.publish_upstream_revision(Some(revision.clone()));
+        runtime.publish_upstream_failure("timeout");
+        assert!(matches!(
+            &runtime.upstream_revision_cache,
+            UpstreamSnapshot::LastFailure { stale: Some(_), .. }
+        ));
+        runtime.publish_upstream_revision(Some(revision));
+        assert!(matches!(
+            &runtime.upstream_revision_cache,
+            UpstreamSnapshot::Success(_)
+        ));
         fs::remove_dir_all(directory).ok();
     }
 
@@ -4819,37 +4808,25 @@ for line in sys.stdin:
             .await
             .unwrap();
 
-        let execution = runtime.execute_info().await;
+        let execution = runtime.execute_info();
 
         assert!(execution.response.text.contains("Owner: unknown"));
         fs::remove_dir_all(directory).ok();
     }
 
-    struct FakeUpstream {
-        result: Result<String, UpstreamError>,
+    struct PanickingUpstream {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
-    impl FakeUpstream {
-        fn new(revision: &str) -> Self {
-            Self {
-                result: Ok(revision.to_owned()),
-            }
-        }
-
-        fn new_err() -> Self {
-            Self {
-                result: Err(UpstreamError::NoMainRef),
-            }
-        }
-    }
-
-    impl UpstreamRev for FakeUpstream {
+    impl UpstreamRev for PanickingUpstream {
         fn main_rev<'a>(&'a self) -> UpstreamRevFuture<'a> {
-            Box::pin(async move { self.result.clone() })
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            panic!("execute_info must not resolve upstream revisions")
         }
 
         fn compare<'a>(&'a self, _base: &'a str, _head: &'a str) -> CompareFuture<'a> {
-            Box::pin(async { Err(UpstreamError::Transport) })
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            panic!("execute_info must not compare upstream revisions")
         }
     }
 

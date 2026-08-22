@@ -75,6 +75,7 @@ pub fn relation_from_compare(compare: &CompareResult) -> RevisionRelation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UpstreamError {
     Transport,
+    ResponseTooLarge,
     Timeout,
     HttpStatus(u16),
     RevisionNotFound { revision: String },
@@ -88,6 +89,7 @@ impl std::fmt::Display for UpstreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Transport => write!(f, "transport"),
+            Self::ResponseTooLarge => write!(f, "response_too_large"),
             Self::Timeout => write!(f, "timeout"),
             Self::HttpStatus(code) => write!(f, "http_status_{}", code),
             Self::RevisionNotFound { revision } => {
@@ -117,9 +119,8 @@ const SHA1_HEX_LEN: usize = 40;
 /// `info/refs` advertises refs only, so its bodies stay tiny.
 const MAX_INFO_REFS_BODY_BYTES: usize = 64 * 1024;
 /// Compare responses embed `format_patch` (and friends), which grows with
-/// the diff. A production response with 26 commits measured 1,587,598 bytes;
-/// 4 MiB keeps that response bounded while allowing reasonable diff growth.
-const MAX_COMPARE_BODY_BYTES: usize = 4 * 1024 * 1024;
+/// the diff. A production response with 26 commits measured 1,587,598 bytes.
+const MAX_COMPARE_BODY_BYTES: usize = 8 * 1024 * 1024;
 const UPSTREAM_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Uses Rustls only (via reqwest's `rustls-tls` feature).
@@ -193,22 +194,58 @@ async fn read_bounded_body(
     mut response: reqwest::Response,
     max_bytes: usize,
 ) -> Result<Vec<u8>, UpstreamError> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > max_bytes as u64)
-    {
-        return Err(UpstreamError::Transport);
-    }
+    check_content_length(response.content_length(), max_bytes)?;
     let mut body = Vec::new();
     while let Some(chunk) = response
         .chunk()
         .await
         .map_err(|_| UpstreamError::Transport)?
     {
-        if body.len().saturating_add(chunk.len()) > max_bytes {
-            return Err(UpstreamError::Transport);
-        }
-        body.extend_from_slice(&chunk);
+        append_bounded_chunk(&mut body, &chunk, max_bytes)?;
+    }
+    Ok(body)
+}
+
+fn check_content_length(
+    content_length: Option<u64>,
+    max_bytes: usize,
+) -> Result<(), UpstreamError> {
+    if content_length.is_some_and(|length| length > max_bytes as u64) {
+        return Err(UpstreamError::ResponseTooLarge);
+    }
+    Ok(())
+}
+
+fn append_bounded_chunk(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+    max_bytes: usize,
+) -> Result<(), UpstreamError> {
+    if body.len().saturating_add(chunk.len()) > max_bytes {
+        return Err(UpstreamError::ResponseTooLarge);
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
+#[cfg(test)]
+async fn read_bounded_body_stream<S, E, C>(
+    content_length: Option<u64>,
+    mut stream: S,
+    max_bytes: usize,
+) -> Result<Vec<u8>, UpstreamError>
+where
+    S: futures_util::Stream<Item = Result<C, E>> + Unpin,
+    C: AsRef<[u8]>,
+{
+    check_content_length(content_length, max_bytes)?;
+    let mut body = Vec::new();
+    while let Some(chunk) = futures_util::StreamExt::next(&mut stream)
+        .await
+        .transpose()
+        .map_err(|_| UpstreamError::Transport)?
+    {
+        append_bounded_chunk(&mut body, chunk.as_ref(), max_bytes)?;
     }
     Ok(body)
 }
@@ -698,11 +735,44 @@ mod tests {
         assert_eq!(result.merge_base, Some("BASE".to_string()));
     }
 
-    #[test]
-    fn compare_body_bound_covers_production_response_size() {
-        let max_bytes = std::hint::black_box(MAX_COMPARE_BODY_BYTES);
-        let production_response_bytes = std::hint::black_box(1_587_598usize);
-        assert!(max_bytes >= production_response_bytes);
+    #[tokio::test]
+    async fn declared_body_length_overflow_is_rejected() {
+        let result = read_bounded_body_stream(
+            Some(MAX_COMPARE_BODY_BYTES as u64 + 1),
+            futures_util::stream::iter([Ok::<_, ()>(Vec::new())]),
+            MAX_COMPARE_BODY_BYTES,
+        )
+        .await;
+        assert_eq!(result, Err(UpstreamError::ResponseTooLarge));
+    }
+
+    #[tokio::test]
+    async fn streamed_body_accumulation_overflow_is_rejected() {
+        let result = read_bounded_body_stream(
+            None,
+            futures_util::stream::iter([Ok::<_, ()>(vec![0; MAX_COMPARE_BODY_BYTES]), Ok(vec![0])]),
+            MAX_COMPARE_BODY_BYTES,
+        )
+        .await;
+        assert_eq!(result, Err(UpstreamError::ResponseTooLarge));
+    }
+
+    #[tokio::test]
+    async fn generated_large_compare_response_fits_and_parses() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "format_patch": [{
+                "SHA": "0123456789abcdef0123456789abcdef01234567",
+                "Title": "x".repeat(1_590_700),
+                "Files": [],
+            }],
+            "merge_base": "BASE",
+        }))
+        .unwrap();
+        assert!(body.len() >= 1_590_000);
+        assert!(body.len() < MAX_COMPARE_BODY_BYTES);
+        let result = parse_tangled_compare_response(&body).unwrap();
+        assert!(result.ahead_by > 0);
+        assert_eq!(result.merge_base.as_deref(), Some("BASE"));
     }
 
     #[test]
@@ -817,6 +887,10 @@ mod tests {
     #[test]
     fn upstream_error_display_variants() {
         assert_eq!(UpstreamError::Transport.to_string(), "transport");
+        assert_eq!(
+            UpstreamError::ResponseTooLarge.to_string(),
+            "response_too_large"
+        );
         assert_eq!(UpstreamError::Timeout.to_string(), "timeout");
         assert_eq!(
             UpstreamError::HttpStatus(404).to_string(),

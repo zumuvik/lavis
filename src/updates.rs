@@ -7,6 +7,7 @@ use grammers_client::{
 use grammers_session::types::{PeerAuth, PeerId, PeerKind, PeerRef};
 use std::{future::Future, time::Duration};
 use tokio::task::JoinSet;
+use tokio::time::MissedTickBehavior;
 
 use crate::{
     command::parse,
@@ -32,6 +33,131 @@ const REBOOT_RECEIPT_COMPLETION_TIMEOUT: Duration = Duration::from_secs(4);
 const UPDATE_STREAM_RETRY_BASE: Duration = Duration::from_millis(250);
 const UPDATE_STREAM_RETRY_MAX: Duration = Duration::from_secs(5);
 const UPDATE_STREAM_RESTART_AFTER: u32 = 12;
+const UPSTREAM_REFRESH_INTERVAL: Duration = Duration::from_secs(2 * 60 * 60);
+const UPSTREAM_REFRESH_DEADLINE: Duration = Duration::from_secs(5);
+
+enum UpstreamRefresh {
+    Success(crate::upstream::UpstreamRevision),
+    Failed(String),
+}
+
+struct RefreshTask {
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl RefreshTask {
+    async fn cancel_and_join(mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for RefreshTask {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+}
+
+async fn upstream_refresh_task(
+    resolver: Box<dyn crate::upstream::UpstreamRev>,
+    sender: tokio::sync::mpsc::UnboundedSender<UpstreamRefresh>,
+) {
+    upstream_refresh_task_with(
+        resolver,
+        sender,
+        UPSTREAM_REFRESH_INTERVAL,
+        UPSTREAM_REFRESH_DEADLINE,
+    )
+    .await;
+}
+
+async fn upstream_refresh_task_with(
+    resolver: Box<dyn crate::upstream::UpstreamRev>,
+    sender: tokio::sync::mpsc::UnboundedSender<UpstreamRefresh>,
+    interval_duration: Duration,
+    deadline: Duration,
+) {
+    let mut interval = upstream_refresh_interval(interval_duration);
+    interval.tick().await;
+    loop {
+        let started = tokio::time::Instant::now();
+        tracing::info!(
+            event = "upstream_refresh_started",
+            "Refreshing upstream snapshot"
+        );
+        let result = tokio::time::timeout(
+            deadline,
+            crate::runtime::resolve_upstream_revision(resolver.as_ref()),
+        )
+        .await;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match result {
+            Ok(Ok(revision)) => {
+                tracing::info!(event = "upstream_refresh_succeeded", elapsed_ms, main = %revision.revision, relation = ?revision.relation, "Upstream snapshot refreshed");
+                if sender.send(UpstreamRefresh::Success(revision)).is_err() {
+                    return;
+                }
+            }
+            Ok(Err(crate::runtime::UpstreamResolveFailure::MainRev(error))) => {
+                tracing::warn!(event = "upstream_refresh_failed", elapsed_ms, category = %error, "Upstream refresh failed; retaining last successful snapshot");
+                if sender
+                    .send(UpstreamRefresh::Failed(error.to_string()))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Ok(Err(crate::runtime::UpstreamResolveFailure::RateLimited)) => {
+                tracing::warn!(
+                    event = "upstream_refresh_failed",
+                    elapsed_ms,
+                    category = "rate_limited",
+                    "Upstream refresh failed; retaining last successful snapshot"
+                );
+                if sender
+                    .send(UpstreamRefresh::Failed("rate_limited".to_owned()))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Err(_) => {
+                tracing::warn!(
+                    event = "upstream_refresh_failed",
+                    elapsed_ms,
+                    category = "timeout",
+                    "Upstream refresh exceeded its deadline; retaining last successful snapshot"
+                );
+                if sender
+                    .send(UpstreamRefresh::Failed("timeout".to_owned()))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+        interval.tick().await;
+    }
+}
+
+async fn receive_refresh(
+    receiver: &mut Option<&mut tokio::sync::mpsc::UnboundedReceiver<UpstreamRefresh>>,
+) -> Option<UpstreamRefresh> {
+    match receiver.as_mut() {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+fn upstream_refresh_interval(duration: Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(duration);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    interval
+}
 
 struct EventDispatches {
     tasks: JoinSet<()>,
@@ -125,6 +251,38 @@ pub async fn run(
     runtime: &mut RuntimeState,
     receipt_store: &RebootReceiptStore,
 ) -> anyhow::Result<ShutdownReason> {
+    let resolver = runtime.take_upstream();
+    let has_resolver = resolver.is_some();
+    let (refresh_sender, mut refresh_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let refresh_task = resolver.map(|resolver| RefreshTask {
+        handle: Some(tokio::spawn(upstream_refresh_task(
+            resolver,
+            refresh_sender,
+        ))),
+    });
+    let result = run_loop(
+        stream,
+        self_user_id,
+        client,
+        runtime,
+        receipt_store,
+        has_resolver.then_some(&mut refresh_receiver),
+    )
+    .await;
+    if let Some(task) = refresh_task {
+        task.cancel_and_join().await;
+    }
+    result
+}
+
+async fn run_loop(
+    stream: &mut UpdateStream,
+    self_user_id: PeerId,
+    client: &grammers_client::Client,
+    runtime: &mut RuntimeState,
+    receipt_store: &RebootReceiptStore,
+    mut refresh_receiver: Option<&mut tokio::sync::mpsc::UnboundedReceiver<UpstreamRefresh>>,
+) -> anyhow::Result<ShutdownReason> {
     consume_pending_reboot_receipt(client, runtime, self_user_id, receipt_store).await;
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
@@ -149,6 +307,17 @@ pub async fn run(
                     .map_err(anyhow::Error::from_boxed)
                     .context("failed to synchronize Telegram update state")?;
                 return Ok(ShutdownReason::Exit);
+            }
+            refresh = receive_refresh(&mut refresh_receiver) => {
+                match refresh {
+                    Some(UpstreamRefresh::Success(revision)) => {
+                        runtime.publish_upstream_revision(Some(revision));
+                    }
+                    Some(UpstreamRefresh::Failed(category)) => {
+                        runtime.publish_upstream_failure(category);
+                    }
+                    None => refresh_receiver = None,
+                }
             }
             provision = provision_tasks.tasks.join_next(), if !provision_tasks.tasks.is_empty() => {
                 match provision {
@@ -1237,13 +1406,15 @@ mod tests {
 
     use super::{
         CommandMediaEdits, EventDispatches, MAX_EVENT_DISPATCH_TASKS, MediaDeliveryOutcome,
-        MediaDeliveryPlan, ProvisionTasks, UPDATE_STREAM_RESTART_AFTER, UPDATE_STREAM_RETRY_BASE,
-        UPDATE_STREAM_RETRY_MAX, UpdateOrEvent, deliver_media_with_suppression,
-        edit_definitely_rejected, is_self_authored, is_temporary_telegram_error,
-        provision_completion_text, register_reboot_completion_suppression, route,
-        should_prepare_message_event, update_stream_retry_delay,
+        MediaDeliveryPlan, ProvisionTasks, RefreshTask, UPDATE_STREAM_RESTART_AFTER,
+        UPDATE_STREAM_RETRY_BASE, UPDATE_STREAM_RETRY_MAX, UpdateOrEvent, UpstreamRefresh,
+        deliver_media_with_suppression, edit_definitely_rejected, is_self_authored,
+        is_temporary_telegram_error, provision_completion_text, receive_refresh,
+        register_reboot_completion_suppression, route, should_prepare_message_event,
+        update_stream_retry_delay, upstream_refresh_interval, upstream_refresh_task_with,
     };
     use crate::commands::{Action, ExternalInvocation, PrefixRequest};
+    use crate::upstream::{CompareFuture, UpstreamRev, UpstreamRevFuture};
     use crate::{
         aliases::{Alias, AliasStore},
         external_modules::{
@@ -1256,7 +1427,13 @@ mod tests {
     };
     use std::{
         collections::HashMap,
+        future::Future,
         path::PathBuf,
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{Duration, Instant},
     };
 
@@ -2130,5 +2307,145 @@ mod tests {
         let self_user_id = PeerId::user(1).unwrap();
 
         assert!(!is_self_authored(None, true, self_user_id));
+    }
+
+    struct TestResolver {
+        main: Option<String>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl UpstreamRev for TestResolver {
+        fn main_rev<'a>(&'a self) -> UpstreamRevFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let main = self.main.clone();
+            Box::pin(async move {
+                match main {
+                    Some(revision) => Ok(revision),
+                    None => std::future::pending().await,
+                }
+            })
+        }
+
+        fn compare<'a>(&'a self, _base: &'a str, _head: &'a str) -> CompareFuture<'a> {
+            panic!("compare must not be called by this refresh test")
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_refresh_is_immediate() {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(upstream_refresh_task_with(
+            Box::new(TestResolver {
+                main: Some(crate::info::build_rev().to_owned()),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            sender,
+            Duration::from_secs(3600),
+            Duration::from_secs(1),
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_millis(100), receiver.recv())
+                .await
+                .unwrap(),
+            Some(UpstreamRefresh::Success(_))
+        ));
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn upstream_refresh_deadline_publishes_timeout_failure() {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(upstream_refresh_task_with(
+            Box::new(TestResolver {
+                main: None,
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            sender,
+            Duration::from_secs(3600),
+            Duration::from_millis(10),
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_millis(100), receiver.recv())
+                .await
+                .unwrap(),
+            Some(UpstreamRefresh::Failed(category)) if category == "timeout"
+        ));
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn closed_refresh_receiver_disables_receive_branch() {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        drop(sender);
+        let mut receiver = Some(&mut receiver);
+        assert!(receive_refresh(&mut receiver).await.is_none());
+        receiver = None;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), receive_refresh(&mut receiver))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_task_cancel_and_join_stops_never_completing_refresh() {
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let task = RefreshTask {
+            handle: Some(tokio::spawn(upstream_refresh_task_with(
+                Box::new(TestResolver {
+                    main: None,
+                    calls: Arc::new(AtomicUsize::new(0)),
+                }),
+                sender,
+                Duration::from_secs(3600),
+                Duration::from_secs(3600),
+            ))),
+        };
+        task.cancel_and_join().await;
+    }
+
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Future for DropSignal {
+        type Output = ();
+
+        fn poll(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_refresh_task_aborts_in_flight_work() {
+        let (dropped_sender, dropped_receiver) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(DropSignal(Some(dropped_sender)));
+        drop(RefreshTask {
+            handle: Some(handle),
+        });
+        tokio::time::timeout(Duration::from_millis(100), dropped_receiver)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_interval_skips_missed_ticks() {
+        let interval = upstream_refresh_interval(Duration::from_millis(1));
+        assert_eq!(
+            interval.missed_tick_behavior(),
+            tokio::time::MissedTickBehavior::Skip
+        );
     }
 }

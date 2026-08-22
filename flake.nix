@@ -24,6 +24,10 @@
         preBuild = ''
           export LAVIS_GIT_REV=${self.rev or "dirty"}
         '';
+        preCheck = ''
+          export XDG_STATE_HOME="$TMPDIR/lavis-test-state"
+          install -d -m 700 "$XDG_STATE_HOME"
+        '';
         nativeBuildInputs = [
           pkgs.makeWrapper
           pkgs.python3 # JSON-line external-process fixtures (test-only)
