@@ -114,7 +114,7 @@ const RATE_LIMITED_UPSTREAM_CACHE_TTL: Duration = Duration::from_secs(60);
 /// `info/refs` lookup plus up to two ordered compares). An informational
 /// endpoint must never freeze the Telegram update consumer for the sum of
 /// several per-request timeouts.
-const UPSTREAM_RESOLVE_TIMEOUT: Duration = Duration::from_secs(4);
+const UPSTREAM_RESOLVE_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Debug)]
 enum UpstreamResolveFailure {

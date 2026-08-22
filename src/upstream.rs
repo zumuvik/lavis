@@ -120,7 +120,7 @@ const MAX_INFO_REFS_BODY_BYTES: usize = 64 * 1024;
 /// the diff; the limit must leave room for that instead of reusing the
 /// `info/refs` budget.
 const MAX_COMPARE_BODY_BYTES: usize = 512 * 1024;
-const UPSTREAM_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
+const UPSTREAM_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Uses Rustls only (via reqwest's `rustls-tls` feature).
 pub struct HttpUpstreamRev {
