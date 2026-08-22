@@ -299,9 +299,12 @@ fn compare_query_params<'a>(rev1: &'a str, rev2: &'a str) -> [(&'static str, &'a
 
 /// Runs one ordered Tangled compare. The public contract is
 /// `compare(base, head)` → "how many commits does `head` carry that `base`
-/// lacks". Verified against the live Tangled API (2026-08): `format_patch`
-/// lists the commits reachable from `rev2` but not from `rev1`, so `rev1`
-/// must be the base and `rev2` the head — swapping them inverts the answer.
+/// lacks". Confirmed from the Tangled knotserver source (`FormatPatch` →
+/// `commitsBetween` walks `rev1..rev2`): `format_patch` lists the commits
+/// reachable from `rev2` but not from `rev1`, so `rev1` must be the base and
+/// `rev2` the head — swapping them inverts the answer. Live XRPC verification
+/// was not available (endpoint rate-limited / 5xx), so orientation rests on
+/// the source evidence.
 async fn perform_compare<T: RawCompareTransport + ?Sized>(
     transport: &T,
     base: &str,
