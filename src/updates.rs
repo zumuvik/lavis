@@ -319,6 +319,30 @@ fn delivery_error_category(error: &anyhow::Error) -> &'static str {
     "other"
 }
 
+/// `true` only when the error proves Telegram did not apply the edit, so the
+/// expected-self-edit suppression may be released. An [`InvocationError::Rpc`]
+/// arrives as a definitive server response: the mutation was rejected and never
+/// applied, so the suppression cannot be matched by a later `MessageEdited`.
+///
+/// Every other [`InvocationError`] variant (`Io`, `Transport`, `Deserialize`,
+/// `Dropped`, `Session`, `InvalidDc`, `Authentication`) is ambiguous: the
+/// request may already have been fully sent and applied before the connection
+/// broke, so the client cannot prove the edit did not happen. Those must fail
+/// closed and keep the suppression armed.
+fn edit_definitely_rejected(error: &grammers_client::InvocationError) -> bool {
+    matches!(error, grammers_client::InvocationError::Rpc(_))
+}
+
+/// Resolves the [`InvocationError`] (if any) hidden inside a media-delivery
+/// `anyhow::Error`, so the fail-closed decision in
+/// [`deliver_media_with_suppression`] is made on the underlying MTProto error
+/// rather than the wrapping `anyhow` context.
+fn as_invocation_error(error: &anyhow::Error) -> Option<&grammers_client::InvocationError> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<grammers_client::InvocationError>())
+}
+
 /// Edits the outgoing command message in place to carry the static media
 /// asset with `caption`. The MTProto `messages.editMessage` call supports
 /// the `media` parameter, so we replace the command text with the photo
@@ -440,12 +464,24 @@ async fn deliver_media_with_suppression<E: CommandMediaEdits>(
     match edits.edit_photo(plan.media_path, plan.media_caption).await {
         Ok(()) => return MediaDeliveryOutcome::PhotoDelivered,
         Err(error) => {
-            runtime.remove_expected_self_edit(plan.peer_id, plan.message_id, plan.media_caption);
+            // Fail closed on ambiguous transport/read failures: the photo edit
+            // may already have been applied, so its `MessageEdited` must not be
+            // projected. Only a definitive server rejection proves it did not.
+            let definitely_rejected =
+                as_invocation_error(&error).is_some_and(edit_definitely_rejected);
+            if definitely_rejected {
+                runtime.remove_expected_self_edit(
+                    plan.peer_id,
+                    plan.message_id,
+                    plan.media_caption,
+                );
+            }
             tracing::warn!(
                 event = "command_media_delivery_failed",
                 command = plan.command,
                 message_id = plan.message_id,
                 error_category = delivery_error_category(&error),
+                fail_closed = !definitely_rejected,
                 error = %error,
                 "Falling back to a text edit"
             );
@@ -462,12 +498,20 @@ async fn deliver_media_with_suppression<E: CommandMediaEdits>(
     {
         Ok(()) => MediaDeliveryOutcome::TextFallbackApplied { delivered: true },
         Err(error) => {
-            runtime.remove_expected_self_edit(plan.peer_id, plan.message_id, plan.fallback_text);
+            let definitely_rejected = edit_definitely_rejected(&error);
+            if definitely_rejected {
+                runtime.remove_expected_self_edit(
+                    plan.peer_id,
+                    plan.message_id,
+                    plan.fallback_text,
+                );
+            }
             tracing::warn!(
                 event = "command_edit_failed",
                 command = plan.command,
                 message_id = plan.message_id,
                 error_category = invocation_error_category(&error),
+                fail_closed = !definitely_rejected,
                 error = %error,
                 "Failed to edit outgoing command message after a media delivery failure"
             );
@@ -623,7 +667,10 @@ async fn process_update(
             .fmt_entities(response.entities.clone());
         runtime.register_expected_self_edit(peer_id, message_id, rendered_text.clone());
         if let Err(error) = message.edit(input).await {
-            runtime.remove_expected_self_edit(peer_id, message_id, &rendered_text);
+            let definitely_rejected = edit_definitely_rejected(&error);
+            if definitely_rejected {
+                runtime.remove_expected_self_edit(peer_id, message_id, &rendered_text);
+            }
             if error.is("MESSAGE_NOT_MODIFIED") {
                 tracing::debug!(
                     event = "setup_input_edit_not_modified",
@@ -635,6 +682,7 @@ async fn process_update(
                     event = "setup_input_edit_failed",
                     message_id,
                     error_category = invocation_error_category(&error),
+                    fail_closed = !definitely_rejected,
                     "Failed to edit setup input"
                 );
                 if runtime.claim_setup_edit_fallback(peer_id, message_id) {
@@ -775,12 +823,18 @@ async fn process_update(
                 true
             }
             Err(error) => {
-                runtime.remove_expected_self_edit(peer_id, message_id, &rendered_text);
+                // Fail closed on ambiguous transport/read failures: the edit
+                // may already have been applied, so its MessageEdited must stay
+                // suppressed. Only a definitive server rejection releases it.
+                if edit_definitely_rejected(&error) {
+                    runtime.remove_expected_self_edit(peer_id, message_id, &rendered_text);
+                }
                 tracing::warn!(
                     event = "command_edit_failed",
                     command = action.name(),
                     message_id,
                     error_category = invocation_error_category(&error),
+                    fail_closed = !edit_definitely_rejected(&error),
                     error = %error,
                     "Failed to edit outgoing command message"
                 );
@@ -989,7 +1043,7 @@ async fn fallback_reboot_edit(
     if message
         .edit(grammers_client::message::InputMessage::new().text(text.clone()))
         .await
-        .is_err()
+        .is_err_and(|error| edit_definitely_rejected(&error))
     {
         runtime.remove_expected_self_edit(peer_id, message_id, &text);
     }
@@ -1184,10 +1238,10 @@ mod tests {
     use super::{
         CommandMediaEdits, EventDispatches, MAX_EVENT_DISPATCH_TASKS, MediaDeliveryOutcome,
         MediaDeliveryPlan, ProvisionTasks, UPDATE_STREAM_RESTART_AFTER, UPDATE_STREAM_RETRY_BASE,
-        UPDATE_STREAM_RETRY_MAX, UpdateOrEvent, deliver_media_with_suppression, is_self_authored,
-        is_temporary_telegram_error, provision_completion_text,
-        register_reboot_completion_suppression, route, should_prepare_message_event,
-        update_stream_retry_delay,
+        UPDATE_STREAM_RETRY_MAX, UpdateOrEvent, deliver_media_with_suppression,
+        edit_definitely_rejected, is_self_authored, is_temporary_telegram_error,
+        provision_completion_text, register_reboot_completion_suppression, route,
+        should_prepare_message_event, update_stream_retry_delay,
     };
     use crate::commands::{Action, ExternalInvocation, PrefixRequest};
     use crate::{
@@ -1815,11 +1869,12 @@ mod tests {
         assert!(!runtime.consume_expected_self_edit(peer, 42, "ℹ️ Lavis info card"));
     }
 
-    /// Media delivery fails → the stale media suppression entry is removed →
-    /// the text fallback runs and arms its own expectation, which also
-    /// suppresses the matching MessageEdited.
+    /// Media delivery fails with an AMBIGUOUS error (request may already have
+    /// been applied before the connection broke). The suppression must be
+    /// KEPT (fail closed), so a later matching `MessageEdited` is still
+    /// suppressed; the text fallback then arms its own expectation.
     #[tokio::test]
-    async fn failed_media_delivery_drops_stale_entry_and_arms_fallback() {
+    async fn failed_media_delivery_keeps_suppression_and_arms_fallback() {
         let mut runtime = runtime().await;
         let peer = PeerId::user(1).unwrap();
 
@@ -1840,17 +1895,58 @@ mod tests {
         assert_eq!(edits.photo_calls, vec!["ℹ️ media caption"]);
         assert_eq!(edits.text_calls, vec!["ℹ️ text fallback"]);
 
-        // The media edit never happened: its expectation must be gone, not
-        // lingering as a stale suppression for later updates on this message.
+        // The media edit is ambiguous: its expectation must STILL be armed so a
+        // matching MessageEdited cannot leak into external modules.
+        assert!(runtime.consume_expected_self_edit(peer, 43, "ℹ️ media caption"));
         assert!(!runtime.consume_expected_self_edit(peer, 43, "ℹ️ media caption"));
         // The fallback's own expectation suppresses its MessageEdited once.
         assert!(runtime.consume_expected_self_edit(peer, 43, "ℹ️ text fallback"));
         assert!(!runtime.consume_expected_self_edit(peer, 43, "ℹ️ text fallback"));
     }
 
-    /// Both edits failing must leave no suppression entries behind.
+    /// Media delivery fails with a DEFINITIVE server rejection (`Rpc`): the
+    /// mutation provably was not applied, so its suppression is released and
+    /// the text fallback arms only its own expectation.
     #[tokio::test]
-    async fn double_failure_leaves_no_suppression_entries() {
+    async fn definitively_rejected_media_delivery_releases_suppression() {
+        let mut runtime = runtime().await;
+        let peer = PeerId::user(1).unwrap();
+
+        let media_rejection = anyhow::anyhow!(grammers_client::InvocationError::Rpc(
+            grammers_mtsender::RpcError {
+                code: 400,
+                name: "MESSAGE_ID_INVALID".to_owned(),
+                value: None,
+                caused_by: None,
+            }
+        ));
+        let mut edits = ScriptedMediaEdits::new(vec![Err(media_rejection)], vec![Ok(())]);
+        let outcome = deliver(
+            &mut runtime,
+            &mut edits,
+            46,
+            "ℹ️ media caption",
+            "ℹ️ text fallback",
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            MediaDeliveryOutcome::TextFallbackApplied { delivered: true }
+        );
+        // The media edit was definitively rejected: no MessageEdited will ever
+        // arrive for it, so its stale expectation must be gone.
+        assert!(!runtime.consume_expected_self_edit(peer, 46, "ℹ️ media caption"));
+        // The fallback's own expectation suppresses its MessageEdited once.
+        assert!(runtime.consume_expected_self_edit(peer, 46, "ℹ️ text fallback"));
+        assert!(!runtime.consume_expected_self_edit(peer, 46, "ℹ️ text fallback"));
+    }
+
+    /// Both edits failing with AMBIGUOUS errors must leave BOTH suppressions
+    /// armed (fail closed): the mutation may have applied despite the error, so
+    /// neither a media nor a text `MessageEdited` may leak.
+    #[tokio::test]
+    async fn double_failure_keeps_all_suppressions() {
         let mut runtime = runtime().await;
         let peer = PeerId::user(1).unwrap();
 
@@ -1873,6 +1969,9 @@ mod tests {
             outcome,
             MediaDeliveryOutcome::TextFallbackApplied { delivered: false }
         );
+        // Both edits are ambiguous → both suppressions stay armed.
+        assert!(runtime.consume_expected_self_edit(peer, 44, "ℹ️ media caption"));
+        assert!(runtime.consume_expected_self_edit(peer, 44, "ℹ️ text fallback"));
         assert!(!runtime.consume_expected_self_edit(peer, 44, "ℹ️ media caption"));
         assert!(!runtime.consume_expected_self_edit(peer, 44, "ℹ️ text fallback"));
     }
@@ -1899,6 +1998,36 @@ mod tests {
             runtime.consume_expected_self_edit(peer, 45, "ℹ️ media caption"),
             "the genuine media caption still suppresses"
         );
+    }
+
+    /// Only a definitive server `Rpc` rejection proves the edit was not applied
+    /// and may release its suppression. Ambiguous transport/read/session errors
+    /// (the request may have been applied before the confirmation was lost) must
+    /// fail closed and keep it.
+    #[test]
+    fn edit_error_classification_fails_closed_on_ambiguous_errors() {
+        fn rpc(code: i32, name: &str) -> grammers_client::InvocationError {
+            grammers_client::InvocationError::Rpc(grammers_mtsender::RpcError {
+                code,
+                name: name.to_owned(),
+                value: None,
+                caused_by: None,
+            })
+        }
+
+        let io = grammers_client::InvocationError::Io(std::io::Error::other("read failed"));
+        let dropped = grammers_client::InvocationError::Dropped;
+        let invalid_dc = grammers_client::InvocationError::InvalidDc;
+
+        // Ambiguous: never proof the mutation did not happen.
+        assert!(!edit_definitely_rejected(&io));
+        assert!(!edit_definitely_rejected(&dropped));
+        assert!(!edit_definitely_rejected(&invalid_dc));
+
+        // Definitive server rejection: safe to release the suppression because
+        // no MessageEdited can follow.
+        assert!(edit_definitely_rejected(&rpc(400, "MESSAGE_ID_INVALID")));
+        assert!(edit_definitely_rejected(&rpc(400, "MESSAGE_NOT_MODIFIED")));
     }
 
     #[test]

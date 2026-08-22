@@ -652,8 +652,11 @@ impl RuntimeState {
                     category = %error,
                     "Could not resolve the upstream main revision"
                 );
-                self.upstream_revision_cache = Some((Instant::now(), None));
-                return None;
+                // A transient `info/refs` failure should not poison the cache
+                // for the full UPSTREAM_REVISION_TTL. Reuse the short
+                // negative-cache lease (or serve the last successful value),
+                // matching the rate-limit and timeout paths.
+                return self.stale_upstream_or_negative_cache();
             }
             Err(_elapsed) => {
                 tracing::warn!(
@@ -4775,6 +4778,34 @@ for line in sys.stdin:
                 .contains("Upstream main: unavailable")
         );
         assert!(execution.media.is_some());
+        fs::remove_dir_all(directory).ok();
+    }
+
+    /// A TRANSIENT upstream `main` failure must not poison the cache for the
+    /// full [`UPSTREAM_REVISION_TTL`]; it reuses the short negative-cache lease
+    /// so the next `,info` retries soon instead of reporting `unavailable` for
+    /// five minutes.
+    #[tokio::test]
+    async fn transient_main_rev_failure_uses_short_negative_cache() {
+        let (mut runtime, directory) = runtime_with_alias().await;
+        runtime.set_upstream(Box::new(FakeUpstream::new_err()));
+
+        assert!(runtime.upstream_revision().await.is_none());
+        let (resolved_at, cached) = runtime
+            .upstream_revision_cache
+            .as_ref()
+            .expect("a negative-cache entry must be installed after a transient failure");
+        assert!(
+            cached.is_none(),
+            "freshly resolved failure must cache a None (no stale value to serve)"
+        );
+
+        let lease = super::UPSTREAM_REVISION_TTL.saturating_sub(resolved_at.elapsed());
+        assert!(
+            lease <= super::RATE_LIMITED_UPSTREAM_CACHE_TTL,
+            "transient failures must use the short {}s lease, got a {lease:?} lease",
+            super::RATE_LIMITED_UPSTREAM_CACHE_TTL.as_secs()
+        );
         fs::remove_dir_all(directory).ok();
     }
 

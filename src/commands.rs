@@ -288,10 +288,10 @@ pub fn command_description(kind: CommandKind, locale: Locale) -> &'static str {
             "Показывает задержку Telegram, время работы Lavis и хоста, память, число команд и версию пакета."
         }
         (CommandKind::Info, Locale::English) => {
-            "Shows Lavis version, module API, active prefix, module counts, and source repository."
+            "Shows owner, version, current commit, upstream status, active prefix, module counts, host, and OS."
         }
         (CommandKind::Info, Locale::Russian) => {
-            "Показывает версию Lavis, API модулей, текущий префикс, количество модулей и репозиторий исходников."
+            "Показывает владельца, версию, текущий коммит, статус основной ветки, активный префикс, количество модулей, хост и ОС."
         }
         (CommandKind::Fastfetch, Locale::English) => {
             "Runs Fastfetch only with restricted safe display options."
