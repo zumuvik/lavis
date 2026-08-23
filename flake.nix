@@ -4,7 +4,6 @@
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
   inputs.crane = {
     url = "github:ipetkov/crane/v0.23.4";
-    inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs =
