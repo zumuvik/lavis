@@ -18,11 +18,18 @@ pub struct RenderedResponse {
 impl Response {
     pub fn four_blockquotes_with_locale(locale: Locale, text: String) -> Self {
         let text = truncate_utf16_with_locale(locale, &text);
+        let Some((heading, quoted_sections)) = text.split_once("\n\n") else {
+            return Self::plain_with_locale(locale, text);
+        };
+        if heading.is_empty() {
+            return Self::plain_with_locale(locale, text);
+        }
+
         let mut entities = Vec::with_capacity(4);
-        let mut offset = 0usize;
-        for section in text.split("\n\n") {
+        let mut byte_offset = heading.len() + 2;
+        for section in quoted_sections.split("\n\n") {
             if let (Some(offset), Some(length)) =
-                (utf16_i32_len(&text[..offset]), utf16_i32_len(section))
+                (utf16_i32_len(&text[..byte_offset]), utf16_i32_len(section))
                 && length > 0
             {
                 entities.push(
@@ -34,7 +41,7 @@ impl Response {
                     .into(),
                 );
             }
-            offset += section.len() + 2;
+            byte_offset += section.len() + 2;
         }
         if entities.len() == 4 {
             Self { text, entities }
@@ -420,8 +427,9 @@ mod tests {
     }
 
     #[test]
-    fn four_blockquotes_use_utf16_offsets_for_each_section() {
+    fn four_blockquotes_leave_the_heading_plain_and_use_utf16_offsets() {
         let text = [
+            "ℹ️ Lavis — really your userbot",
             "┌ first 🦀\n├ owner\n└ version",
             "┌ source\n├ commit\n└ upstream",
             "┌ runtime\n├ prefix\n└ modules",
@@ -432,8 +440,8 @@ mod tests {
 
         assert_eq!(response.text, text);
         assert_eq!(response.entities.len(), 4);
-        let mut byte_offset = 0;
-        for (entity, section) in response.entities.iter().zip(text.split("\n\n")) {
+        let mut byte_offset = text.split_once("\n\n").unwrap().0.len() + 2;
+        for (entity, section) in response.entities.iter().zip(text.split("\n\n").skip(1)) {
             let grammers_client::tl::enums::MessageEntity::Blockquote(entity) = entity else {
                 panic!("expected blockquote entity");
             };

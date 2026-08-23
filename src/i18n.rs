@@ -801,10 +801,10 @@ pub enum InfoText {
 pub fn info_text(locale: Locale, key: InfoText) -> &'static str {
     match (locale, key) {
         (Locale::English, InfoText::Caption) => {
-            "┌ ℹ️ Lavis — really your userbot\n├ Owner: {owner}\n└ Version: {version} ({version_status})\n\n┌ Source\n├ Current commit: {commit}\n└ Upstream main: {upstream} ({upstream_status})\n\n┌ Runtime\n├ Prefix: {prefix}\n└ Modules: {total} ({active} active)\n\n┌ Environment\n├ Host: {host}\n└ OS: {os}"
+            "ℹ️ Lavis — really your userbot\n\n┌Owner: {owner}\n└Version: {version} ({version_status})\n\n┌Current commit: {commit}\n├Upstream main: {upstream}\n└Status: {upstream_status}\n\n┌Prefix: {prefix}\n└Modules: {total} ({active} active)\n\n┌Host: {host}\n└OS: {os}"
         }
         (Locale::Russian, InfoText::Caption) => {
-            "┌ ℹ️ Lavis — really your userbot\n├ Владелец: {owner}\n└ Версия: {version} ({version_status})\n\n┌ Источник\n├ Текущий коммит: {commit}\n└ Основная ветка: {upstream} ({upstream_status})\n\n┌ Среда\n├ Префикс: {prefix}\n└ Модули: {total} ({active} активных)\n\n┌ Окружение\n├ Хост: {host}\n└ ОС: {os}"
+            "ℹ️ Lavis — really your userbot\n\n┌Владелец: {owner}\n└Версия: {version} ({version_status})\n\n┌Текущий коммит: {commit}\n├Основная ветка: {upstream}\n└Статус: {upstream_status}\n\n┌Префикс: {prefix}\n└Модули: {total} ({active} активных)\n\n┌Хост: {host}\n└ОС: {os}"
         }
         (Locale::English, InfoText::Unknown) => "unknown",
         (Locale::Russian, InfoText::Unknown) => "неизвестно",
@@ -1812,14 +1812,15 @@ mod tests {
                 os: "NixOS 25.05",
             },
         );
-        assert!(english.contains("Owner: @owner"));
-        assert!(english.contains("Version: 0.1.0"));
-        assert!(english.contains("Current commit: b1d18f8"));
-        assert!(english.contains("Upstream main: unavailable"));
-        assert!(english.contains("Prefix: ,"));
-        assert!(english.contains("Modules: 5 (3 active)"));
-        assert!(english.contains("Host: standalone"));
-        assert!(english.contains("OS: NixOS 25.05"));
+        assert!(english.contains("┌Owner: @owner"));
+        assert!(english.contains("└Version: 0.1.0"));
+        assert!(english.contains("┌Current commit: b1d18f8"));
+        assert!(english.contains("├Upstream main: unavailable"));
+        assert!(english.contains("└Status: unavailable"));
+        assert!(english.contains("┌Prefix: ,"));
+        assert!(english.contains("└Modules: 5 (3 active)"));
+        assert!(english.contains("┌Host: standalone"));
+        assert!(english.contains("└OS: NixOS 25.05"));
         assert!(!contains_cyrillic(&english));
 
         let russian = render_info_text(
@@ -1827,10 +1828,10 @@ mod tests {
             InfoCaptionData {
                 owner: "@owner",
                 version: "0.1.0",
-                version_status: "актуальна",
-                commit: "b1d18f8",
-                upstream: "недоступно",
-                upstream_status: "недоступно",
+                version_status: "актуальная ✅",
+                commit: "d2b0433",
+                upstream: "b1d18f8",
+                upstream_status: "актуален ✓",
                 prefix: ",",
                 active_modules: 3,
                 total_modules: 5,
@@ -1838,10 +1839,10 @@ mod tests {
                 os: "NixOS 25.05",
             },
         );
-        assert!(russian.contains("Владелец: @owner"));
-        assert!(russian.contains("Версия: 0.1.0"));
-        assert!(russian.contains("Основная ветка: недоступно"));
-        assert!(russian.contains("Модули: 5 (3 активных)"));
+        assert_eq!(
+            russian,
+            "ℹ️ Lavis — really your userbot\n\n┌Владелец: @owner\n└Версия: 0.1.0 (актуальная ✅)\n\n┌Текущий коммит: d2b0433\n├Основная ветка: b1d18f8\n└Статус: актуален ✓\n\n┌Префикс: ,\n└Модули: 5 (3 активных)\n\n┌Хост: standalone\n└ОС: NixOS 25.05"
+        );
     }
 
     #[test]

@@ -1111,8 +1111,8 @@ impl RuntimeState {
                 .and_then(|data| data.version.as_deref()),
         ) {
             VersionRelation::Current => match locale {
-                Locale::English => "current".to_owned(),
-                Locale::Russian => "актуальна".to_owned(),
+                Locale::English => "current ✅".to_owned(),
+                Locale::Russian => "актуальная ✅".to_owned(),
             },
             VersionRelation::NewerAvailable => {
                 let upstream_version = upstream_data
@@ -1120,8 +1120,8 @@ impl RuntimeState {
                     .and_then(|data| data.version.as_deref())
                     .unwrap_or_default();
                 match locale {
-                    Locale::English => format!("newer available: {upstream_version}"),
-                    Locale::Russian => format!("доступна новая: {upstream_version}"),
+                    Locale::English => format!("newer available: {upstream_version} ⬆️"),
+                    Locale::Russian => format!("доступна новая: {upstream_version} ⬆️"),
                 }
             }
             VersionRelation::Unavailable => info_text(locale, InfoText::Unavailable).to_owned(),
@@ -4707,7 +4707,12 @@ for line in sys.stdin:
         let execution = runtime.execute_info();
 
         assert!(execution.response.text.contains("Owner: @owner"));
-        assert!(execution.response.text.contains("Version: 0.1.0 (current)"));
+        assert!(
+            execution
+                .response
+                .text
+                .contains("Version: 0.1.0 (current ✅)")
+        );
         assert!(execution.response.text.contains("Current commit: "));
         assert!(execution.response.text.contains("Upstream main: b1d18f8"));
         assert!(execution.response.text.contains("Prefix: "));
