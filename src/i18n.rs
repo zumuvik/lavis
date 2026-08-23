@@ -860,7 +860,7 @@ fn interpolate(template: &str, placeholders: &[(&str, &str)]) -> String {
 pub fn render_info_text(locale: Locale, info: InfoCaptionData<'_>) -> String {
     let active_modules = info.active_modules.to_string();
     let total_modules = info.total_modules.to_string();
-    interpolate(
+    let rendered = interpolate(
         info_text(locale, InfoText::Caption),
         &[
             ("{owner}", info.owner),
@@ -875,7 +875,12 @@ pub fn render_info_text(locale: Locale, info: InfoCaptionData<'_>) -> String {
             ("{host}", info.host),
             ("{os}", info.os),
         ],
-    )
+    );
+    if info.version_status.is_empty() {
+        rendered.replace(" ()", "")
+    } else {
+        rendered
+    }
 }
 
 /// Renders the localized status label for a [`RevisionRelation`](crate::upstream::RevisionRelation).
@@ -891,22 +896,38 @@ pub fn render_revision_status(
             format!("{commits} commits ahead")
         }
         (Locale::Russian, RevisionRelation::Ahead { commits }) => {
-            format!("на {commits} коммитов впереди")
+            format!("на {commits} {} впереди", russian_commit_word(commits))
         }
         (Locale::English, RevisionRelation::Behind { commits }) => {
             format!("{commits} commits behind")
         }
         (Locale::Russian, RevisionRelation::Behind { commits }) => {
-            format!("на {commits} коммитов позади")
+            format!("на {commits} {} позади", russian_commit_word(commits))
         }
         (Locale::English, RevisionRelation::Diverged { ahead, behind }) => {
             format!("+{ahead} / -{behind}")
         }
         (Locale::Russian, RevisionRelation::Diverged { ahead, behind }) => {
-            format!("+{ahead} / -{behind}")
+            format!(
+                "+{ahead} {} / -{behind} {}",
+                russian_commit_word(ahead),
+                russian_commit_word(behind)
+            )
         }
         (Locale::English, RevisionRelation::Unavailable) => "unavailable".to_owned(),
         (Locale::Russian, RevisionRelation::Unavailable) => "недоступно".to_owned(),
+    }
+}
+
+fn russian_commit_word(count: u64) -> &'static str {
+    let n = count % 100;
+    if (11..=14).contains(&n) {
+        return "коммитов";
+    }
+    match count % 10 {
+        1 => "коммит",
+        2..=4 => "коммита",
+        _ => "коммитов",
     }
 }
 
@@ -1921,7 +1942,7 @@ mod tests {
         );
         assert_eq!(
             render_revision_status(Locale::Russian, RevisionRelation::Ahead { commits: 3 }),
-            "на 3 коммитов впереди"
+            "на 3 коммита впереди"
         );
         assert_eq!(
             render_revision_status(Locale::English, RevisionRelation::Behind { commits: 5 }),
@@ -1931,6 +1952,23 @@ mod tests {
             render_revision_status(Locale::Russian, RevisionRelation::Behind { commits: 5 }),
             "на 5 коммитов позади"
         );
+        for (count, expected) in [
+            (1, "на 1 коммит впереди"),
+            (2, "на 2 коммита впереди"),
+            (4, "на 4 коммита впереди"),
+            (5, "на 5 коммитов впереди"),
+            (11, "на 11 коммитов впереди"),
+            (21, "на 21 коммит впереди"),
+            (22, "на 22 коммита впереди"),
+            (25, "на 25 коммитов впереди"),
+            (31, "на 31 коммит впереди"),
+            (32, "на 32 коммита впереди"),
+        ] {
+            assert_eq!(
+                render_revision_status(Locale::Russian, RevisionRelation::Ahead { commits: count }),
+                expected
+            );
+        }
         assert_eq!(
             render_revision_status(
                 Locale::English,
@@ -1949,7 +1987,7 @@ mod tests {
                     behind: 4
                 }
             ),
-            "+2 / -4"
+            "+2 коммита / -4 коммита"
         );
         assert_eq!(
             render_revision_status(Locale::English, RevisionRelation::Unavailable),

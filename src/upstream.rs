@@ -18,7 +18,7 @@ pub type VersionFuture<'a> =
 /// Raw result of one Tangled compare HTTP round trip: the response status
 /// plus the bounded body, read before any status interpretation because the
 /// error mapping needs the JSON payload of failed responses.
-type RawCompareResponse = Result<(u16, Vec<u8>), UpstreamError>;
+type RawCompareResponse = Result<(u16, Vec<u8>, Option<Duration>), UpstreamError>;
 
 type RawCompareFuture<'a> = Pin<Box<dyn Future<Output = RawCompareResponse> + Send + 'a>>;
 
@@ -162,7 +162,7 @@ impl std::fmt::Display for UpstreamError {
 }
 
 const UPSTREAM_INFO_REFS_URL: &str =
-    "https://tangled.org/zumuvik.tngl.sh/lavis/info/refs?service=git-upload-pack";
+    "https://knot1.tangled.sh/did:plc:xhzbac5le4gwflk4t6stjjgf/info/refs?service=git-upload-pack";
 const UPSTREAM_CARGO_TOML_URL: &str =
     "https://tangled.org/zumuvik.tngl.sh/lavis/raw/main/Cargo.toml";
 const TANGLED_COMPARE_URL: &str = "https://knot1.tangled.sh/xrpc/sh.tangled.repo.compare";
@@ -244,6 +244,18 @@ fn request_error(error: reqwest::Error) -> UpstreamError {
     }
 }
 
+fn retry_after_header(response: &reqwest::Response) -> Option<Duration> {
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_retry_after_value)
+}
+
+fn parse_retry_after_value(value: &str) -> Option<Duration> {
+    value.trim().parse::<u64>().ok().map(Duration::from_secs)
+}
+
 async fn read_bounded_body(
     mut response: reqwest::Response,
     max_bytes: usize,
@@ -315,6 +327,11 @@ impl UpstreamRev for HttpUpstreamRev {
                 .map_err(request_error)?;
             let status = response.status();
             if !status.is_success() {
+                if status.as_u16() == 429 {
+                    return Err(UpstreamError::RateLimited {
+                        retry_after: retry_after_header(&response),
+                    });
+                }
                 return Err(UpstreamError::HttpStatus(status.as_u16()));
             }
             let body = read_bounded_body(response, MAX_INFO_REFS_BODY_BYTES).await?;
@@ -331,6 +348,11 @@ impl UpstreamRev for HttpUpstreamRev {
                 .await
                 .map_err(request_error)?;
             if !response.status().is_success() {
+                if response.status().as_u16() == 429 {
+                    return Err(UpstreamError::RateLimited {
+                        retry_after: retry_after_header(&response),
+                    });
+                }
                 return Err(UpstreamError::HttpStatus(response.status().as_u16()));
             }
             let body = read_bounded_body(response, MAX_INFO_REFS_BODY_BYTES).await?;
@@ -404,8 +426,9 @@ impl RawCompareTransport for HttpUpstreamRev {
                 .await
                 .map_err(request_error)?;
             let status = response.status().as_u16();
+            let retry_after = retry_after_header(&response);
             let body = read_bounded_body(response, MAX_COMPARE_BODY_BYTES).await?;
-            Ok((status, body))
+            Ok((status, body, retry_after))
         })
     }
 }
@@ -435,9 +458,9 @@ async fn perform_compare<T: RawCompareTransport + ?Sized>(
     base: &str,
     head: &str,
 ) -> Result<CompareResult, UpstreamError> {
-    let (status, body) = transport.fetch_compare(base, head).await?;
+    let (status, body, retry_after) = transport.fetch_compare(base, head).await?;
     if !(200..300).contains(&status) {
-        return parse_tangled_error_response(status, &body, base, head);
+        return parse_tangled_error_response(status, &body, base, head, retry_after);
     }
     parse_tangled_compare_response(&body)
 }
@@ -516,6 +539,7 @@ fn parse_tangled_error_response(
     body: &[u8],
     rev1: &str,
     rev2: &str,
+    retry_after: Option<Duration>,
 ) -> Result<CompareResult, UpstreamError> {
     // Handle 429 rate limiting specially
     if status == 429 {
@@ -526,7 +550,7 @@ fn parse_tangled_error_response(
             rev2,
             "Tangled API rate limit exceeded"
         );
-        return Err(UpstreamError::RateLimited { retry_after: None });
+        return Err(UpstreamError::RateLimited { retry_after });
     }
 
     if let Ok(error_body) = serde_json::from_slice::<serde_json::Value>(body)
@@ -571,7 +595,7 @@ fn parse_tangled_error_response(
                     rev2,
                     "Tangled API rate limit exceeded"
                 );
-                return Err(UpstreamError::RateLimited { retry_after: None });
+                return Err(UpstreamError::RateLimited { retry_after });
             }
             _ => {
                 tracing::debug!(
@@ -603,8 +627,10 @@ mod tests {
     /// Records the exact ordered `(rev1, rev2)` pair of every request and
     /// serves a canned status/body per pair, so tests can distinguish which
     /// direction the client actually asked for.
+    type ScriptedResponse = (u16, Vec<u8>, Option<Duration>);
+
     struct ScriptedCompareTransport {
-        responses: HashMap<(String, String), (u16, Vec<u8>)>,
+        responses: HashMap<(String, String), ScriptedResponse>,
         requested: std::sync::Mutex<Vec<(String, String)>>,
     }
 
@@ -629,8 +655,10 @@ mod tests {
                 "merge_base": merge_base,
             })
             .to_string();
-            self.responses
-                .insert((rev1.to_owned(), rev2.to_owned()), (200, body.into_bytes()));
+            self.responses.insert(
+                (rev1.to_owned(), rev2.to_owned()),
+                (200, body.into_bytes(), None),
+            );
             self
         }
 
@@ -956,7 +984,7 @@ mod tests {
     #[test]
     fn parses_revision_not_found_error_with_from_revision() {
         let body = br#"{"error":"RevisionNotFound","message":"revision abc123 not found"}"#;
-        let result = parse_tangled_error_response(400, body, "abc123", "def456");
+        let result = parse_tangled_error_response(400, body, "abc123", "def456", None);
         assert_eq!(
             result,
             Err(UpstreamError::RevisionNotFound {
@@ -968,7 +996,7 @@ mod tests {
     #[test]
     fn parses_revision_not_found_error_defaults_to_to_revision() {
         let body = br#"{"error":"RevisionNotFound","message":"revision not found"}"#;
-        let result = parse_tangled_error_response(400, body, "abc123", "def456");
+        let result = parse_tangled_error_response(400, body, "abc123", "def456", None);
         assert_eq!(
             result,
             Err(UpstreamError::RevisionNotFound {
@@ -980,7 +1008,7 @@ mod tests {
     #[test]
     fn parses_revision_not_found_error_without_message() {
         let body = br#"{"error":"RevisionNotFound"}"#;
-        let result = parse_tangled_error_response(400, body, "abc123", "def456");
+        let result = parse_tangled_error_response(400, body, "abc123", "def456", None);
         assert_eq!(
             result,
             Err(UpstreamError::RevisionNotFound {
@@ -992,21 +1020,21 @@ mod tests {
     #[test]
     fn parses_repo_not_found_error() {
         let body = br#"{"error":"RepoNotFound","message":"repo does not exist"}"#;
-        let result = parse_tangled_error_response(400, body, "abc123", "def456");
+        let result = parse_tangled_error_response(400, body, "abc123", "def456", None);
         assert_eq!(result, Err(UpstreamError::RepoNotFound));
     }
 
     #[test]
     fn unrecognized_error_name_falls_back_to_http_status() {
         let body = br#"{"error":"SomeNewError","message":"something"}"#;
-        let result = parse_tangled_error_response(500, body, "abc123", "def456");
+        let result = parse_tangled_error_response(500, body, "abc123", "def456", None);
         assert_eq!(result, Err(UpstreamError::HttpStatus(500)));
     }
 
     #[test]
     fn non_json_error_body_falls_back_to_http_status() {
         let body = b"Internal Server Error";
-        let result = parse_tangled_error_response(500, body, "abc123", "def456");
+        let result = parse_tangled_error_response(500, body, "abc123", "def456", None);
         assert_eq!(result, Err(UpstreamError::HttpStatus(500)));
     }
 
@@ -1283,5 +1311,16 @@ mod tests {
             transport.requested_pairs(),
             vec![("B".to_owned(), "C".to_owned())]
         );
+    }
+
+    #[test]
+    fn retry_after_values_are_parsed_conservatively() {
+        assert_eq!(
+            parse_retry_after_value(" 17 "),
+            Some(Duration::from_secs(17))
+        );
+        assert_eq!(parse_retry_after_value(""), None);
+        assert_eq!(parse_retry_after_value("tomorrow"), None);
+        assert_eq!(parse_retry_after_value("-1"), None);
     }
 }

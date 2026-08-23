@@ -7,7 +7,6 @@ use grammers_client::{
 use grammers_session::types::{PeerAuth, PeerId, PeerKind, PeerRef};
 use std::{future::Future, time::Duration};
 use tokio::task::JoinSet;
-use tokio::time::MissedTickBehavior;
 
 use crate::{
     command::parse,
@@ -35,6 +34,64 @@ const UPDATE_STREAM_RETRY_MAX: Duration = Duration::from_secs(5);
 const UPDATE_STREAM_RESTART_AFTER: u32 = 12;
 const UPSTREAM_REFRESH_INTERVAL: Duration = Duration::from_secs(2 * 60 * 60);
 const UPSTREAM_REFRESH_DEADLINE: Duration = Duration::from_secs(5);
+const COLD_TRANSIENT_DELAYS: [Duration; 5] = [
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+    Duration::from_secs(120),
+    Duration::from_secs(300),
+];
+const RATE_LIMIT_DELAYS: [Duration; 5] = [
+    Duration::from_secs(60),
+    Duration::from_secs(120),
+    Duration::from_secs(300),
+    Duration::from_secs(900),
+    Duration::from_secs(1800),
+];
+
+fn upstream_retry_delay(
+    successful_snapshot: bool,
+    transient_attempt: usize,
+    rate_attempt: usize,
+    rate_after: Option<Duration>,
+    transient: bool,
+    jitter: Duration,
+    normal_cadence: Duration,
+) -> Duration {
+    let base = if rate_attempt > 0 {
+        let index = (rate_attempt - 1).min(4);
+        RATE_LIMIT_DELAYS[index]
+    } else if !successful_snapshot && transient {
+        let index = transient_attempt.min(4);
+        COLD_TRANSIENT_DELAYS[index]
+    } else {
+        return normal_cadence;
+    };
+    let local = base.saturating_add(jitter);
+    rate_after.map_or(local, |server| server.max(local))
+}
+
+const UPSTREAM_JITTER_MAX_MILLIS: u64 = 1000;
+
+fn upstream_retry_jitter() -> Duration {
+    let mut byte = [0_u8; 1];
+    if getrandom::fill(&mut byte).is_err() {
+        return Duration::ZERO;
+    }
+    Duration::from_millis((u64::from(byte[0]) * UPSTREAM_JITTER_MAX_MILLIS) / 256)
+}
+
+fn is_transient_refresh_failure(failure: &crate::runtime::UpstreamResolveFailure) -> bool {
+    match failure {
+        crate::runtime::UpstreamResolveFailure::MainRev(error) => matches!(
+            error,
+            crate::upstream::UpstreamError::Timeout
+                | crate::upstream::UpstreamError::Transport
+                | crate::upstream::UpstreamError::HttpStatus(500..=599)
+        ),
+        crate::runtime::UpstreamResolveFailure::RateLimited { .. } => false,
+    }
+}
 
 enum UpstreamRefresh {
     Success(crate::upstream::UpstreamRevision),
@@ -82,27 +139,39 @@ async fn upstream_refresh_task_with(
     interval_duration: Duration,
     deadline: Duration,
 ) {
-    let mut interval = upstream_refresh_interval(interval_duration);
-    interval.tick().await;
+    let mut successful_snapshot = false;
+    let mut transient_attempt = 0usize;
+    let mut rate_attempt = 0usize;
+    let mut next_delay = Duration::ZERO;
     loop {
+        if !next_delay.is_zero() {
+            tokio::time::sleep(next_delay).await;
+        }
         let started = tokio::time::Instant::now();
+        let cycle_deadline = started + deadline;
         tracing::info!(
             event = "upstream_refresh_started",
             "Refreshing upstream snapshot"
         );
-        let result = tokio::time::timeout(
-            deadline,
+        let result = tokio::time::timeout_at(
+            cycle_deadline,
             crate::runtime::resolve_upstream_revision(resolver.as_ref()),
         )
         .await;
         let elapsed_ms = started.elapsed().as_millis() as u64;
-        match result {
+        match &result {
             Ok(Ok(revision)) => {
+                successful_snapshot = true;
+                transient_attempt = 0;
+                rate_attempt = 0;
                 tracing::info!(event = "upstream_refresh_succeeded", elapsed_ms, main = %revision.revision, relation = ?revision.relation, "Upstream snapshot refreshed");
-                if sender.send(UpstreamRefresh::Success(revision)).is_err() {
+                if sender
+                    .send(UpstreamRefresh::Success(revision.clone()))
+                    .is_err()
+                {
                     return;
                 }
-                match tokio::time::timeout(deadline, resolver.version()).await {
+                match tokio::time::timeout_at(cycle_deadline, resolver.version()).await {
                     Ok(Ok(version)) => {
                         if sender.send(UpstreamRefresh::Version(version)).is_err() {
                             return;
@@ -133,7 +202,7 @@ async fn upstream_refresh_task_with(
                     return;
                 }
             }
-            Ok(Err(crate::runtime::UpstreamResolveFailure::RateLimited)) => {
+            Ok(Err(crate::runtime::UpstreamResolveFailure::RateLimited { .. })) => {
                 tracing::warn!(
                     event = "upstream_refresh_failed",
                     elapsed_ms,
@@ -162,7 +231,61 @@ async fn upstream_refresh_task_with(
                 }
             }
         }
-        interval.tick().await;
+        let rate_after = match &result {
+            Ok(Err(crate::runtime::UpstreamResolveFailure::RateLimited { retry_after })) => {
+                transient_attempt = 0;
+                rate_attempt = rate_attempt.saturating_add(1);
+                *retry_after
+            }
+            _ => None,
+        };
+        let transient = match &result {
+            Ok(Err(failure)) => is_transient_refresh_failure(failure),
+            Err(_) => true,
+            _ => false,
+        };
+        let rate_limited = matches!(
+            &result,
+            Ok(Err(
+                crate::runtime::UpstreamResolveFailure::RateLimited { .. }
+            ))
+        );
+        if transient {
+            rate_attempt = 0;
+        } else if !matches!(
+            &result,
+            Ok(Err(
+                crate::runtime::UpstreamResolveFailure::RateLimited { .. }
+            ))
+        ) && !matches!(&result, Ok(Ok(_)))
+        {
+            transient_attempt = 0;
+            rate_attempt = 0;
+        }
+        next_delay = upstream_retry_delay(
+            successful_snapshot,
+            if transient {
+                transient_attempt
+            } else {
+                COLD_TRANSIENT_DELAYS.len()
+            },
+            rate_attempt,
+            rate_after,
+            transient,
+            if transient || rate_limited {
+                upstream_retry_jitter()
+            } else {
+                Duration::ZERO
+            },
+            interval_duration,
+        );
+        if transient {
+            transient_attempt = transient_attempt.saturating_add(1);
+        }
+        if matches!(&result, Ok(Ok(_))) {
+            transient_attempt = 0;
+            rate_attempt = 0;
+        }
     }
 }
 
@@ -173,12 +296,6 @@ async fn receive_refresh(
         Some(receiver) => receiver.recv().await,
         None => std::future::pending().await,
     }
-}
-
-fn upstream_refresh_interval(duration: Duration) -> tokio::time::Interval {
-    let mut interval = tokio::time::interval(duration);
-    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    interval
 }
 
 struct EventDispatches {
@@ -1439,7 +1556,7 @@ mod tests {
         deliver_media_with_suppression, edit_definitely_rejected, is_self_authored,
         is_temporary_telegram_error, provision_completion_text, receive_refresh,
         register_reboot_completion_suppression, route, should_prepare_message_event,
-        update_stream_retry_delay, upstream_refresh_interval, upstream_refresh_task_with,
+        update_stream_retry_delay, upstream_refresh_task_with, upstream_retry_delay,
     };
     use crate::commands::{Action, ExternalInvocation, PrefixRequest};
     use crate::upstream::{CompareFuture, UpstreamRev, UpstreamRevFuture};
@@ -1488,6 +1605,138 @@ mod tests {
                 "connection closed",
             ))
         ));
+    }
+
+    #[test]
+    fn upstream_retry_schedule_is_capped_and_resets() {
+        let cadence = Duration::from_secs(7200);
+        assert_eq!(
+            upstream_retry_delay(false, 0, 0, None, true, Duration::ZERO, cadence),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            upstream_retry_delay(false, 1, 0, None, true, Duration::from_millis(137), cadence),
+            Duration::from_secs(30) + Duration::from_millis(137)
+        );
+        assert_eq!(
+            upstream_retry_delay(
+                false,
+                99,
+                0,
+                None,
+                true,
+                Duration::from_millis(548),
+                cadence
+            ),
+            Duration::from_secs(300) + Duration::from_millis(4 * 137)
+        );
+        assert_eq!(
+            upstream_retry_delay(true, 4, 0, None, true, Duration::from_secs(99), cadence),
+            cadence
+        );
+    }
+
+    #[test]
+    fn explicit_retry_after_is_never_shortened() {
+        let minimum = Duration::from_secs(17);
+        assert_eq!(
+            upstream_retry_delay(
+                false,
+                0,
+                1,
+                Some(minimum),
+                true,
+                Duration::from_millis(79),
+                Duration::ZERO
+            ),
+            Duration::from_secs(60) + Duration::from_millis(79)
+        );
+        assert_eq!(
+            upstream_retry_delay(
+                true,
+                0,
+                5,
+                Some(Duration::from_secs(600)),
+                true,
+                Duration::from_millis(395),
+                Duration::ZERO
+            ),
+            Duration::from_secs(1800) + Duration::from_millis(395)
+        );
+        assert_eq!(
+            upstream_retry_delay(
+                true,
+                0,
+                1,
+                None,
+                true,
+                Duration::from_millis(79),
+                Duration::from_secs(7200)
+            ),
+            Duration::from_secs(60) + Duration::from_millis(79)
+        );
+    }
+
+    #[test]
+    fn refresh_backoff_sequences_are_deterministic_without_tight_loops() {
+        let cadence = Duration::from_secs(2 * 60 * 60);
+        assert_ne!(
+            upstream_retry_delay(false, 0, 0, None, true, Duration::ZERO, cadence),
+            upstream_retry_delay(false, 0, 0, None, true, Duration::from_millis(250), cadence)
+        );
+        let transient = [0, 1, 2, 3, 4].map(|attempt| {
+            upstream_retry_delay(false, attempt, 0, None, true, Duration::ZERO, cadence)
+        });
+        assert_eq!(transient[0], Duration::from_secs(15));
+        assert!(transient.windows(2).all(|pair| pair[1] > pair[0]));
+        assert_eq!(transient[4], Duration::from_secs(300));
+
+        // A successful snapshot returns to the normal cadence and clears either
+        // kind of accumulated retry state.
+        assert_eq!(
+            upstream_retry_delay(true, 0, 0, None, false, Duration::from_secs(99), cadence),
+            cadence
+        );
+        assert_eq!(
+            upstream_retry_delay(true, 0, 0, None, true, Duration::from_secs(99), cadence),
+            cadence
+        );
+        assert_eq!(
+            upstream_retry_delay(true, 0, 0, None, false, Duration::from_secs(99), cadence),
+            cadence
+        );
+
+        let repeated_rate_limits = (1..=5)
+            .map(|attempt| {
+                upstream_retry_delay(true, 0, attempt, None, false, Duration::ZERO, cadence)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            repeated_rate_limits
+                .iter()
+                .all(|delay| *delay >= Duration::from_secs(60))
+        );
+        assert!(
+            repeated_rate_limits
+                .windows(2)
+                .all(|pair| pair[1] > pair[0])
+        );
+        assert_eq!(
+            upstream_retry_delay(true, 0, 5, None, false, Duration::from_millis(395), cadence),
+            Duration::from_secs(1800) + Duration::from_millis(395)
+        );
+        assert_eq!(
+            upstream_retry_delay(
+                true,
+                0,
+                1,
+                Some(Duration::from_secs(10)),
+                false,
+                Duration::from_millis(79),
+                cadence
+            ),
+            Duration::from_secs(60) + Duration::from_millis(79)
+        );
     }
 
     #[tokio::test]
@@ -2467,14 +2716,5 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-    }
-
-    #[tokio::test]
-    async fn refresh_interval_skips_missed_ticks() {
-        let interval = upstream_refresh_interval(Duration::from_millis(1));
-        assert_eq!(
-            interval.missed_tick_behavior(),
-            tokio::time::MissedTickBehavior::Skip
-        );
     }
 }

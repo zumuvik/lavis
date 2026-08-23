@@ -74,6 +74,7 @@ pub struct RuntimeState {
     self_identity: Option<SelfIdentity>,
     upstream: Option<Box<dyn UpstreamRev>>,
     upstream_revision_cache: UpstreamSnapshot,
+    upstream_version_known: bool,
     info_local_metadata: InfoLocalMetadata,
     external_manager: Option<ExternalManagerHandle>,
     external_snapshot: ExternalRuntimeSnapshot,
@@ -128,7 +129,7 @@ pub(crate) enum UpstreamResolveFailure {
     /// The `info/refs` lookup for upstream `main` itself failed.
     MainRev(crate::upstream::UpstreamError),
     /// Tangled answered with a rate limit.
-    RateLimited,
+    RateLimited { retry_after: Option<Duration> },
 }
 
 /// Resolves the upstream `main` revision together with the current build's
@@ -149,10 +150,12 @@ async fn resolve_upstream_relation_for(
     upstream: &dyn UpstreamRev,
     current_rev: &str,
 ) -> Result<UpstreamRevision, UpstreamResolveFailure> {
-    let main_rev = upstream
-        .main_rev()
-        .await
-        .map_err(UpstreamResolveFailure::MainRev)?;
+    let main_rev = upstream.main_rev().await.map_err(|error| match error {
+        crate::upstream::UpstreamError::RateLimited { retry_after } => {
+            UpstreamResolveFailure::RateLimited { retry_after }
+        }
+        error => UpstreamResolveFailure::MainRev(error),
+    })?;
     let relation = if current_rev == "unknown" {
         RevisionRelation::Unavailable
     } else if current_rev == main_rev {
@@ -168,8 +171,8 @@ async fn resolve_upstream_relation_for(
                     version: None,
                 });
             }
-            Err(crate::upstream::UpstreamError::RateLimited { .. }) => {
-                return Err(UpstreamResolveFailure::RateLimited);
+            Err(crate::upstream::UpstreamError::RateLimited { retry_after }) => {
+                return Err(UpstreamResolveFailure::RateLimited { retry_after });
             }
             Err(error) => {
                 tracing::warn!(
@@ -197,6 +200,9 @@ async fn resolve_upstream_relation_for(
                     first_compare,
                     reverse_compare,
                 ),
+                Err(crate::upstream::UpstreamError::RateLimited { retry_after }) => {
+                    return Err(UpstreamResolveFailure::RateLimited { retry_after });
+                }
                 Err(error) => {
                     tracing::warn!(
                         event = "upstream_compare_failed",
@@ -414,6 +420,7 @@ impl RuntimeState {
             self_identity: None,
             upstream: None,
             upstream_revision_cache: UpstreamSnapshot::Never,
+            upstream_version_known: false,
             info_local_metadata: InfoLocalMetadata {
                 host: info::deployment_label(std::env::var("LAVIS_HOST").ok().as_deref()),
                 os: info::read_os_release_pretty_name()
@@ -631,13 +638,30 @@ impl RuntimeState {
 
     pub(crate) fn publish_upstream_revision(&mut self, revision: Option<UpstreamRevision>) {
         if let Some(revision) = revision {
+            if revision.version.is_some() {
+                self.upstream_version_known = true;
+            }
+            let version = match &self.upstream_revision_cache {
+                UpstreamSnapshot::Success(previous)
+                | UpstreamSnapshot::LastFailure {
+                    stale: Some(previous),
+                    ..
+                } => revision
+                    .version
+                    .clone()
+                    .or_else(|| previous.version.clone()),
+                _ => revision.version.clone(),
+            };
+            let mut revision = revision;
+            revision.version = version;
             self.upstream_revision_cache = UpstreamSnapshot::Success(revision);
         }
     }
 
     pub(crate) fn publish_upstream_version(&mut self, version: Option<String>) {
+        self.upstream_version_known = true;
         match &mut self.upstream_revision_cache {
-            UpstreamSnapshot::Success(revision) => revision.version = version,
+            UpstreamSnapshot::Success(revision) => revision.version = version.clone(),
             UpstreamSnapshot::LastFailure { stale, .. } => {
                 if let Some(revision) = stale {
                     revision.version = version;
@@ -1104,27 +1128,31 @@ impl RuntimeState {
             .as_ref()
             .map(|data| render_revision_status(locale, data.relation))
             .unwrap_or_else(|| info_text(locale, InfoText::Unavailable).to_owned());
-        let version_status = match version_relation(
-            env!("CARGO_PKG_VERSION"),
-            upstream_data
-                .as_ref()
-                .and_then(|data| data.version.as_deref()),
-        ) {
-            VersionRelation::Current => match locale {
-                Locale::English => "current ✅".to_owned(),
-                Locale::Russian => "актуальная ✅".to_owned(),
-            },
-            VersionRelation::NewerAvailable => {
-                let upstream_version = upstream_data
+        let version_status = if !self.upstream_version_known {
+            String::new()
+        } else {
+            match version_relation(
+                env!("CARGO_PKG_VERSION"),
+                upstream_data
                     .as_ref()
-                    .and_then(|data| data.version.as_deref())
-                    .unwrap_or_default();
-                match locale {
-                    Locale::English => format!("newer available: {upstream_version} ⬆️"),
-                    Locale::Russian => format!("доступна новая: {upstream_version} ⬆️"),
+                    .and_then(|data| data.version.as_deref()),
+            ) {
+                VersionRelation::Current => match locale {
+                    Locale::English => "current ✅".to_owned(),
+                    Locale::Russian => "актуальная ✅".to_owned(),
+                },
+                VersionRelation::NewerAvailable => {
+                    let upstream_version = upstream_data
+                        .as_ref()
+                        .and_then(|data| data.version.as_deref())
+                        .unwrap_or_default();
+                    match locale {
+                        Locale::English => format!("newer available: {upstream_version} ⬆️"),
+                        Locale::Russian => format!("доступна новая: {upstream_version} ⬆️"),
+                    }
                 }
+                VersionRelation::Unavailable => String::new(),
             }
-            VersionRelation::Unavailable => info_text(locale, InfoText::Unavailable).to_owned(),
         };
         let built_in_modules = crate::modules::modules().len();
         let total_modules = built_in_modules + self.external_descriptors().len();
@@ -4746,6 +4774,8 @@ for line in sys.stdin:
                 .text
                 .contains("Upstream main: unavailable")
         );
+        assert!(execution.response.text.contains("Version: 0.1.0"));
+        assert!(!execution.response.text.contains("Version: 0.1.0 ("));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(execution.media.is_some());
         fs::remove_dir_all(directory).ok();
@@ -4809,6 +4839,38 @@ for line in sys.stdin:
             &runtime.upstream_revision_cache,
             UpstreamSnapshot::Success(_)
         ));
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[tokio::test]
+    async fn version_failure_retains_revision_but_successful_none_clears_version() {
+        let (mut runtime, directory) = runtime_with_alias().await;
+        runtime
+            .settings
+            .set_locale(Some(crate::i18n::Locale::English))
+            .await
+            .unwrap();
+        runtime.publish_upstream_revision(Some(crate::upstream::UpstreamRevision {
+            revision: "b1d18f8ef407d043506c983b0d68e96c282eb1c9".to_owned(),
+            relation: crate::upstream::RevisionRelation::Ahead { commits: 2 },
+            version: Some("0.2.0".to_owned()),
+        }));
+        runtime.publish_upstream_failure("rate_limited");
+
+        // A failed version lookup publishes nothing: the stale relation and
+        // successful version remain available to the local info command.
+        let retained = runtime.execute_info();
+        assert!(retained.response.text.contains("Upstream main: b1d18f8"));
+        assert!(retained.response.text.contains("Version: 0.1.0"));
+        assert!(retained.response.text.contains("newer available: 0.2.0 ⬆️"));
+
+        // An actual successful lookup with no package version is different from
+        // a failure and clears the previously known version.
+        runtime.publish_upstream_version(None);
+        let cleared = runtime.execute_info();
+        assert!(cleared.response.text.contains("Upstream main: b1d18f8"));
+        assert!(cleared.response.text.contains("Version: 0.1.0"));
+        assert!(!cleared.response.text.contains("Version: 0.1.0 ("));
         fs::remove_dir_all(directory).ok();
     }
 
@@ -5064,7 +5126,7 @@ for line in sys.stdin:
 
         assert!(matches!(
             resolve_upstream_relation_for(&upstream, "local").await,
-            Err(UpstreamResolveFailure::RateLimited)
+            Err(UpstreamResolveFailure::RateLimited { retry_after: None })
         ));
     }
 
