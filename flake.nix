@@ -23,7 +23,7 @@
             rustInput =
               relative == ""
               || builtins.elem relative [ "Cargo.toml" "Cargo.lock" "build.rs" ]
-              || builtins.elem topLevel [ ".cargo" "src" "tests" "examples" "benches" "tools" ];
+              || builtins.elem topLevel [ ".cargo" "src" "tests" "examples" "benches" "tools" "protocol" ];
           in
           pkgs.lib.cleanSourceFilter path type && rustInput;
       };
