@@ -1,19 +1,30 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Identity of the authenticated Telegram account, captured once at
+/// authorization time so `info` never needs a per-invocation RPC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfIdentity {
+    pub username: Option<String>,
+    pub display_name: Option<String>,
+    pub id: PeerId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthorizationOutcome {
-    JustCompleted { self_user_id: PeerId },
-    ExistingSession { self_user_id: PeerId },
+    JustCompleted { identity: SelfIdentity },
+    ExistingSession { identity: SelfIdentity },
 }
 
 impl AuthorizationOutcome {
-    pub fn is_just_completed(self) -> bool {
+    pub fn is_just_completed(&self) -> bool {
         matches!(self, Self::JustCompleted { .. })
     }
 
-    pub fn self_user_id(self) -> PeerId {
+    pub fn self_user_id(&self) -> PeerId {
+        self.identity().id
+    }
+
+    pub fn identity(&self) -> &SelfIdentity {
         match self {
-            Self::JustCompleted { self_user_id } | Self::ExistingSession { self_user_id } => {
-                self_user_id
-            }
+            Self::JustCompleted { identity } | Self::ExistingSession { identity } => identity,
         }
     }
 }
@@ -95,14 +106,18 @@ pub async fn authorize(
         .await
         .map_err(|_| AuthError::GetAuthorizedUser)?;
     log_authorized_user(&user);
+    let identity = SelfIdentity {
+        username: user
+            .username()
+            .filter(|username| !username.is_empty())
+            .map(ToOwned::to_owned),
+        display_name: display_name(&user),
+        id: user.id(),
+    };
     let outcome = if just_completed {
-        AuthorizationOutcome::JustCompleted {
-            self_user_id: user.id(),
-        }
+        AuthorizationOutcome::JustCompleted { identity }
     } else {
-        AuthorizationOutcome::ExistingSession {
-            self_user_id: user.id(),
-        }
+        AuthorizationOutcome::ExistingSession { identity }
     };
     Ok(outcome)
 }
@@ -409,35 +424,64 @@ mod tests {
 
     #[test]
     fn just_completed_causes_is_just_completed_true() {
-        use super::AuthorizationOutcome;
+        use super::{AuthorizationOutcome, SelfIdentity};
         use grammers_session::types::PeerId;
         let outcome = AuthorizationOutcome::JustCompleted {
-            self_user_id: PeerId::self_user(),
+            identity: SelfIdentity {
+                username: None,
+                display_name: None,
+                id: PeerId::self_user(),
+            },
         };
         assert!(outcome.is_just_completed());
     }
 
     #[test]
     fn existing_session_causes_is_just_completed_false() {
-        use super::AuthorizationOutcome;
+        use super::{AuthorizationOutcome, SelfIdentity};
         use grammers_session::types::PeerId;
         let outcome = AuthorizationOutcome::ExistingSession {
-            self_user_id: PeerId::self_user(),
+            identity: SelfIdentity {
+                username: None,
+                display_name: None,
+                id: PeerId::self_user(),
+            },
         };
         assert!(!outcome.is_just_completed());
     }
 
     #[test]
     fn both_outcomes_provide_self_user_id() {
-        use super::AuthorizationOutcome;
+        use super::{AuthorizationOutcome, SelfIdentity};
         use grammers_session::types::PeerId;
+        let identity = SelfIdentity {
+            username: None,
+            display_name: None,
+            id: PeerId::self_user(),
+        };
         let just = AuthorizationOutcome::JustCompleted {
-            self_user_id: PeerId::self_user(),
+            identity: identity.clone(),
         };
-        let existing = AuthorizationOutcome::ExistingSession {
-            self_user_id: PeerId::self_user(),
-        };
+        let existing = AuthorizationOutcome::ExistingSession { identity };
         assert_eq!(just.self_user_id(), PeerId::self_user());
         assert_eq!(existing.self_user_id(), PeerId::self_user());
+    }
+
+    #[test]
+    fn outcome_exposes_identity_fields() {
+        use super::{AuthorizationOutcome, SelfIdentity};
+        use grammers_session::types::PeerId;
+        let outcome = AuthorizationOutcome::ExistingSession {
+            identity: SelfIdentity {
+                username: Some("@owner".into()),
+                display_name: Some("First Last".into()),
+                id: PeerId::self_user(),
+            },
+        };
+        assert_eq!(outcome.identity().username.as_deref(), Some("@owner"));
+        assert_eq!(
+            outcome.identity().display_name.as_deref(),
+            Some("First Last")
+        );
     }
 }

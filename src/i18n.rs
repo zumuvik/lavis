@@ -791,6 +791,146 @@ pub fn render_stats_text(
         .replace("{version}", version)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InfoText {
+    Caption,
+    Unknown,
+    Unavailable,
+}
+
+pub fn info_text(locale: Locale, key: InfoText) -> &'static str {
+    match (locale, key) {
+        (Locale::English, InfoText::Caption) => {
+            "ℹ️ Lavis — really your userbot\n\n┌Owner: {owner}\n└Version: {version} ({version_status})\n\n┌Current commit: {commit}\n├Upstream main: {upstream}\n└Status: {upstream_status}\n\n┌Prefix: {prefix}\n└Modules: {total} ({active} active)\n\n┌Host: {host}\n└OS: {os}"
+        }
+        (Locale::Russian, InfoText::Caption) => {
+            "ℹ️ Lavis — really your userbot\n\n┌Владелец: {owner}\n└Версия: {version} ({version_status})\n\n┌Текущий коммит: {commit}\n├Основная ветка: {upstream}\n└Статус: {upstream_status}\n\n┌Префикс: {prefix}\n└Модули: {total} ({active} активных)\n\n┌Хост: {host}\n└ОС: {os}"
+        }
+        (Locale::English, InfoText::Unknown) => "unknown",
+        (Locale::Russian, InfoText::Unknown) => "неизвестно",
+        (Locale::English, InfoText::Unavailable) => "unavailable",
+        (Locale::Russian, InfoText::Unavailable) => "недоступно",
+    }
+}
+
+pub struct InfoCaptionData<'a> {
+    pub owner: &'a str,
+    pub version: &'a str,
+    pub version_status: &'a str,
+    pub commit: &'a str,
+    pub upstream: &'a str,
+    pub upstream_status: &'a str,
+    pub prefix: &'a str,
+    pub active_modules: usize,
+    pub total_modules: usize,
+    pub host: &'a str,
+    pub os: &'a str,
+}
+
+/// Replaces `{placeholder}` tokens in a single pass: substituted values are
+/// never rescanned, so user-controlled text that itself contains
+/// `{version}`-shaped content stays literal instead of being expanded by a
+/// later replacement.
+fn interpolate(template: &str, placeholders: &[(&str, &str)]) -> String {
+    let mut output = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        output.push_str(&rest[..open]);
+        let tail = &rest[open..];
+        match tail.find('}') {
+            Some(close) => {
+                let token = &tail[..=close];
+                match placeholders.iter().find(|(key, _)| *key == token) {
+                    Some((_, value)) => output.push_str(value),
+                    None => output.push_str(token),
+                }
+                rest = &tail[close + 1..];
+            }
+            // Unterminated `{`: keep it verbatim and stop scanning.
+            None => {
+                output.push_str(tail);
+                return output;
+            }
+        }
+    }
+    output.push_str(rest);
+    output
+}
+
+pub fn render_info_text(locale: Locale, info: InfoCaptionData<'_>) -> String {
+    let active_modules = info.active_modules.to_string();
+    let total_modules = info.total_modules.to_string();
+    let rendered = interpolate(
+        info_text(locale, InfoText::Caption),
+        &[
+            ("{owner}", info.owner),
+            ("{version}", info.version),
+            ("{version_status}", info.version_status),
+            ("{commit}", info.commit),
+            ("{upstream}", info.upstream),
+            ("{upstream_status}", info.upstream_status),
+            ("{prefix}", info.prefix),
+            ("{active}", &active_modules),
+            ("{total}", &total_modules),
+            ("{host}", info.host),
+            ("{os}", info.os),
+        ],
+    );
+    if info.version_status.is_empty() {
+        rendered.replace(" ()", "")
+    } else {
+        rendered
+    }
+}
+
+/// Renders the localized status label for a [`RevisionRelation`](crate::upstream::RevisionRelation).
+pub fn render_revision_status(
+    locale: Locale,
+    relation: crate::upstream::RevisionRelation,
+) -> String {
+    use crate::upstream::RevisionRelation;
+    match (locale, relation) {
+        (Locale::English, RevisionRelation::Current) => "current ✓".to_owned(),
+        (Locale::Russian, RevisionRelation::Current) => "актуален ✓".to_owned(),
+        (Locale::English, RevisionRelation::Ahead { commits }) => {
+            format!("{commits} commits ahead")
+        }
+        (Locale::Russian, RevisionRelation::Ahead { commits }) => {
+            format!("на {commits} {} впереди", russian_commit_word(commits))
+        }
+        (Locale::English, RevisionRelation::Behind { commits }) => {
+            format!("{commits} commits behind")
+        }
+        (Locale::Russian, RevisionRelation::Behind { commits }) => {
+            format!("на {commits} {} позади", russian_commit_word(commits))
+        }
+        (Locale::English, RevisionRelation::Diverged { ahead, behind }) => {
+            format!("+{ahead} / -{behind}")
+        }
+        (Locale::Russian, RevisionRelation::Diverged { ahead, behind }) => {
+            format!(
+                "+{ahead} {} / -{behind} {}",
+                russian_commit_word(ahead),
+                russian_commit_word(behind)
+            )
+        }
+        (Locale::English, RevisionRelation::Unavailable) => "unavailable".to_owned(),
+        (Locale::Russian, RevisionRelation::Unavailable) => "недоступно".to_owned(),
+    }
+}
+
+fn russian_commit_word(count: u64) -> &'static str {
+    let n = count % 100;
+    if (11..=14).contains(&n) {
+        return "коммитов";
+    }
+    match count % 10 {
+        1 => "коммит",
+        2..=4 => "коммита",
+        _ => "коммитов",
+    }
+}
+
 /// Lavis-owned framing for an external command result. Module-provided text is
 /// deliberately not catalogued or translated.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1476,9 +1616,10 @@ pub fn bilingual(key: Text, prefix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExternalCommandText, LmInstallPlanText, LmText, Locale, RebootText, Text,
-        external_command_text, lm_format, lm_runtime_status, lm_text, reboot_text,
-        render_lm_install_plan, text,
+        ExternalCommandText, InfoCaptionData, InfoText, LmInstallPlanText, LmText, Locale,
+        RebootText, Text, external_command_text, info_text, interpolate, lm_format,
+        lm_runtime_status, lm_text, reboot_text, render_info_text, render_lm_install_plan,
+        render_revision_status, text,
     };
     use crate::external_modules::manager::ExternalModuleRuntimeStatus;
 
@@ -1671,6 +1812,190 @@ mod tests {
                 ExternalModuleRuntimeStatus::InstalledDisabled
             ),
             "установлен, выключен"
+        );
+    }
+
+    #[test]
+    fn info_caption_is_localized_without_hardcoded_counts() {
+        let english = render_info_text(
+            Locale::English,
+            InfoCaptionData {
+                owner: "@owner",
+                version: "1.0.0",
+                version_status: "current",
+                commit: "b1d18f8",
+                upstream: "unavailable",
+                upstream_status: "unavailable",
+                prefix: ",",
+                active_modules: 3,
+                total_modules: 5,
+                host: "standalone",
+                os: "NixOS 25.05",
+            },
+        );
+        assert!(english.contains("┌Owner: @owner"));
+        assert!(english.contains("└Version: 1.0.0"));
+        assert!(english.contains("┌Current commit: b1d18f8"));
+        assert!(english.contains("├Upstream main: unavailable"));
+        assert!(english.contains("└Status: unavailable"));
+        assert!(english.contains("┌Prefix: ,"));
+        assert!(english.contains("└Modules: 5 (3 active)"));
+        assert!(english.contains("┌Host: standalone"));
+        assert!(english.contains("└OS: NixOS 25.05"));
+        assert!(!contains_cyrillic(&english));
+
+        let russian = render_info_text(
+            Locale::Russian,
+            InfoCaptionData {
+                owner: "@owner",
+                version: "1.0.0",
+                version_status: "актуальная ✅",
+                commit: "d2b0433",
+                upstream: "b1d18f8",
+                upstream_status: "актуален ✓",
+                prefix: ",",
+                active_modules: 3,
+                total_modules: 5,
+                host: "standalone",
+                os: "NixOS 25.05",
+            },
+        );
+        assert_eq!(
+            russian,
+            "ℹ️ Lavis — really your userbot\n\n┌Владелец: @owner\n└Версия: 1.0.0 (актуальная ✅)\n\n┌Текущий коммит: d2b0433\n├Основная ветка: b1d18f8\n└Статус: актуален ✓\n\n┌Префикс: ,\n└Модули: 5 (3 активных)\n\n┌Хост: standalone\n└ОС: NixOS 25.05"
+        );
+    }
+
+    #[test]
+    fn info_unavailable_string_is_localized() {
+        assert_eq!(
+            info_text(Locale::English, InfoText::Unavailable),
+            "unavailable"
+        );
+        assert_eq!(
+            info_text(Locale::Russian, InfoText::Unavailable),
+            "недоступно"
+        );
+    }
+
+    /// Regression coverage for multi-pass interpolation: a Telegram display
+    /// name shaped like `{version}` used to be expanded into the Lavis
+    /// version by the subsequent `.replace()` chain. Single-pass rendering
+    /// must keep it literal.
+    #[test]
+    fn placeholder_shaped_owner_and_os_stay_literal() {
+        let rendered = render_info_text(
+            Locale::English,
+            InfoCaptionData {
+                owner: "{version}",
+                version: "1.0.0",
+                version_status: "current",
+                commit: "b1d18f8",
+                upstream: "b1d18f8",
+                upstream_status: "current",
+                prefix: ",",
+                active_modules: 1,
+                total_modules: 2,
+                host: "standalone",
+                os: "{owner} on {host}",
+            },
+        );
+
+        assert!(rendered.contains("Owner: {version}"));
+        assert!(!rendered.contains("Version: {version}"));
+        assert_eq!(rendered.matches("1.0.0").count(), 1);
+        // Values substituted earlier must not re-enter later placeholders.
+        assert!(rendered.contains("OS: {owner} on {host}"));
+        assert!(!rendered.contains("Owner: Owner:"));
+        assert_eq!(rendered.matches("{version}").count(), 1);
+    }
+
+    #[test]
+    fn interpolate_preserves_unknown_and_unterminated_tokens() {
+        assert_eq!(interpolate("no tokens", &[]), "no tokens");
+        assert_eq!(
+            interpolate("{known} and {unknown}", &[("{known}", "ok")]),
+            "ok and {unknown}"
+        );
+        assert_eq!(
+            interpolate("dangling {brace", &[("{brace", "nope")]),
+            "dangling {brace"
+        );
+        assert_eq!(interpolate("empty {}", &[]), "empty {}");
+    }
+
+    #[test]
+    fn revision_status_labels_are_localized() {
+        use crate::upstream::RevisionRelation;
+
+        assert_eq!(
+            render_revision_status(Locale::English, RevisionRelation::Current),
+            "current ✓"
+        );
+        assert_eq!(
+            render_revision_status(Locale::Russian, RevisionRelation::Current),
+            "актуален ✓"
+        );
+        assert_eq!(
+            render_revision_status(Locale::English, RevisionRelation::Ahead { commits: 3 }),
+            "3 commits ahead"
+        );
+        assert_eq!(
+            render_revision_status(Locale::Russian, RevisionRelation::Ahead { commits: 3 }),
+            "на 3 коммита впереди"
+        );
+        assert_eq!(
+            render_revision_status(Locale::English, RevisionRelation::Behind { commits: 5 }),
+            "5 commits behind"
+        );
+        assert_eq!(
+            render_revision_status(Locale::Russian, RevisionRelation::Behind { commits: 5 }),
+            "на 5 коммитов позади"
+        );
+        for (count, expected) in [
+            (1, "на 1 коммит впереди"),
+            (2, "на 2 коммита впереди"),
+            (4, "на 4 коммита впереди"),
+            (5, "на 5 коммитов впереди"),
+            (11, "на 11 коммитов впереди"),
+            (21, "на 21 коммит впереди"),
+            (22, "на 22 коммита впереди"),
+            (25, "на 25 коммитов впереди"),
+            (31, "на 31 коммит впереди"),
+            (32, "на 32 коммита впереди"),
+        ] {
+            assert_eq!(
+                render_revision_status(Locale::Russian, RevisionRelation::Ahead { commits: count }),
+                expected
+            );
+        }
+        assert_eq!(
+            render_revision_status(
+                Locale::English,
+                RevisionRelation::Diverged {
+                    ahead: 2,
+                    behind: 4
+                }
+            ),
+            "+2 / -4"
+        );
+        assert_eq!(
+            render_revision_status(
+                Locale::Russian,
+                RevisionRelation::Diverged {
+                    ahead: 2,
+                    behind: 4
+                }
+            ),
+            "+2 коммита / -4 коммита"
+        );
+        assert_eq!(
+            render_revision_status(Locale::English, RevisionRelation::Unavailable),
+            "unavailable"
+        );
+        assert_eq!(
+            render_revision_status(Locale::Russian, RevisionRelation::Unavailable),
+            "недоступно"
         );
     }
 }

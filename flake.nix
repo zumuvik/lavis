@@ -9,18 +9,33 @@
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
       extensionLib = import ./nix/lib/extensions.nix { inherit pkgs; };
-      package = pkgs.rustPlatform.buildRustPackage {
+      rustSourceRoot = toString self.outPath;
+      rustSource = pkgs.lib.cleanSourceWith {
+        name = "lavis-rust-source";
+        src = self;
+        filter =
+          path: type:
+          let
+            relative = pkgs.lib.removePrefix "/" (
+              pkgs.lib.removePrefix rustSourceRoot (toString path)
+            );
+            topLevel = builtins.head (pkgs.lib.splitString "/" relative);
+            rustInput =
+              relative == ""
+              || builtins.elem relative [ "Cargo.toml" "Cargo.lock" "build.rs" ]
+              || builtins.elem topLevel [ ".cargo" "src" "tests" "examples" "benches" "tools" "protocol" ];
+          in
+          pkgs.lib.cleanSourceFilter path type && rustInput;
+      };
+      corePackage = pkgs.rustPlatform.buildRustPackage {
         pname = "lavis";
-        version = "0.1.0";
-        src = pkgs.lib.cleanSourceWith {
-          src = self;
-          filter =
-            path: type:
-            pkgs.lib.cleanSourceFilter path type
-            && builtins.baseNameOf path != "result"
-            && builtins.baseNameOf path != "target";
-        };
+        version = "1.0.0";
+        src = rustSource;
         cargoLock.lockFile = ./Cargo.lock;
+        preCheck = ''
+          export XDG_STATE_HOME="$TMPDIR/lavis-test-state"
+          install -d -m 700 "$XDG_STATE_HOME"
+        '';
         nativeBuildInputs = [
           pkgs.makeWrapper
           pkgs.python3 # JSON-line external-process fixtures (test-only)
@@ -28,7 +43,8 @@
         ];
         postFixup = ''
           wrapProgram $out/bin/lavis \
-            --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.fastfetch ]}
+            --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.fastfetch ]} \
+            --set-default LAVIS_HOST nix-package
         '';
         meta = {
           description = "Personal Telegram userbot written in Rust";
@@ -37,6 +53,19 @@
           mainProgram = "lavis";
           platforms = pkgs.lib.platforms.linux;
         };
+      };
+      # Keep the Git revision in a cheap outer wrapper instead of the Rust
+      # derivation. Documentation/Nix/module-only commits can then reuse the
+      # already compiled core package while `,info` still reports the real HEAD.
+      package = pkgs.symlinkJoin {
+        name = "lavis-${corePackage.version}";
+        paths = [ corePackage ];
+        nativeBuildInputs = [ pkgs.makeWrapper ];
+        postBuild = ''
+          wrapProgram "$out/bin/lavis" \
+            --set LAVIS_GIT_REV ${pkgs.lib.escapeShellArg (self.rev or "dirty")}
+        '';
+        meta = corePackage.meta;
       };
       gafExtension = pkgs.stdenvNoCC.mkDerivation {
         pname = "lavis-extension-gaf";
@@ -354,10 +383,19 @@ PY
         default = package;
         lavis-extension-gaf = gafExtension;
       };
-      apps.${system}.default = {
-        type = "app";
-        program = "${package}/bin/lavis";
-      };
+      # Separate wrapper for `nix run` so it reports "Host: nix run" without
+      # affecting the base package used by NixOS module or systemPackages.
+      apps.${system}.default =
+        let
+          nixRunWrapper = pkgs.writeShellScriptBin "lavis" ''
+            export LAVIS_HOST="nix-run"
+            exec ${package}/bin/lavis "$@"
+          '';
+        in
+        {
+          type = "app";
+          program = "${nixRunWrapper}/bin/lavis";
+        };
       nixosModules.default = import ./nix/modules/lavis.nix { inherit self; };
       devShells.${system}.default = pkgs.mkShell {
         packages = with pkgs; [

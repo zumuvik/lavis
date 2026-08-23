@@ -11,6 +11,7 @@ use grammers_session::types::PeerId;
 
 use crate::{
     aliases::{Alias, AliasStore, DeleteResult},
+    auth::SelfIdentity,
     bot_api::{BotApi, HttpBotApi},
     command::Command,
     commands::{
@@ -34,7 +35,7 @@ use crate::{
     },
     external_modules::{
         control,
-        manager::{ExternalManagerHandle, ExternalRuntimeSnapshot},
+        manager::{ExternalManagerHandle, ExternalModuleRuntimeStatus, ExternalRuntimeSnapshot},
         state::ExternalStateStore,
     },
     fastfetch::{self, FastfetchInputError, FastfetchProfileError, FastfetchResult},
@@ -43,20 +44,25 @@ use crate::{
         render_with_external_locale,
     },
     i18n::{
-        AliasText, ExternalCommandText, FastfetchText, LmInfoResponse, LmInstallPlanText, LmLabel,
-        LmText, Locale, PingText, PrefixText, RuntimeText, SensitiveText, SetupText, StatsText,
-        Text, alias_text, external_command_text, fastfetch_text, inspection_warning_text,
-        lm_format, lm_label, lm_runtime_status, lm_state_text, lm_text, ping_text, prefix_text,
+        AliasText, ExternalCommandText, FastfetchText, InfoCaptionData, InfoText, LmInfoResponse,
+        LmInstallPlanText, LmLabel, LmText, Locale, PingText, PrefixText, RuntimeText,
+        SensitiveText, SetupText, StatsText, Text, alias_text, external_command_text,
+        fastfetch_text, info_text, inspection_warning_text, lm_format, lm_label, lm_runtime_status,
+        lm_state_text, lm_text, ping_text, prefix_text, render_info_text,
         render_lm_doctor_missing_catalog, render_lm_doctor_module, render_lm_doctor_report,
-        render_lm_info, render_lm_install_plan, render_stats_text, runtime_text, sensitive_text,
-        setup_text, stats_text, text,
+        render_lm_info, render_lm_install_plan, render_revision_status, render_stats_text,
+        runtime_text, sensitive_text, setup_text, stats_text, text,
     },
+    info,
     onboarding::OnboardingProgress,
     response::{Response, sanitize_external_output},
     settings::{DEFAULT_PREFIX, SettingsStore},
     setup::{self, UsernameCandidate},
     setup_store::SetupStore,
     setup_telegram::{BotFatherProgress, CompanionSetup, GrammersTelegramSetup, ProvisionRequest},
+    upstream::{
+        RevisionRelation, UpstreamRev, UpstreamRevision, VersionRelation, version_relation,
+    },
 };
 
 pub struct RuntimeState {
@@ -65,6 +71,11 @@ pub struct RuntimeState {
     aliases: AliasStore,
     settings: SettingsStore,
     fastfetch_profile_path: PathBuf,
+    self_identity: Option<SelfIdentity>,
+    upstream: Option<Box<dyn UpstreamRev>>,
+    upstream_revision_cache: UpstreamSnapshot,
+    upstream_version_known: bool,
+    info_local_metadata: InfoLocalMetadata,
     external_manager: Option<ExternalManagerHandle>,
     external_snapshot: ExternalRuntimeSnapshot,
     expected_self_edits: VecDeque<ExpectedSelfEdit>,
@@ -96,6 +107,121 @@ const MODULE_APPROVAL_LIMIT: usize = 8;
 const MODULE_APPROVAL_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_EXPECTED_SELF_EDITS: usize = 128;
 const SETUP_STAGE_TIMEOUT: Duration = Duration::from_secs(90);
+
+#[derive(Clone)]
+pub(crate) enum UpstreamSnapshot {
+    Never,
+    Success(UpstreamRevision),
+    LastFailure {
+        stale: Option<UpstreamRevision>,
+        category: String,
+    },
+}
+
+struct InfoLocalMetadata {
+    host: &'static str,
+    os: String,
+    media: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) enum UpstreamResolveFailure {
+    /// The `info/refs` lookup for upstream `main` itself failed.
+    MainRev(crate::upstream::UpstreamError),
+    /// Tangled answered with a rate limit.
+    RateLimited { retry_after: Option<Duration> },
+}
+
+/// Resolves the upstream `main` revision together with the current build's
+/// relation to it: one `info/refs` request plus at most two ordered compares
+/// (`compare(main, current)` first, then the reverse only when the merge base
+/// does not already prove an Ahead relation).
+///
+/// Deliberately free of caching and deadlines. The refresh worker owns the
+/// overall deadline, while this function remains directly testable for the
+/// network shape.
+pub(crate) async fn resolve_upstream_revision(
+    upstream: &dyn UpstreamRev,
+) -> Result<UpstreamRevision, UpstreamResolveFailure> {
+    resolve_upstream_relation_for(upstream, info::build_rev()).await
+}
+
+async fn resolve_upstream_relation_for(
+    upstream: &dyn UpstreamRev,
+    current_rev: &str,
+) -> Result<UpstreamRevision, UpstreamResolveFailure> {
+    let main_rev = upstream.main_rev().await.map_err(|error| match error {
+        crate::upstream::UpstreamError::RateLimited { retry_after } => {
+            UpstreamResolveFailure::RateLimited { retry_after }
+        }
+        error => UpstreamResolveFailure::MainRev(error),
+    })?;
+    let relation = if current_rev == "unknown" {
+        RevisionRelation::Unavailable
+    } else if current_rev == main_rev {
+        RevisionRelation::Current
+    } else {
+        let first_compare = match upstream.compare(&main_rev, current_rev).await {
+            Ok(first_compare) => first_compare,
+            Err(crate::upstream::UpstreamError::RevisionNotFound { .. }) => {
+                // Current commit not published on Tangled
+                return Ok(UpstreamRevision {
+                    revision: main_rev,
+                    relation: RevisionRelation::Unavailable,
+                    version: None,
+                });
+            }
+            Err(crate::upstream::UpstreamError::RateLimited { retry_after }) => {
+                return Err(UpstreamResolveFailure::RateLimited { retry_after });
+            }
+            Err(error) => {
+                tracing::warn!(
+                    event = "upstream_compare_failed",
+                    category = %error,
+                    base = %main_rev,
+                    head = %current_rev,
+                    "Could not compare current build with upstream main"
+                );
+                return Err(UpstreamResolveFailure::MainRev(error));
+            }
+        };
+        match first_compare.merge_base.as_deref() {
+            Some(base) if base == main_rev => {
+                // merge_base == main: current is ahead of main; the reverse
+                // question is already answered by construction.
+                RevisionRelation::Ahead {
+                    commits: first_compare.ahead_by,
+                }
+            }
+            _ => match upstream.compare(current_rev, &main_rev).await {
+                Ok(reverse_compare) => crate::upstream::relation_from_ordered_compares(
+                    &main_rev,
+                    current_rev,
+                    first_compare,
+                    reverse_compare,
+                ),
+                Err(crate::upstream::UpstreamError::RateLimited { retry_after }) => {
+                    return Err(UpstreamResolveFailure::RateLimited { retry_after });
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        event = "upstream_compare_failed",
+                        category = %error,
+                        base = %current_rev,
+                        head = %main_rev,
+                        "Reverse compare failed"
+                    );
+                    return Err(UpstreamResolveFailure::MainRev(error));
+                }
+            },
+        }
+    };
+    Ok(UpstreamRevision {
+        revision: main_rev,
+        relation,
+        version: None,
+    })
+}
 
 pub struct CreatedEventDispatch {
     handle: ExternalManagerHandle,
@@ -225,6 +351,10 @@ pub(crate) struct RuntimeExecution {
     pub shutdown: Option<ShutdownReason>,
     pub post_edit: Option<PostEditAction>,
     pub onboarding_page: bool,
+    /// Static media to deliver alongside `response` instead of editing the
+    /// command message. Only `info` sets this today; when present, the update
+    /// layer sends the media and falls back to a text edit on failure.
+    pub media: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,6 +383,7 @@ impl From<Response> for RuntimeExecution {
             shutdown: None,
             post_edit: None,
             onboarding_page: false,
+            media: None,
         }
     }
 }
@@ -286,6 +417,16 @@ impl RuntimeState {
             aliases,
             settings,
             fastfetch_profile_path,
+            self_identity: None,
+            upstream: None,
+            upstream_revision_cache: UpstreamSnapshot::Never,
+            upstream_version_known: false,
+            info_local_metadata: InfoLocalMetadata {
+                host: info::deployment_label(std::env::var("LAVIS_HOST").ok().as_deref()),
+                os: info::read_os_release_pretty_name()
+                    .unwrap_or_else(|| std::env::consts::OS.to_owned()),
+                media: Some(info::INFO_MEDIA_URL.to_owned()),
+            },
             external_manager: None,
             external_snapshot: ExternalRuntimeSnapshot::new(),
             expected_self_edits: VecDeque::new(),
@@ -464,6 +605,95 @@ impl RuntimeState {
         self.external_manager.as_ref()
     }
 
+    /// Stores the identity captured during authorization so `info` can render
+    /// the owner without a per-invocation Telegram RPC.
+    pub fn set_self_identity(&mut self, identity: SelfIdentity) {
+        self.self_identity = Some(identity);
+    }
+
+    pub fn self_identity(&self) -> Option<&SelfIdentity> {
+        self.self_identity.as_ref()
+    }
+
+    /// Injects the upstream revision resolver. Tests use a fake; production
+    /// calls `set_http_upstream` once at startup.
+    pub fn set_upstream(&mut self, upstream: Box<dyn UpstreamRev>) {
+        self.upstream = Some(upstream);
+    }
+
+    pub fn set_http_upstream(&mut self) {
+        match crate::upstream::HttpUpstreamRev::new() {
+            Ok(client) => self.upstream = Some(Box::new(client)),
+            Err(error) => tracing::warn!(
+                event = "upstream_client_unavailable",
+                ?error,
+                "Upstream revision lookup will report unavailable"
+            ),
+        }
+    }
+
+    pub(crate) fn take_upstream(&mut self) -> Option<Box<dyn UpstreamRev>> {
+        self.upstream.take()
+    }
+
+    pub(crate) fn publish_upstream_revision(&mut self, revision: Option<UpstreamRevision>) {
+        if let Some(revision) = revision {
+            if revision.version.is_some() {
+                self.upstream_version_known = true;
+            }
+            let version = match &self.upstream_revision_cache {
+                UpstreamSnapshot::Success(previous)
+                | UpstreamSnapshot::LastFailure {
+                    stale: Some(previous),
+                    ..
+                } => revision
+                    .version
+                    .clone()
+                    .or_else(|| previous.version.clone()),
+                _ => revision.version.clone(),
+            };
+            let mut revision = revision;
+            revision.version = version;
+            self.upstream_revision_cache = UpstreamSnapshot::Success(revision);
+        }
+    }
+
+    pub(crate) fn publish_upstream_version(&mut self, version: Option<String>) {
+        self.upstream_version_known = true;
+        match &mut self.upstream_revision_cache {
+            UpstreamSnapshot::Success(revision) => revision.version = version.clone(),
+            UpstreamSnapshot::LastFailure { stale, .. } => {
+                if let Some(revision) = stale {
+                    revision.version = version;
+                }
+            }
+            UpstreamSnapshot::Never => {}
+        }
+    }
+
+    pub(crate) fn publish_upstream_failure(&mut self, category: impl Into<String>) {
+        let stale = match &self.upstream_revision_cache {
+            UpstreamSnapshot::Success(revision) => Some(revision.clone()),
+            UpstreamSnapshot::LastFailure { stale, .. } => stale.clone(),
+            UpstreamSnapshot::Never => None,
+        };
+        self.upstream_revision_cache = UpstreamSnapshot::LastFailure {
+            stale,
+            category: category.into(),
+        };
+    }
+
+    fn upstream_revision(&self) -> Option<UpstreamRevision> {
+        match &self.upstream_revision_cache {
+            UpstreamSnapshot::Success(revision) => Some(revision.clone()),
+            UpstreamSnapshot::LastFailure { stale, category } => {
+                tracing::debug!(category = %category, "Serving upstream snapshot after refresh failure");
+                stale.clone()
+            }
+            UpstreamSnapshot::Never => None,
+        }
+    }
+
     pub async fn refresh_snapshot(&mut self) {
         if let Some(handle) = &self.external_manager {
             self.external_snapshot = handle.snapshot().await;
@@ -546,11 +776,6 @@ impl RuntimeState {
     }
 
     pub fn register_expected_self_edit(&mut self, peer_id: PeerId, message_id: i32, text: String) {
-        self.expected_self_edits.retain(|expected| {
-            expected.peer_id != peer_id
-                || expected.message_id != message_id
-                || expected.text != text
-        });
         if self.expected_self_edits.len() == MAX_EXPECTED_SELF_EDITS {
             self.expected_self_edits.pop_front();
         }
@@ -810,6 +1035,9 @@ impl RuntimeState {
         if let Action::Setup(request) = action {
             return self.execute_setup(client, request, peer_id).await;
         }
+        if let Action::Info = action {
+            return self.execute_info();
+        }
         match action {
             Action::Language(request) => self.execute_language(request).await,
             Action::Ping => match telegram_ping(client, message_id).await {
@@ -846,6 +1074,7 @@ impl RuntimeState {
                     ),
                 )
             }
+            Action::Info => unreachable!("info actions return before response dispatch"),
             Action::Help(request) => {
                 let rendered = render_with_external_locale(
                     request,
@@ -879,6 +1108,85 @@ impl RuntimeState {
             Action::External(invocation) => self.execute_external(invocation).await,
         }
         .into()
+    }
+
+    /// Builds the `info` reply: a dynamic caption plus the static branding
+    /// image URL.
+    fn execute_info(&mut self) -> RuntimeExecution {
+        let locale = self.locale();
+        let prefix = self.prefix().to_owned();
+        let owner = self
+            .self_identity()
+            .map(info::owner_label)
+            .unwrap_or_else(|| info_text(locale, InfoText::Unknown).to_owned());
+        let upstream_data = self.upstream_revision();
+        let upstream = match &upstream_data {
+            Some(data) => info::short_commit(&data.revision).to_owned(),
+            None => info_text(locale, InfoText::Unavailable).to_owned(),
+        };
+        let upstream_status = upstream_data
+            .as_ref()
+            .map(|data| render_revision_status(locale, data.relation))
+            .unwrap_or_else(|| info_text(locale, InfoText::Unavailable).to_owned());
+        let version_status = if !self.upstream_version_known {
+            String::new()
+        } else {
+            match version_relation(
+                env!("CARGO_PKG_VERSION"),
+                upstream_data
+                    .as_ref()
+                    .and_then(|data| data.version.as_deref()),
+            ) {
+                VersionRelation::Current => match locale {
+                    Locale::English => "current ✅".to_owned(),
+                    Locale::Russian => "актуальная ✅".to_owned(),
+                },
+                VersionRelation::NewerAvailable => {
+                    let upstream_version = upstream_data
+                        .as_ref()
+                        .and_then(|data| data.version.as_deref())
+                        .unwrap_or_default();
+                    match locale {
+                        Locale::English => format!("newer available: {upstream_version} ⬆️"),
+                        Locale::Russian => format!("доступна новая: {upstream_version} ⬆️"),
+                    }
+                }
+                VersionRelation::Unavailable => String::new(),
+            }
+        };
+        let built_in_modules = crate::modules::modules().len();
+        let total_modules = built_in_modules + self.external_descriptors().len();
+        let active_modules = built_in_modules
+            + self
+                .external_snapshot
+                .module_statuses
+                .iter()
+                .filter(|status| status.status == ExternalModuleRuntimeStatus::Running)
+                .count();
+        let caption = render_info_text(
+            locale,
+            InfoCaptionData {
+                owner: &owner,
+                version: env!("CARGO_PKG_VERSION"),
+                version_status: &version_status,
+                commit: info::short_commit(info::build_rev()),
+                upstream: &upstream,
+                upstream_status: &upstream_status,
+                prefix: &prefix,
+                active_modules,
+                total_modules,
+                host: self.info_local_metadata.host,
+                os: &self.info_local_metadata.os,
+            },
+        );
+        RuntimeExecution {
+            response: Response::four_blockquotes_with_locale(locale, caption),
+            media: self.info_local_metadata.media.clone(),
+            provision: None,
+            shutdown: None,
+            post_edit: None,
+            onboarding_page: false,
+        }
     }
 
     async fn execute_language(&mut self, request: &LanguageRequest) -> Response {
@@ -1012,6 +1320,7 @@ impl RuntimeState {
                 shutdown: None,
                 post_edit: None,
                 onboarding_page: true,
+                media: None,
             },
             Err(_) => {
                 Response::plain_with_locale(self.locale(), text(locale, Text::OnboardingSaveFailed))
@@ -1422,6 +1731,7 @@ impl RuntimeState {
                 shutdown: None,
                 post_edit: Some(PostEditAction::ArmRebootReceipt),
                 onboarding_page: false,
+                media: None,
             },
             Err(response) => response.into(),
         }
@@ -2449,6 +2759,7 @@ impl SetupCoordinator {
                 shutdown: None,
                 post_edit: None,
                 onboarding_page: false,
+                media: None,
             },
             Err(response) => response.into(),
         }
@@ -2809,10 +3120,14 @@ fn format_stats(
 #[cfg(test)]
 mod tests {
     use super::{
-        ProcStats, SensitiveCommandDenial, SensitiveCommandPolicy, authorize_sensitive_message,
-        bounded_list, external_event_error_category, fastfetch_response, format_duration,
-        format_latency, format_stats, lm_usage, missing_descriptor_response, parse_memory_kib,
-        parse_system_uptime, render_install_plan, setup_status_label, setup_status_response,
+        ProcStats, SensitiveCommandDenial, SensitiveCommandPolicy, UpstreamResolveFailure,
+        UpstreamSnapshot, authorize_sensitive_message, bounded_list, external_event_error_category,
+        fastfetch_response, format_duration, format_latency, format_stats, lm_usage,
+        missing_descriptor_response, parse_memory_kib, parse_system_uptime, render_install_plan,
+        resolve_upstream_relation_for, setup_status_label, setup_status_response,
+    };
+    use crate::external_modules::manager::{
+        ExternalModuleRuntimeStatus, ExternalModuleStatus, ExternalRuntimeSnapshot,
     };
     use crate::response::Response;
     use crate::{
@@ -2829,9 +3144,11 @@ mod tests {
             Locale, PingText, RuntimeText, SensitiveText, ping_text, runtime_text, sensitive_text,
         },
         setup_store::{CompanionToken, PersistedSetupState, SetupStore},
+        upstream::{CompareFuture, UpstreamError, UpstreamRev, UpstreamRevFuture},
     };
     use grammers_session::types::PeerId;
     use std::{
+        collections::HashMap,
         fs,
         path::PathBuf,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -3674,9 +3991,14 @@ mod tests {
             .await;
         let overview =
             runtime.execute_modules(&crate::commands::ModulesRequest::Overview, runtime.prefix());
-        assert!(overview.text.starts_with("🧩 Модули Lavis: 3\n\n"));
+        let heading = format!("🧩 Модули Lavis: {}\n\n", crate::modules::modules().len());
+        assert!(overview.text.starts_with(&heading));
         assert!(overview.text.contains("🦀fastfetch"));
-        assert!(overview.text.contains("Команды (12)"));
+        assert!(
+            overview
+                .text
+                .contains(&format!("Команды ({})", crate::commands::commands().len()))
+        );
         assert_eq!(overview.entities.len(), 2);
         assert_eq!(
             runtime.execute_modules(&crate::commands::ModulesRequest::Invalid, runtime.prefix(),),
@@ -3689,12 +4011,9 @@ mod tests {
         let units = overview.text.encode_utf16().collect::<Vec<_>>();
         let offset = usize::try_from(entity.offset).unwrap();
         let length = usize::try_from(entity.length).unwrap();
-        assert_eq!(
-            String::from_utf16(&units[..offset]).unwrap(),
-            "🧩 Модули Lavis: 3\n\n"
-        );
+        assert_eq!(String::from_utf16(&units[..offset]).unwrap(), heading);
         let body = String::from_utf16(&units[offset..offset + length]).unwrap();
-        assert!(body.contains("Команды (12)"));
+        assert!(body.contains(&format!("Команды ({})", crate::commands::commands().len())));
         let grammers_client::tl::enums::MessageEntity::Blockquote(provenance) =
             &overview.entities[1]
         else {
@@ -3717,8 +4036,13 @@ mod tests {
             .unwrap();
         let english =
             runtime.execute_modules(&crate::commands::ModulesRequest::Overview, runtime.prefix());
-        assert!(english.text.starts_with("🧩 Lavis modules: 3\n\n"));
-        assert!(english.text.contains("Commands (12)"));
+        let english_heading = format!("🧩 Lavis modules: {}\n\n", crate::modules::modules().len());
+        assert!(english.text.starts_with(&english_heading));
+        assert!(
+            english
+                .text
+                .contains(&format!("Commands ({})", crate::commands::commands().len()))
+        );
         assert!(!english.text.contains("Модули"));
         assert_eq!(
             runtime.execute_modules(&crate::commands::ModulesRequest::Invalid, runtime.prefix(),),
@@ -3749,6 +4073,12 @@ mod tests {
         runtime.register_expected_self_edit(peer, 43, "failed response".to_owned());
         runtime.remove_expected_self_edit(peer, 43, "failed response");
         assert!(!runtime.consume_expected_self_edit(peer, 43, "failed response"));
+
+        runtime.register_expected_self_edit(peer, 44, "duplicate response".to_owned());
+        runtime.register_expected_self_edit(peer, 44, "duplicate response".to_owned());
+        assert!(runtime.consume_expected_self_edit(peer, 44, "duplicate response"));
+        assert!(runtime.consume_expected_self_edit(peer, 44, "duplicate response"));
+        assert!(!runtime.consume_expected_self_edit(peer, 44, "duplicate response"));
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -4318,6 +4648,488 @@ for line in sys.stdin:
         assert_eq!(parse_memory_kib("VmRSS: 1234 bytes\n"), None);
     }
 
+    #[tokio::test]
+    async fn info_caption_computes_module_counts_from_runtime_state() {
+        use crate::external_modules::manifest::{ExternalCapability, ExternalModuleDescriptor};
+
+        fn descriptor(id: &str) -> ExternalModuleDescriptor {
+            ExternalModuleDescriptor {
+                protocol_version: 6,
+                id: id.to_owned(),
+                display_name: id.to_owned(),
+                version: "test".to_owned(),
+                author: "test".to_owned(),
+                entrypoint: PathBuf::from("/unused"),
+                module_dir: PathBuf::from("/unused"),
+                capabilities: vec![ExternalCapability::MessageRead],
+                default_command: None,
+                subscriptions: Vec::new(),
+                telegram_methods: Vec::new(),
+                actions: Vec::new(),
+                commands: Vec::new(),
+            }
+        }
+
+        let mut snapshot = ExternalRuntimeSnapshot::new();
+        let built_in_modules = crate::modules::modules().len();
+        snapshot.descriptors.push(descriptor("alpha"));
+        snapshot.descriptors.push(descriptor("beta"));
+        snapshot.module_statuses.push(ExternalModuleStatus {
+            id: "alpha".to_owned(),
+            display_name: "alpha".to_owned(),
+            version: "test".to_owned(),
+            author: "test".to_owned(),
+            capabilities: Vec::new(),
+            command_count: 1,
+            status: ExternalModuleRuntimeStatus::Running,
+        });
+        snapshot.module_statuses.push(ExternalModuleStatus {
+            id: "beta".to_owned(),
+            display_name: "beta".to_owned(),
+            version: "test".to_owned(),
+            author: "test".to_owned(),
+            capabilities: Vec::new(),
+            command_count: 1,
+            status: ExternalModuleRuntimeStatus::InstalledDisabled,
+        });
+
+        let (mut runtime, directory) = runtime_with_alias().await;
+        runtime.set_external_snapshot_for_tests(snapshot);
+        runtime
+            .settings
+            .set_locale(Some(crate::i18n::Locale::English))
+            .await
+            .unwrap();
+        let execution = runtime.execute_info();
+
+        assert!(execution.response.text.contains(&format!(
+            "Modules: {} ({} active)",
+            built_in_modules + 2,
+            built_in_modules + 1
+        )));
+        assert!(execution.response.text.contains("Host: "));
+        assert!(execution.response.text.contains("OS: "));
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[tokio::test]
+    async fn info_action_dispatches_through_execute() {
+        use grammers_session::types::PeerId;
+        let (mut runtime, directory) = runtime_with_alias().await;
+        runtime
+            .settings
+            .set_locale(Some(crate::i18n::Locale::English))
+            .await
+            .unwrap();
+        runtime.set_self_identity(crate::auth::SelfIdentity {
+            username: Some("owner".to_owned()),
+            display_name: None,
+            id: PeerId::self_user(),
+        });
+        runtime.publish_upstream_revision(Some(crate::upstream::UpstreamRevision {
+            revision: "b1d18f8ef407d043506c983b0d68e96c282eb1c9".to_owned(),
+            relation: crate::upstream::RevisionRelation::Current,
+            version: Some("1.0.0".to_owned()),
+        }));
+
+        let execution = runtime.execute_info();
+
+        assert!(execution.response.text.contains("Owner: @owner"));
+        assert!(
+            execution
+                .response
+                .text
+                .contains("Version: 1.0.0 (current ✅)")
+        );
+        assert!(execution.response.text.contains("Current commit: "));
+        assert!(execution.response.text.contains("Upstream main: b1d18f8"));
+        assert!(execution.response.text.contains("Prefix: "));
+        assert!(execution.response.text.contains("Modules: "));
+        assert_eq!(execution.response.entities.len(), 4);
+        assert_eq!(
+            execution.media.as_deref(),
+            Some(crate::info::INFO_MEDIA_URL)
+        );
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[tokio::test]
+    async fn info_reports_unavailable_upstream_when_resolver_fails() {
+        let (mut runtime, directory) = runtime_with_alias().await;
+        runtime
+            .settings
+            .set_locale(Some(crate::i18n::Locale::English))
+            .await
+            .unwrap();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        runtime.set_upstream(Box::new(PanickingUpstream {
+            calls: calls.clone(),
+        }));
+
+        let execution = runtime.execute_info();
+
+        assert!(
+            execution
+                .response
+                .text
+                .contains("Upstream main: unavailable")
+        );
+        assert!(execution.response.text.contains("Version: 1.0.0"));
+        assert!(!execution.response.text.contains("Version: 1.0.0 ("));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(execution.media.is_some());
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[tokio::test]
+    async fn upstream_failure_retains_the_last_successful_info_value() {
+        let (mut runtime, directory) = runtime_with_alias().await;
+        runtime
+            .settings
+            .set_locale(Some(crate::i18n::Locale::English))
+            .await
+            .unwrap();
+        runtime.publish_upstream_revision(Some(crate::upstream::UpstreamRevision {
+            revision: "b1d18f8ef407d043506c983b0d68e96c282eb1c9".to_owned(),
+            relation: crate::upstream::RevisionRelation::Current,
+            version: Some("1.0.0".to_owned()),
+        }));
+        runtime.publish_upstream_failure("timeout");
+
+        let execution = runtime.execute_info();
+
+        assert!(execution.response.text.contains("b1d18f8"));
+        assert!(matches!(
+            &runtime.upstream_revision_cache,
+            UpstreamSnapshot::LastFailure {
+                stale: Some(_),
+                category
+            } if category == "timeout"
+        ));
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[tokio::test]
+    async fn upstream_snapshot_failure_and_recovery_transitions_are_explicit() {
+        let (mut runtime, directory) = runtime_with_alias().await;
+        assert!(matches!(
+            &runtime.upstream_revision_cache,
+            UpstreamSnapshot::Never
+        ));
+
+        runtime.publish_upstream_failure("transport");
+        assert!(matches!(
+            &runtime.upstream_revision_cache,
+            UpstreamSnapshot::LastFailure { stale: None, .. }
+        ));
+
+        let revision = crate::upstream::UpstreamRevision {
+            revision: "b1d18f8ef407d043506c983b0d68e96c282eb1c9".to_owned(),
+            relation: crate::upstream::RevisionRelation::Current,
+            version: Some("1.0.0".to_owned()),
+        };
+        runtime.publish_upstream_revision(Some(revision.clone()));
+        runtime.publish_upstream_failure("timeout");
+        assert!(matches!(
+            &runtime.upstream_revision_cache,
+            UpstreamSnapshot::LastFailure { stale: Some(_), .. }
+        ));
+        runtime.publish_upstream_revision(Some(revision));
+        assert!(matches!(
+            &runtime.upstream_revision_cache,
+            UpstreamSnapshot::Success(_)
+        ));
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[tokio::test]
+    async fn version_failure_retains_revision_but_successful_none_clears_version() {
+        let (mut runtime, directory) = runtime_with_alias().await;
+        runtime
+            .settings
+            .set_locale(Some(crate::i18n::Locale::English))
+            .await
+            .unwrap();
+        runtime.publish_upstream_revision(Some(crate::upstream::UpstreamRevision {
+            revision: "b1d18f8ef407d043506c983b0d68e96c282eb1c9".to_owned(),
+            relation: crate::upstream::RevisionRelation::Ahead { commits: 2 },
+            version: Some("1.1.0".to_owned()),
+        }));
+        runtime.publish_upstream_failure("rate_limited");
+
+        // A failed version lookup publishes nothing: the stale relation and
+        // successful version remain available to the local info command.
+        let retained = runtime.execute_info();
+        assert!(retained.response.text.contains("Upstream main: b1d18f8"));
+        assert!(retained.response.text.contains("Version: 1.0.0"));
+        assert!(retained.response.text.contains("newer available: 1.1.0 ⬆️"));
+
+        // An actual successful lookup with no package version is different from
+        // a failure and clears the previously known version.
+        runtime.publish_upstream_version(None);
+        let cleared = runtime.execute_info();
+        assert!(cleared.response.text.contains("Upstream main: b1d18f8"));
+        assert!(cleared.response.text.contains("Version: 1.0.0"));
+        assert!(!cleared.response.text.contains("Version: 1.0.0 ("));
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[tokio::test]
+    async fn info_owner_falls_back_to_unknown_without_identity() {
+        let (mut runtime, directory) = runtime_with_alias().await;
+        runtime
+            .settings
+            .set_locale(Some(crate::i18n::Locale::English))
+            .await
+            .unwrap();
+
+        let execution = runtime.execute_info();
+
+        assert!(execution.response.text.contains("Owner: unknown"));
+        fs::remove_dir_all(directory).ok();
+    }
+
+    struct PanickingUpstream {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl UpstreamRev for PanickingUpstream {
+        fn main_rev<'a>(&'a self) -> UpstreamRevFuture<'a> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            panic!("execute_info must not resolve upstream revisions")
+        }
+
+        fn compare<'a>(&'a self, _base: &'a str, _head: &'a str) -> CompareFuture<'a> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            panic!("execute_info must not compare upstream revisions")
+        }
+    }
+
+    /// Regression coverage for blocker 1 at the resolution level: scripts a
+    /// per-direction compare answer and records every ordered `(rev1, rev2)`
+    /// pair requested, so a swapped orientation fails the exact call-order
+    /// assertions instead of silently producing inverted relations.
+    struct ScriptedRelationUpstream {
+        main_rev: Result<String, UpstreamError>,
+        compares: HashMap<(String, String), Result<crate::upstream::CompareResult, UpstreamError>>,
+        requested: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl ScriptedRelationUpstream {
+        fn requested_pairs(&self) -> Vec<(String, String)> {
+            self.requested.lock().unwrap().clone()
+        }
+    }
+
+    impl UpstreamRev for ScriptedRelationUpstream {
+        fn main_rev<'a>(&'a self) -> UpstreamRevFuture<'a> {
+            Box::pin(async move { self.main_rev.clone() })
+        }
+
+        fn compare<'a>(&'a self, base: &'a str, head: &'a str) -> CompareFuture<'a> {
+            self.requested
+                .lock()
+                .unwrap()
+                .push((base.to_owned(), head.to_owned()));
+            let outcome = self
+                .compares
+                .get(&(base.to_owned(), head.to_owned()))
+                .cloned()
+                .unwrap_or(Err(UpstreamError::InvalidResponse));
+            Box::pin(async move { outcome })
+        }
+    }
+
+    /// ```text
+    /// A -- B -- C
+    ///      main  current
+    /// ```
+    #[tokio::test]
+    async fn resolves_ahead_from_a_single_ordered_compare() {
+        let upstream = ScriptedRelationUpstream {
+            main_rev: Ok("B".to_owned()),
+            compares: HashMap::from([(
+                ("B".to_owned(), "C".to_owned()),
+                Ok(crate::upstream::CompareResult {
+                    ahead_by: 1,
+                    behind_by: 0,
+                    merge_base: Some("B".to_owned()),
+                }),
+            )]),
+            requested: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let resolved = resolve_upstream_relation_for(&upstream, "C").await.unwrap();
+
+        assert_eq!(resolved.revision, "B");
+        assert_eq!(
+            resolved.relation,
+            crate::upstream::RevisionRelation::Ahead { commits: 1 }
+        );
+        // merge_base == main proves Ahead: the reverse question must not even
+        // be asked, and certainly not with swapped arguments.
+        assert_eq!(
+            upstream.requested_pairs(),
+            vec![("B".to_owned(), "C".to_owned())]
+        );
+    }
+
+    /// ```text
+    /// A -- B -- C
+    ///   current  main
+    /// ```
+    #[tokio::test]
+    async fn resolves_behind_via_the_reverse_ordered_compare() {
+        let upstream = ScriptedRelationUpstream {
+            main_rev: Ok("C".to_owned()),
+            compares: HashMap::from([
+                (
+                    ("C".to_owned(), "B".to_owned()),
+                    Ok(crate::upstream::CompareResult {
+                        ahead_by: 0,
+                        behind_by: 0,
+                        merge_base: Some("B".to_owned()),
+                    }),
+                ),
+                (
+                    ("B".to_owned(), "C".to_owned()),
+                    Ok(crate::upstream::CompareResult {
+                        ahead_by: 1,
+                        behind_by: 0,
+                        merge_base: Some("B".to_owned()),
+                    }),
+                ),
+            ]),
+            requested: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let resolved = resolve_upstream_relation_for(&upstream, "B").await.unwrap();
+
+        assert_eq!(resolved.revision, "C");
+        assert_eq!(
+            resolved.relation,
+            crate::upstream::RevisionRelation::Behind { commits: 1 }
+        );
+        assert_eq!(
+            upstream.requested_pairs(),
+            vec![
+                ("C".to_owned(), "B".to_owned()),
+                ("B".to_owned(), "C".to_owned()),
+            ]
+        );
+    }
+
+    /// ```text
+    ///       C -- D   current
+    ///      /
+    /// A -- B
+    ///      \
+    ///       E -- F -- G   main
+    /// ```
+    #[tokio::test]
+    async fn resolves_divergence_as_ahead_two_behind_three() {
+        let upstream = ScriptedRelationUpstream {
+            main_rev: Ok("G".to_owned()),
+            compares: HashMap::from([
+                (
+                    ("G".to_owned(), "D".to_owned()),
+                    Ok(crate::upstream::CompareResult {
+                        ahead_by: 2,
+                        behind_by: 0,
+                        merge_base: Some("B".to_owned()),
+                    }),
+                ),
+                (
+                    ("D".to_owned(), "G".to_owned()),
+                    Ok(crate::upstream::CompareResult {
+                        ahead_by: 3,
+                        behind_by: 0,
+                        merge_base: Some("B".to_owned()),
+                    }),
+                ),
+            ]),
+            requested: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let resolved = resolve_upstream_relation_for(&upstream, "D").await.unwrap();
+
+        assert_eq!(
+            resolved.relation,
+            crate::upstream::RevisionRelation::Diverged {
+                ahead: 2,
+                behind: 3
+            }
+        );
+        assert_eq!(
+            upstream.requested_pairs(),
+            vec![
+                ("G".to_owned(), "D".to_owned()),
+                ("D".to_owned(), "G".to_owned()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn identical_and_unknown_revisions_skip_compare_entirely() {
+        let mut upstream = ScriptedRelationUpstream {
+            main_rev: Ok("M".to_owned()),
+            compares: HashMap::new(),
+            requested: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let current = resolve_upstream_relation_for(&upstream, "M").await.unwrap();
+        assert_eq!(current.relation, crate::upstream::RevisionRelation::Current);
+
+        upstream.main_rev = Ok("N".to_owned());
+        let unknown = resolve_upstream_relation_for(&upstream, "unknown")
+            .await
+            .unwrap();
+        assert_eq!(
+            unknown.relation,
+            crate::upstream::RevisionRelation::Unavailable
+        );
+        assert!(upstream.requested_pairs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unpublished_current_revision_reports_unavailable() {
+        let upstream = ScriptedRelationUpstream {
+            main_rev: Ok("M".to_owned()),
+            compares: HashMap::from([(
+                ("M".to_owned(), "local".to_owned()),
+                Err(UpstreamError::RevisionNotFound {
+                    revision: "local".to_owned(),
+                }),
+            )]),
+            requested: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let resolved = resolve_upstream_relation_for(&upstream, "local")
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved.relation,
+            crate::upstream::RevisionRelation::Unavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limited_compare_surfaces_rate_limit_failure() {
+        let upstream = ScriptedRelationUpstream {
+            main_rev: Ok("M".to_owned()),
+            compares: HashMap::from([(
+                ("M".to_owned(), "local".to_owned()),
+                Err(UpstreamError::RateLimited { retry_after: None }),
+            )]),
+            requested: std::sync::Mutex::new(Vec::new()),
+        };
+
+        assert!(matches!(
+            resolve_upstream_relation_for(&upstream, "local").await,
+            Err(UpstreamResolveFailure::RateLimited { retry_after: None })
+        ));
+    }
+
     #[test]
     fn formats_stats_with_all_labels_and_values() {
         let output = format_stats(
@@ -4338,7 +5150,7 @@ for line in sys.stdin:
         assert!(output.contains("System uptime: 1h 00m 00s"));
         assert!(output.contains("Memory: 10.4 MiB RSS"));
         assert!(output.contains("Commands: 2"));
-        assert!(output.contains("Version: 0.1.0"));
+        assert!(output.contains("Version: 1.0.0"));
     }
 
     #[test]

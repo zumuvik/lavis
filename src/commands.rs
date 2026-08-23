@@ -8,6 +8,7 @@ pub enum CommandKind {
     Language,
     Ping,
     Stats,
+    Info,
     Help,
     Fastfetch,
     Alias,
@@ -40,7 +41,7 @@ pub struct CommandDefinition {
     pub module: ModuleId,
 }
 
-const COMMAND_SPECS: [CommandDefinition; 12] = [
+const COMMAND_SPECS: [CommandDefinition; 13] = [
     CommandDefinition {
         kind: CommandKind::Start,
         name: "start",
@@ -160,6 +161,16 @@ const COMMAND_SPECS: [CommandDefinition; 12] = [
         module: ModuleId::Core,
     },
     CommandDefinition {
+        kind: CommandKind::Info,
+        name: "info",
+        usage: "info",
+        examples: &["info"],
+        risk: CommandRisk::ReadOnly,
+        icon: "ℹ️",
+        aliasable: true,
+        module: ModuleId::Core,
+    },
+    CommandDefinition {
         kind: CommandKind::Fastfetch,
         name: "fastfetch",
         usage: "fastfetch [--no-profile] [--logo <...>] [--structure <...>] [--separator <text>] [--logo-padding-left <n>] [--logo-padding-right <n>] [--logo-padding-top <n>]",
@@ -195,6 +206,8 @@ pub fn command_summary(kind: CommandKind, locale: Locale) -> &'static str {
         (CommandKind::Ping, Locale::Russian) => "Измерить задержку Telegram",
         (CommandKind::Stats, Locale::English) => "Show runtime statistics",
         (CommandKind::Stats, Locale::Russian) => "Показать статистику работы",
+        (CommandKind::Info, Locale::English) => "Show Lavis project information",
+        (CommandKind::Info, Locale::Russian) => "Показать информацию о Lavis",
         (CommandKind::Help, Locale::English) => "Show command help",
         (CommandKind::Help, Locale::Russian) => "Показать справку",
         (CommandKind::Fastfetch, Locale::English) => "Show safe system information",
@@ -274,6 +287,12 @@ pub fn command_description(kind: CommandKind, locale: Locale) -> &'static str {
         (CommandKind::Stats, Locale::Russian) => {
             "Показывает задержку Telegram, время работы Lavis и хоста, память, число команд и версию пакета."
         }
+        (CommandKind::Info, Locale::English) => {
+            "Shows owner, version, current commit, upstream status, active prefix, module counts, host, and OS."
+        }
+        (CommandKind::Info, Locale::Russian) => {
+            "Показывает владельца, версию, текущий коммит, статус основной ветки, активный префикс, количество модулей, хост и ОС."
+        }
         (CommandKind::Fastfetch, Locale::English) => {
             "Runs Fastfetch only with restricted safe display options."
         }
@@ -330,6 +349,7 @@ pub enum Action {
     Language(LanguageRequest),
     Ping,
     Stats,
+    Info,
     Help(HelpRequest),
     Fastfetch(String),
     Alias(AliasRequest),
@@ -373,6 +393,7 @@ impl Action {
             Self::Language(_) => "language",
             Self::Ping => "ping",
             Self::Stats => "stats",
+            Self::Info => "info",
             Self::Help(_) => "help",
             Self::Fastfetch(_) => "fastfetch",
             Self::Alias(_) => "alias",
@@ -398,6 +419,8 @@ pub fn dispatch(command: &Command) -> Option<Action> {
         CommandKind::Language => Some(Action::Language(parse_language_request(&command.args))),
         CommandKind::Ping => Some(Action::Ping),
         CommandKind::Stats => Some(Action::Stats),
+        CommandKind::Info if command.args.trim().is_empty() => Some(Action::Info),
+        CommandKind::Info => None,
         CommandKind::Help => Some(Action::Help(parse_help_request(&command.args))),
         CommandKind::Fastfetch => Some(Action::Fastfetch(command.args.clone())),
         CommandKind::Alias => Some(Action::Alias(parse_alias_request(&command.args))),
@@ -675,6 +698,23 @@ mod tests {
     }
 
     #[test]
+    fn dispatches_info() {
+        let command = Command {
+            name: "info".to_owned(),
+            args: String::new(),
+        };
+
+        assert_eq!(dispatch(&command), Some(Action::Info));
+        assert_eq!(
+            dispatch(&Command {
+                name: "info".to_owned(),
+                args: "extra".to_owned(),
+            }),
+            None
+        );
+    }
+
+    #[test]
     fn dispatches_start_and_language_with_exact_arguments() {
         assert_eq!(
             dispatch(&Command {
@@ -786,6 +826,7 @@ mod tests {
                 "setup",
                 "lm",
                 "stats",
+                "info",
                 "fastfetch",
                 "alias"
             ]
@@ -865,7 +906,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "start", "language", "help", "reboot", "modules", "ping", "prefix", "setup", "lm",
-                "stats"
+                "stats", "info"
             ]
         );
         assert_eq!(
@@ -945,6 +986,7 @@ mod tests {
             CommandKind::Modules,
             CommandKind::Ping,
             CommandKind::Stats,
+            CommandKind::Info,
         ] {
             assert_eq!(command_by_kind(kind).unwrap().risk, CommandRisk::ReadOnly);
         }

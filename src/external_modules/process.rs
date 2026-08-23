@@ -12,7 +12,10 @@ use std::{
     ffi::OsString,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU8, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -39,12 +42,46 @@ pub const MAX_STDERR_CAPTURE: usize = 16 * 1024;
 /// descendant that retains the inherited stderr FD.
 pub const STDERR_DRAIN_GRACE: Duration = Duration::from_millis(100);
 
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessStatus {
     Running,
     Failed,
     Crashed,
     Terminated,
+}
+
+#[derive(Debug)]
+pub(crate) struct LegacyMetadata {
+    pub(crate) descriptor: Arc<ExternalModuleDescriptor>,
+    status: AtomicU8,
+}
+
+impl LegacyMetadata {
+    fn new(descriptor: ExternalModuleDescriptor) -> Arc<Self> {
+        Arc::new(Self {
+            descriptor: Arc::new(descriptor),
+            status: AtomicU8::new(ProcessStatus::Running as u8),
+        })
+    }
+    pub(crate) fn status(&self) -> ProcessStatus {
+        match self.status.load(Ordering::Acquire) {
+            x if x == ProcessStatus::Running as u8 => ProcessStatus::Running,
+            x if x == ProcessStatus::Failed as u8 => ProcessStatus::Failed,
+            x if x == ProcessStatus::Crashed as u8 => ProcessStatus::Crashed,
+            x if x == ProcessStatus::Terminated as u8 => ProcessStatus::Terminated,
+            _ => ProcessStatus::Terminated,
+        }
+    }
+    pub(crate) fn set_status(&self, status: ProcessStatus) {
+        self.status.store(status as u8, Ordering::Release);
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct LegacyMetadataView {
+    pub(crate) descriptor: Arc<ExternalModuleDescriptor>,
+    pub(crate) status: ProcessStatus,
 }
 
 pub struct ModuleProcess {
@@ -54,8 +91,8 @@ pub struct ModuleProcess {
     stdout_reader: tokio::io::BufReader<tokio::process::ChildStdout>,
     stderr_drain: Option<tokio::task::JoinHandle<()>>,
     stderr_capture: Arc<Mutex<StderrCapture>>,
-    descriptor: ExternalModuleDescriptor,
-    status: ProcessStatus,
+    descriptor: Arc<ExternalModuleDescriptor>,
+    metadata: Arc<LegacyMetadata>,
     in_flight_request: Option<String>,
     gateway: Option<std::sync::Arc<dyn TelegramGateway>>,
     active_call_ids: HashSet<String>,
@@ -116,9 +153,12 @@ impl ModuleProcess {
     }
 
     pub fn status(&self) -> ProcessStatus {
-        self.status
+        self.metadata.status()
     }
 
+    pub(crate) fn metadata(&self) -> Arc<LegacyMetadata> {
+        self.metadata.clone()
+    }
     pub fn id(&self) -> &str {
         &self.descriptor.id
     }
@@ -201,6 +241,7 @@ impl ModuleProcess {
         let stderr_capture = Arc::new(Mutex::new(StderrCapture::default()));
         let stderr_drain = tokio::spawn(drain_stderr(stderr, stderr_capture.clone()));
 
+        let metadata = LegacyMetadata::new(descriptor);
         let mut process = Self {
             child: Some(child),
             process_group_id: Some(pid),
@@ -208,8 +249,8 @@ impl ModuleProcess {
             stdout_reader,
             stderr_drain: Some(stderr_drain),
             stderr_capture,
-            descriptor,
-            status: ProcessStatus::Running,
+            descriptor: metadata.descriptor.clone(),
+            metadata,
             in_flight_request: None,
             gateway,
             active_call_ids: HashSet::new(),
@@ -408,7 +449,7 @@ impl ModuleProcess {
                 .await
                 .map_err(|_| ExternalError::ExecutionTimeout)??;
             let Some(msg) = line else {
-                self.status = ProcessStatus::Crashed;
+                self.set_status(ProcessStatus::Crashed);
                 return Err(ExternalError::Unavailable);
             };
             match msg {
@@ -554,7 +595,7 @@ impl ModuleProcess {
             Ok(()) => {
                 self.join_stderr_drain().await;
                 self.clear_request_state();
-                self.status = ProcessStatus::Terminated;
+                self.set_status(ProcessStatus::Terminated);
                 Ok(())
             }
             Err(_) => Err(self
@@ -565,7 +606,7 @@ impl ModuleProcess {
 
     pub fn mark_failed(&mut self) {
         self.clear_request_state();
-        self.status = ProcessStatus::Failed;
+        self.set_status(ProcessStatus::Failed);
     }
 
     fn clear_request_state(&mut self) {
@@ -595,7 +636,7 @@ impl ModuleProcess {
     /// itself. `fail_and_terminate` uses this before snapshotting stderr and
     /// emitting the single `external_module_crashed` event.
     async fn terminate_failed_process(&mut self) {
-        self.status = ProcessStatus::Crashed;
+        self.set_status(ProcessStatus::Crashed);
         self.terminate_process_group().await;
         self.reap_child().await;
         self.join_stderr_drain().await;
@@ -608,11 +649,15 @@ impl ModuleProcess {
     }
 
     pub async fn terminate(&mut self) {
-        self.status = ProcessStatus::Terminated;
+        self.set_status(ProcessStatus::Terminated);
         self.clear_request_state();
         self.terminate_process_group().await;
         self.reap_child().await;
         self.join_stderr_drain().await;
+    }
+
+    fn set_status(&self, status: ProcessStatus) {
+        self.metadata.set_status(status);
     }
 
     async fn terminate_process_group(&self) {
@@ -1197,6 +1242,44 @@ async fn secure_directory(_path: &Path) -> std::io::Result<()> {
 
 pub async fn reap_child(mut child: Child) {
     let _ = child.wait().await;
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::{ExternalModuleDescriptor, LegacyMetadata, ProcessStatus};
+    use std::path::PathBuf;
+
+    fn descriptor() -> ExternalModuleDescriptor {
+        ExternalModuleDescriptor {
+            protocol_version: 4,
+            id: "metadata-test".to_owned(),
+            display_name: "Metadata test".to_owned(),
+            version: "1".to_owned(),
+            author: "test".to_owned(),
+            entrypoint: PathBuf::from("run"),
+            module_dir: PathBuf::new(),
+            capabilities: Vec::new(),
+            default_command: None,
+            subscriptions: Vec::new(),
+            telegram_methods: Vec::new(),
+            actions: Vec::new(),
+            commands: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn legacy_metadata_round_trips_each_atomic_status() {
+        let metadata = LegacyMetadata::new(descriptor());
+        for status in [
+            ProcessStatus::Running,
+            ProcessStatus::Failed,
+            ProcessStatus::Crashed,
+            ProcessStatus::Terminated,
+        ] {
+            metadata.set_status(status);
+            assert_eq!(metadata.status(), status);
+        }
+    }
 }
 
 #[cfg(all(test, feature = "fixture-tests"))]

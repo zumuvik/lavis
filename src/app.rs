@@ -24,6 +24,7 @@ pub mod external_modules;
 pub mod fastfetch;
 pub mod help;
 pub mod i18n;
+pub mod info;
 pub mod modules;
 pub mod onboarding;
 pub mod reboot_receipt;
@@ -37,6 +38,7 @@ pub mod setup_provision;
 pub mod setup_store;
 pub mod setup_telegram;
 pub mod updates;
+pub mod upstream;
 
 use auth::AuthorizationOutcome;
 
@@ -305,7 +307,30 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
         }
 
         let self_user_id = outcome.self_user_id();
-        initialize_dialog_cache(guard.inner().client()).await?;
+        let self_identity = outcome.identity().clone();
+        // Warm up the dialog cache in the background. This persists peers and
+        // initializes update state for broadcast channels/megagroups, which
+        // stream_updates gap recovery requires. Runs concurrently with module
+        // startup so it does not block the critical path.
+        let dialog_cache_client = guard.inner().client().clone();
+        tokio::spawn(async move {
+            let started = Instant::now();
+
+            if let Err(error) = initialize_dialog_cache(&dialog_cache_client).await {
+                tracing::warn!(
+                    event = "dialog_cache_init_failed",
+                    %error,
+                    "Dialog cache initialization failed"
+                );
+                return;
+            }
+
+            tracing::info!(
+                event = "dialog_cache_initialized",
+                elapsed_ms = started.elapsed().as_millis(),
+                "Dialog cache initialized"
+            );
+        });
         let mut stream = {
             let client_ref = guard.inner();
             let receiver = client_ref
@@ -407,6 +432,8 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
             settings,
             config.fastfetch_profile_path.clone(),
         );
+        runtime.set_http_upstream();
+        runtime.set_self_identity(self_identity);
         runtime.configure_setup(
             config::ConfigPaths::setup_state_path_with(&environment)
                 .context("failed to determine setup state path")?,
@@ -2135,7 +2162,11 @@ mod tests {
     fn should_show_quick_start_is_true_for_just_completed() {
         use grammers_session::types::PeerId;
         let outcome = AuthorizationOutcome::JustCompleted {
-            self_user_id: PeerId::self_user(),
+            identity: crate::auth::SelfIdentity {
+                username: None,
+                display_name: None,
+                id: PeerId::self_user(),
+            },
         };
         assert!(should_show_quick_start(&outcome));
     }
@@ -2144,7 +2175,11 @@ mod tests {
     fn should_show_quick_start_is_false_for_existing_session() {
         use grammers_session::types::PeerId;
         let outcome = AuthorizationOutcome::ExistingSession {
-            self_user_id: PeerId::self_user(),
+            identity: crate::auth::SelfIdentity {
+                username: None,
+                display_name: None,
+                id: PeerId::self_user(),
+            },
         };
         assert!(!should_show_quick_start(&outcome));
     }

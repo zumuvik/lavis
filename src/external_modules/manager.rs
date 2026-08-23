@@ -6,7 +6,7 @@ use tracing;
 use super::{
     MAX_COMMANDS_PER_MODULE,
     manifest::{ExternalCommandDescriptor, ExternalModuleDescriptor},
-    process::{ModuleProcess, ProcessStatus},
+    process::{LegacyMetadata, LegacyMetadataView, ModuleProcess, ProcessStatus},
     v6_executor::V6TelegramExecutor,
     v6_process::V6Process,
 };
@@ -57,7 +57,10 @@ pub struct ExternalManager {
 
 #[derive(Clone)]
 enum ManagedProcess {
-    Legacy(Arc<Mutex<ModuleProcess>>),
+    Legacy {
+        process: Arc<Mutex<ModuleProcess>>,
+        metadata: Arc<LegacyMetadata>,
+    },
     V6(V6Process),
 }
 
@@ -80,26 +83,22 @@ fn process_start_kind(
 }
 
 impl ManagedProcess {
-    fn status(&self) -> Option<ProcessStatus> {
+    fn metadata_view(&self) -> LegacyMetadataView {
         match self {
-            Self::Legacy(process) => process.try_lock().ok().map(|process| process.status()),
-            Self::V6(process) => Some(process.status()),
-        }
-    }
-
-    fn descriptor(&self) -> Option<ExternalModuleDescriptor> {
-        match self {
-            Self::Legacy(process) => process
-                .try_lock()
-                .ok()
-                .map(|process| process.descriptor().clone()),
-            Self::V6(process) => Some(process.descriptor().clone()),
+            Self::Legacy { metadata, .. } => LegacyMetadataView {
+                descriptor: metadata.descriptor.clone(),
+                status: metadata.status(),
+            },
+            Self::V6(process) => LegacyMetadataView {
+                descriptor: Arc::new(process.descriptor().clone()),
+                status: process.status(),
+            },
         }
     }
 
     fn diagnostic_text(&self) -> Option<String> {
         match self {
-            Self::Legacy(_) => None,
+            Self::Legacy { .. } => None,
             Self::V6(process) => process
                 .diagnostic()
                 .map(|diagnostic| diagnostic.render_user()),
@@ -123,7 +122,7 @@ async fn retain_v6_diagnostic(process: &V6Process) -> Option<super::process::Cra
 
 async fn shutdown_process(id: &str, process: ManagedProcess) {
     match process {
-        ManagedProcess::Legacy(process) => {
+        ManagedProcess::Legacy { process, .. } => {
             let mut process = process.lock().await;
             if process.status() == ProcessStatus::Running
                 && process.graceful_shutdown().await.is_err()
@@ -193,7 +192,10 @@ impl ExternalManager {
     }
 
     pub fn has_running_process(&self, id: &str) -> bool {
-        self.processes.get(id).and_then(ManagedProcess::status) == Some(ProcessStatus::Running)
+        self.processes
+            .get(id)
+            .map(|process| process.metadata_view().status == ProcessStatus::Running)
+            .unwrap_or(false)
     }
 
     pub fn running_command_count(&self) -> usize {
@@ -201,14 +203,29 @@ impl ExternalManager {
     }
 
     pub fn statuses(&self) -> Vec<ExternalModuleStatus> {
+        let views = self.process_views();
+        self.statuses_from_views(&views)
+    }
+
+    fn process_views(&self) -> BTreeMap<String, LegacyMetadataView> {
+        self.processes
+            .iter()
+            .map(|(id, process)| (id.clone(), process.metadata_view()))
+            .collect()
+    }
+
+    fn statuses_from_views(
+        &self,
+        views: &BTreeMap<String, LegacyMetadataView>,
+    ) -> Vec<ExternalModuleStatus> {
         let mut statuses = Vec::new();
         for desc in &self.descriptors {
-            let status = if let Some(proc) = self
-                .processes
+            let metadata = views
                 .get(&desc.id)
-                .and_then(ManagedProcess::status)
-            {
-                match proc {
+                .map(|view| &*view.descriptor)
+                .unwrap_or(desc);
+            let status = if let Some(view) = views.get(&desc.id) {
+                match view.status {
                     ProcessStatus::Running => ExternalModuleRuntimeStatus::Running,
                     ProcessStatus::Failed | ProcessStatus::Crashed => {
                         ExternalModuleRuntimeStatus::Failed
@@ -222,15 +239,18 @@ impl ExternalManager {
             };
             statuses.push(ExternalModuleStatus {
                 id: desc.id.clone(),
-                display_name: desc.display_name.clone(),
-                version: desc.version.clone(),
-                author: desc.author.clone(),
-                capabilities: desc
+                display_name: metadata.display_name.clone(),
+                version: metadata.version.clone(),
+                author: metadata.author.clone(),
+                capabilities: metadata
                     .capabilities
                     .iter()
                     .map(|c| c.as_str().to_owned())
                     .collect(),
-                command_count: desc.commands.len(),
+                command_count: views
+                    .get(&desc.id)
+                    .map(|view| view.descriptor.commands.len())
+                    .unwrap_or(metadata.commands.len()),
                 status,
             });
         }
@@ -246,38 +266,40 @@ impl ExternalManager {
         if module_id.is_empty() || command_name.is_empty() {
             return None;
         }
-        let desc = self.descriptor_by_id(module_id)?;
-        if !self.has_running_process(module_id) {
+        let view = self.processes.get(module_id)?.metadata_view();
+        if view.status != ProcessStatus::Running {
             return None;
         }
-        desc.commands.iter().find(|c| c.name == command_name)?;
+        view.descriptor
+            .commands
+            .iter()
+            .find(|c| c.name == command_name)?;
         Some((module_id.to_owned(), command_name.to_owned()))
     }
 
     pub fn resolve_default_command(&self, module_id: &str) -> Option<(String, String)> {
-        let process = self.processes.get(module_id)?;
-        (process.status() == Some(ProcessStatus::Running))
-            .then(|| process.descriptor())
+        let view = self.processes.get(module_id)?.metadata_view();
+        (view.status == ProcessStatus::Running)
+            .then(|| view.descriptor.default_command.clone())
             .flatten()
-            .and_then(|descriptor| {
-                descriptor
-                    .default_command
-                    .map(|command| (module_id.to_owned(), command))
-            })
+            .map(|command| (module_id.to_owned(), command))
     }
 
     pub fn command_refs(&self) -> Vec<ExternalCommandRef> {
         let mut refs = Vec::new();
         for process in self.processes.values() {
-            if process.status() != Some(ProcessStatus::Running) {
+            let view = process.metadata_view();
+            if view.status != ProcessStatus::Running {
                 continue;
             }
-            let Some(desc) = process.descriptor() else {
-                continue;
-            };
-            for cmd in desc.commands.iter().take(MAX_COMMANDS_PER_MODULE) {
+            for cmd in view
+                .descriptor
+                .commands
+                .iter()
+                .take(MAX_COMMANDS_PER_MODULE)
+            {
                 refs.push(ExternalCommandRef {
-                    module_id: desc.id.clone(),
+                    module_id: view.descriptor.id.clone(),
                     command_name: cmd.name.clone(),
                     summary_ru: cmd.summary_ru.clone(),
                     description_ru: cmd.description_ru.clone(),
@@ -290,17 +312,17 @@ impl ExternalManager {
     }
 
     pub fn find_command(&self, module_id: &str, command_name: &str) -> Option<ExternalCommandRef> {
-        let process = self.processes.get(module_id)?;
-        if process.status() != Some(ProcessStatus::Running) {
+        let view = self.processes.get(module_id)?.metadata_view();
+        if view.status != ProcessStatus::Running {
             return None;
         }
-        let descriptor = process.descriptor()?;
-        let cmd = descriptor
+        let cmd = view
+            .descriptor
             .commands
             .iter()
             .find(|c| c.name == command_name)?;
         Some(ExternalCommandRef {
-            module_id: descriptor.id.clone(),
+            module_id: view.descriptor.id.clone(),
             command_name: cmd.name.clone(),
             summary_ru: cmd.summary_ru.clone(),
             description_ru: cmd.description_ru.clone(),
@@ -322,7 +344,7 @@ impl ExternalManager {
 
     pub fn remove_crashed(&mut self, module_id: &str) {
         if let Some(proc) = self.processes.get(module_id)
-            && proc.status() == Some(ProcessStatus::Crashed)
+            && proc.metadata_view().status == ProcessStatus::Crashed
         {
             if let ManagedProcess::V6(process) = &self.processes[module_id]
                 && let Some(diagnostic) = process.diagnostic()
@@ -354,22 +376,48 @@ impl ExternalRuntimeSnapshot {
     }
 
     pub fn from_manager(manager: &ExternalManager) -> Self {
-        let command_refs = manager.command_refs();
-        let descriptors = manager.descriptors().to_vec();
-        let module_statuses = manager.statuses();
+        let views = manager.process_views();
+        let command_refs = views
+            .values()
+            .filter(|view| view.status == ProcessStatus::Running)
+            .flat_map(|view| {
+                view.descriptor
+                    .commands
+                    .iter()
+                    .take(MAX_COMMANDS_PER_MODULE)
+                    .map(|cmd| ExternalCommandRef {
+                        module_id: view.descriptor.id.clone(),
+                        command_name: cmd.name.clone(),
+                        summary_ru: cmd.summary_ru.clone(),
+                        description_ru: cmd.description_ru.clone(),
+                        usage: cmd.usage.clone(),
+                        examples: cmd.examples.clone(),
+                    })
+            })
+            .collect::<Vec<_>>();
+        let descriptors = manager
+            .descriptors()
+            .iter()
+            .map(|descriptor| {
+                views
+                    .get(&descriptor.id)
+                    .map(|view| (*view.descriptor).clone())
+                    .unwrap_or_else(|| descriptor.clone())
+            })
+            .collect();
+        let module_statuses = manager.statuses_from_views(&views);
         let active_commands = command_refs
             .iter()
             .map(|r| format!("{}.{}", r.module_id, r.command_name))
             .collect();
-        let active_defaults = manager
-            .processes
+        let active_defaults = views
             .values()
-            .filter(|process| process.status() == Some(ProcessStatus::Running))
-            .filter_map(|process| {
-                let descriptor = process.descriptor()?;
-                descriptor
+            .filter(|view| view.status == ProcessStatus::Running)
+            .filter_map(|view| {
+                view.descriptor
                     .default_command
-                    .map(|command| (descriptor.id, command))
+                    .clone()
+                    .map(|command| (view.descriptor.id.clone(), command))
             })
             .collect();
         Self {
@@ -525,7 +573,13 @@ impl ExternalManagerHandle {
                     Ok(ProcessStartKind::Legacy) => {
                         ModuleProcess::start_with_gateway(descriptor.clone(), gateway.clone())
                             .await
-                            .map(|process| ManagedProcess::Legacy(Arc::new(Mutex::new(process))))
+                            .map(|process| {
+                                let metadata = process.metadata();
+                                ManagedProcess::Legacy {
+                                    process: Arc::new(Mutex::new(process)),
+                                    metadata,
+                                }
+                            })
                     }
                     Err(error) => Err(error),
                 };
@@ -573,7 +627,7 @@ impl ExternalManagerHandle {
         }
         .ok_or(ExternalError::Unavailable)?;
         match process {
-            ManagedProcess::Legacy(process) => {
+            ManagedProcess::Legacy { process, .. } => {
                 let mut process = process.lock().await;
                 if process.status() != ProcessStatus::Running
                     || process.descriptor().protocol_version < 3
@@ -599,7 +653,7 @@ impl ExternalManagerHandle {
         }
         .ok_or(ExternalError::Unavailable)?;
         match process {
-            ManagedProcess::Legacy(process) => {
+            ManagedProcess::Legacy { process, .. } => {
                 let mut process = process.lock().await;
                 if process.status() != ProcessStatus::Running {
                     return Err(ExternalError::Unavailable);
@@ -623,7 +677,8 @@ impl ExternalManagerHandle {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExternalManager, ExternalModuleRuntimeStatus, ProcessStartKind, process_start_kind,
+        ExternalManager, ExternalModuleRuntimeStatus, ManagedProcess, ProcessStartKind,
+        process_start_kind,
     };
     use crate::external_modules::manifest::{ExternalCommandDescriptor, ExternalModuleDescriptor};
     use std::path::PathBuf;
@@ -924,5 +979,83 @@ mod tests {
             handle.lock().await.statuses()[0].status,
             ExternalModuleRuntimeStatus::Failed
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_metadata_reads_do_not_wait_for_process_mutex() {
+        use std::{os::unix::fs::PermissionsExt, time::Duration};
+        let root = std::env::temp_dir().join(format!("lavis-legacy-meta-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let python = std::env::var_os("PATH")
+            .unwrap()
+            .to_string_lossy()
+            .split(':')
+            .map(|p| std::path::Path::new(p).join("python3"))
+            .find(|p| p.is_file())
+            .unwrap();
+        let entrypoint = root.join("run");
+        std::fs::write(&entrypoint, format!("#!{}\nimport json,sys\nfor line in sys.stdin:\n v=json.loads(line)\n if v['type']=='initialize': print(json.dumps({{'protocol_version':4,'type':'initialized','request_id':v['request_id'],'module_id':v['module_id']}}),flush=True)\n", python.display())).unwrap();
+        std::fs::set_permissions(&entrypoint, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut module = descriptor("legacy", "1");
+        module.protocol_version = 4;
+        module.module_dir = root.clone();
+        module.entrypoint = entrypoint;
+        module.default_command = Some("run".into());
+        let handle = super::ExternalManagerHandle::new(ExternalManager::new());
+        {
+            let mut m = handle.lock().await;
+            m.set_descriptors(vec![module]);
+        }
+        handle
+            .startup_enabled(&std::collections::BTreeSet::from(["legacy".into()]))
+            .await;
+        let process = {
+            let m = handle.lock().await;
+            match m.processes.get("legacy").unwrap() {
+                ManagedProcess::Legacy { process, .. } => process.clone(),
+                _ => panic!(),
+            }
+        };
+        let guard = process.lock().await;
+        let snapshot = tokio::time::timeout(Duration::from_secs(1), handle.snapshot())
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.module_statuses[0].status,
+            ExternalModuleRuntimeStatus::Running
+        );
+        assert!(snapshot.active_commands.contains("legacy.run"));
+        assert_eq!(
+            snapshot.active_defaults.get("legacy"),
+            Some(&"run".to_owned())
+        );
+        assert_eq!(snapshot.command_refs.len(), 1);
+        assert_eq!(snapshot.command_refs[0].module_id, "legacy");
+        assert_eq!(snapshot.command_refs[0].command_name, "run");
+        assert_eq!(snapshot.descriptors[0].id, "legacy");
+        assert_eq!(
+            snapshot.descriptors[0].default_command.as_deref(),
+            Some("run")
+        );
+        let manager = handle.lock().await;
+        assert_eq!(
+            manager.resolve_namespaced_command("legacy.run"),
+            Some(("legacy".to_owned(), "run".to_owned()))
+        );
+        assert_eq!(
+            manager.resolve_default_command("legacy"),
+            Some(("legacy".to_owned(), "run".to_owned()))
+        );
+        let help = manager
+            .find_command("legacy", "run")
+            .expect("help metadata");
+        assert_eq!(help.summary_ru, "run");
+        assert!(manager.has_command("legacy", "run"));
+        drop(manager);
+        drop(guard);
+        handle.shutdown_all().await;
+        let _ = std::fs::remove_dir_all(root);
     }
 }

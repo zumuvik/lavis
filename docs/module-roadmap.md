@@ -244,6 +244,10 @@ by imperative commands.
   modules.
 - Treat protocol removal as a major compatibility event with an explicit
   migration window.
+- Persist last successful upstream `info` metadata across restarts so cold
+  starts can render stale-good data while background refresh runs; track this
+  separately in #42 and only reuse revision relations for the same local build
+  SHA.
 
 ## Global acceptance gates
 
