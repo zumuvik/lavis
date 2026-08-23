@@ -29,7 +29,7 @@
       };
       corePackage = pkgs.rustPlatform.buildRustPackage {
         pname = "lavis";
-        version = "0.1.0";
+        version = "1.0.0";
         src = rustSource;
         cargoLock.lockFile = ./Cargo.lock;
         preCheck = ''

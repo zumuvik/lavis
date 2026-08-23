@@ -4729,7 +4729,7 @@ for line in sys.stdin:
         runtime.publish_upstream_revision(Some(crate::upstream::UpstreamRevision {
             revision: "b1d18f8ef407d043506c983b0d68e96c282eb1c9".to_owned(),
             relation: crate::upstream::RevisionRelation::Current,
-            version: Some("0.1.0".to_owned()),
+            version: Some("1.0.0".to_owned()),
         }));
 
         let execution = runtime.execute_info();
@@ -4739,7 +4739,7 @@ for line in sys.stdin:
             execution
                 .response
                 .text
-                .contains("Version: 0.1.0 (current ✅)")
+                .contains("Version: 1.0.0 (current ✅)")
         );
         assert!(execution.response.text.contains("Current commit: "));
         assert!(execution.response.text.contains("Upstream main: b1d18f8"));
@@ -4774,8 +4774,8 @@ for line in sys.stdin:
                 .text
                 .contains("Upstream main: unavailable")
         );
-        assert!(execution.response.text.contains("Version: 0.1.0"));
-        assert!(!execution.response.text.contains("Version: 0.1.0 ("));
+        assert!(execution.response.text.contains("Version: 1.0.0"));
+        assert!(!execution.response.text.contains("Version: 1.0.0 ("));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(execution.media.is_some());
         fs::remove_dir_all(directory).ok();
@@ -4792,7 +4792,7 @@ for line in sys.stdin:
         runtime.publish_upstream_revision(Some(crate::upstream::UpstreamRevision {
             revision: "b1d18f8ef407d043506c983b0d68e96c282eb1c9".to_owned(),
             relation: crate::upstream::RevisionRelation::Current,
-            version: Some("0.1.0".to_owned()),
+            version: Some("1.0.0".to_owned()),
         }));
         runtime.publish_upstream_failure("timeout");
 
@@ -4826,7 +4826,7 @@ for line in sys.stdin:
         let revision = crate::upstream::UpstreamRevision {
             revision: "b1d18f8ef407d043506c983b0d68e96c282eb1c9".to_owned(),
             relation: crate::upstream::RevisionRelation::Current,
-            version: Some("0.1.0".to_owned()),
+            version: Some("1.0.0".to_owned()),
         };
         runtime.publish_upstream_revision(Some(revision.clone()));
         runtime.publish_upstream_failure("timeout");
@@ -4853,7 +4853,7 @@ for line in sys.stdin:
         runtime.publish_upstream_revision(Some(crate::upstream::UpstreamRevision {
             revision: "b1d18f8ef407d043506c983b0d68e96c282eb1c9".to_owned(),
             relation: crate::upstream::RevisionRelation::Ahead { commits: 2 },
-            version: Some("0.2.0".to_owned()),
+            version: Some("1.1.0".to_owned()),
         }));
         runtime.publish_upstream_failure("rate_limited");
 
@@ -4861,16 +4861,16 @@ for line in sys.stdin:
         // successful version remain available to the local info command.
         let retained = runtime.execute_info();
         assert!(retained.response.text.contains("Upstream main: b1d18f8"));
-        assert!(retained.response.text.contains("Version: 0.1.0"));
-        assert!(retained.response.text.contains("newer available: 0.2.0 ⬆️"));
+        assert!(retained.response.text.contains("Version: 1.0.0"));
+        assert!(retained.response.text.contains("newer available: 1.1.0 ⬆️"));
 
         // An actual successful lookup with no package version is different from
         // a failure and clears the previously known version.
         runtime.publish_upstream_version(None);
         let cleared = runtime.execute_info();
         assert!(cleared.response.text.contains("Upstream main: b1d18f8"));
-        assert!(cleared.response.text.contains("Version: 0.1.0"));
-        assert!(!cleared.response.text.contains("Version: 0.1.0 ("));
+        assert!(cleared.response.text.contains("Version: 1.0.0"));
+        assert!(!cleared.response.text.contains("Version: 1.0.0 ("));
         fs::remove_dir_all(directory).ok();
     }
 
@@ -5150,7 +5150,7 @@ for line in sys.stdin:
         assert!(output.contains("System uptime: 1h 00m 00s"));
         assert!(output.contains("Memory: 10.4 MiB RSS"));
         assert!(output.contains("Commands: 2"));
-        assert!(output.contains("Version: 0.1.0"));
+        assert!(output.contains("Version: 1.0.0"));
     }
 
     #[test]

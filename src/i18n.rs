@@ -1821,7 +1821,7 @@ mod tests {
             Locale::English,
             InfoCaptionData {
                 owner: "@owner",
-                version: "0.1.0",
+                version: "1.0.0",
                 version_status: "current",
                 commit: "b1d18f8",
                 upstream: "unavailable",
@@ -1834,7 +1834,7 @@ mod tests {
             },
         );
         assert!(english.contains("┌Owner: @owner"));
-        assert!(english.contains("└Version: 0.1.0"));
+        assert!(english.contains("└Version: 1.0.0"));
         assert!(english.contains("┌Current commit: b1d18f8"));
         assert!(english.contains("├Upstream main: unavailable"));
         assert!(english.contains("└Status: unavailable"));
@@ -1848,7 +1848,7 @@ mod tests {
             Locale::Russian,
             InfoCaptionData {
                 owner: "@owner",
-                version: "0.1.0",
+                version: "1.0.0",
                 version_status: "актуальная ✅",
                 commit: "d2b0433",
                 upstream: "b1d18f8",
@@ -1862,7 +1862,7 @@ mod tests {
         );
         assert_eq!(
             russian,
-            "ℹ️ Lavis — really your userbot\n\n┌Владелец: @owner\n└Версия: 0.1.0 (актуальная ✅)\n\n┌Текущий коммит: d2b0433\n├Основная ветка: b1d18f8\n└Статус: актуален ✓\n\n┌Префикс: ,\n└Модули: 5 (3 активных)\n\n┌Хост: standalone\n└ОС: NixOS 25.05"
+            "ℹ️ Lavis — really your userbot\n\n┌Владелец: @owner\n└Версия: 1.0.0 (актуальная ✅)\n\n┌Текущий коммит: d2b0433\n├Основная ветка: b1d18f8\n└Статус: актуален ✓\n\n┌Префикс: ,\n└Модули: 5 (3 активных)\n\n┌Хост: standalone\n└ОС: NixOS 25.05"
         );
     }
 
@@ -1888,7 +1888,7 @@ mod tests {
             Locale::English,
             InfoCaptionData {
                 owner: "{version}",
-                version: "0.1.0",
+                version: "1.0.0",
                 version_status: "current",
                 commit: "b1d18f8",
                 upstream: "b1d18f8",
@@ -1903,7 +1903,7 @@ mod tests {
 
         assert!(rendered.contains("Owner: {version}"));
         assert!(!rendered.contains("Version: {version}"));
-        assert_eq!(rendered.matches("0.1.0").count(), 1);
+        assert_eq!(rendered.matches("1.0.0").count(), 1);
         // Values substituted earlier must not re-enter later placeholders.
         assert!(rendered.contains("OS: {owner} on {host}"));
         assert!(!rendered.contains("Owner: Owner:"));
