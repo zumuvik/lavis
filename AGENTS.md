@@ -380,6 +380,63 @@ Prefer a test that would have failed before the fix.
 
 Do not build excessive mocking infrastructure for a tiny bug solely to satisfy test-first dogma.
 
+### Documentation-only validation shortcut
+
+Do not recompile or rerun the Rust/Nix build suite when the code has already been fully validated and every change since that validated commit is limited to documentation or repository metadata that cannot affect the build/runtime.
+
+The following paths are normally safe for this shortcut:
+
+```text
+README.md
+README.ru.md
+CONTRIBUTING.md
+AGENTS.md
+LICENSE
+docs/**/*.md
+.gitignore
+.ignore
+```
+
+For a docs-only follow-up commit, verify the changed paths first, for example:
+
+```sh
+git diff --name-only <last-validated-commit>..HEAD
+git diff --check <last-validated-commit>..HEAD
+```
+
+If every changed path is covered by the safe list, do **not** rerun:
+
+```text
+cargo test
+cargo clippy
+cargo check
+nix build
+nix flake check
+nix run
+```
+
+Run documentation-specific checks if the repository has any.
+
+The shortcut does **not** apply when any changed file can influence compilation, tests, packaging, generated code, deployment, or runtime behavior. In particular, rerun relevant validation when changes include paths such as:
+
+```text
+src/**
+tests/**
+Cargo.toml
+Cargo.lock
+flake.nix
+flake.lock
+nix/**
+modules/**
+examples/**
+tools/**
+.tangled/**
+```
+
+Also do not use the shortcut for a documentation-looking file if it is consumed by `build.rs`, `include_str!`, code generation, packaging, runtime lookup, or another build/runtime mechanism.
+
+A merge, rebase, or metadata-only commit does not by itself require recompilation when the validated build inputs are unchanged.
+
 ---
 
 ## 16. Flaky tests
