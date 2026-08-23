@@ -2,16 +2,38 @@
   description = "Lavis Telegram userbot foundation";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+  inputs.crane = {
+    url = "github:ipetkov/crane/v0.23.4";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
 
   outputs =
-    { self, nixpkgs }:
+    { self, nixpkgs, crane }:
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
+      craneLib = crane.mkLib pkgs;
       extensionLib = import ./nix/lib/extensions.nix { inherit pkgs; };
       rustSourceRoot = toString self.outPath;
-      rustSource = pkgs.lib.cleanSourceWith {
+      productionSource = pkgs.lib.cleanSourceWith {
         name = "lavis-rust-source";
+        src = self;
+        filter =
+          path: type:
+          let
+            relative = pkgs.lib.removePrefix "/" (
+              pkgs.lib.removePrefix rustSourceRoot (toString path)
+            );
+            topLevel = builtins.head (pkgs.lib.splitString "/" relative);
+            rustInput =
+              relative == ""
+              || builtins.elem relative [ "Cargo.toml" "Cargo.lock" "build.rs" ]
+              || builtins.elem topLevel [ ".cargo" "src" "protocol" ];
+          in
+          pkgs.lib.cleanSourceFilter path type && rustInput;
+      };
+      fullTestSource = pkgs.lib.cleanSourceWith {
+        name = "lavis-rust-test-source";
         src = self;
         filter =
           path: type:
@@ -27,20 +49,19 @@
           in
           pkgs.lib.cleanSourceFilter path type && rustInput;
       };
-      corePackage = pkgs.rustPlatform.buildRustPackage {
+      commonArgs = {
         pname = "lavis";
         version = "1.0.0";
-        src = rustSource;
-        cargoLock.lockFile = ./Cargo.lock;
-        preCheck = ''
-          export XDG_STATE_HOME="$TMPDIR/lavis-test-state"
-          install -d -m 700 "$XDG_STATE_HOME"
-        '';
-        nativeBuildInputs = [
-          pkgs.makeWrapper
-          pkgs.python3 # JSON-line external-process fixtures (test-only)
-          pkgs.util-linux # `flock` session-lock test helper
-        ];
+        strictDeps = true;
+      };
+      cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
+        src = productionSource;
+      });
+      corePackage = craneLib.buildPackage (commonArgs // {
+        src = productionSource;
+        inherit cargoArtifacts;
+        doCheck = false;
+        nativeBuildInputs = [ pkgs.makeWrapper ];
         postFixup = ''
           wrapProgram $out/bin/lavis \
             --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.fastfetch ]} \
@@ -53,7 +74,20 @@
           mainProgram = "lavis";
           platforms = pkgs.lib.platforms.linux;
         };
-      };
+      });
+      testPackage = craneLib.cargoTest (commonArgs // {
+        src = fullTestSource;
+        inherit cargoArtifacts;
+        cargoTestExtraArgs = "--all-targets --all-features";
+        preCheck = ''
+          export XDG_STATE_HOME="$TMPDIR/lavis-test-state"
+          install -d -m 700 "$XDG_STATE_HOME"
+        '';
+        nativeBuildInputs = [
+          pkgs.python3 # JSON-line external-process fixtures (test-only)
+          pkgs.util-linux # `flock` session-lock test helper
+        ];
+      });
       # Keep the Git revision in a cheap outer wrapper instead of the Rust
       # derivation. Documentation/Nix/module-only commits can then reuse the
       # already compiled core package while `,info` still reports the real HEAD.
@@ -412,6 +446,7 @@ PY
       };
       checks.${system} = {
         default = package;
+        rust-tests = testPackage;
         merge-enabled-extensions = mergeEnabledCheck;
         nixos-module = moduleEvalCheck;
         prefix-validator = prefixValidatorCheck;
