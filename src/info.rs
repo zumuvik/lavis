@@ -1,6 +1,6 @@
 //! Telegram-independent helpers backing the `info` command caption.
 
-use std::io::Read;
+use std::{io::Read, sync::OnceLock};
 
 use crate::auth::SelfIdentity;
 
@@ -88,10 +88,21 @@ pub fn short_commit(rev: &str) -> &str {
     rev.get(..7).unwrap_or(rev)
 }
 
-/// Compile-time build revision, injected by the Nix build as `LAVIS_GIT_REV`.
-/// Development builds without the variable report `unknown`.
+/// Build revision supplied by the cheap Nix wrapper at process start. Keeping
+/// the revision out of the Rust derivation lets documentation-only commits
+/// reuse the already compiled binary. Development builds fall back to a
+/// compile-time value when one is explicitly provided, then to `unknown`.
 pub fn build_rev() -> &'static str {
-    option_env!("LAVIS_GIT_REV").unwrap_or("unknown")
+    static BUILD_REV: OnceLock<String> = OnceLock::new();
+    BUILD_REV
+        .get_or_init(|| {
+            std::env::var("LAVIS_GIT_REV")
+                .ok()
+                .filter(|rev| !rev.is_empty() && rev.len() <= 40)
+                .or_else(|| option_env!("LAVIS_GIT_REV").map(str::to_owned))
+                .unwrap_or_else(|| "unknown".to_owned())
+        })
+        .as_str()
 }
 
 #[cfg(test)]
