@@ -222,7 +222,7 @@
           existingTmpfiles = pkgs.writeText "lavis-existing-user-tmpfiles" (
             nixpkgs.lib.concatStringsSep "\n" evaluated.config.systemd.tmpfiles.rules
           );
-          defaultTmpfiles = pkgs.writeText "lavis-default-user-tmpfiles" (
+          defaultTmpfiles = pkgs.writeText "lavis-default-tmpfiles" (
             nixpkgs.lib.concatStringsSep "\n" defaultEvaluated.config.systemd.tmpfiles.rules
           );
         } ''
