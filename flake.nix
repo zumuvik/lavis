@@ -32,7 +32,18 @@
         version = "1.0.0";
         src = rustSource;
         cargoLock.lockFile = ./Cargo.lock;
+        # rustc spawns helper threads in addition to Cargo's workers. Leaving
+        # all logical CPUs available here can exhaust a host/cgroup pid budget
+        # during a larger NixOS rebuild and turn that pressure into a rustc ICE.
+        preBuild = ''
+          if [ "$NIX_BUILD_CORES" -gt 4 ]; then
+            export NIX_BUILD_CORES=4
+          fi
+        '';
         preCheck = ''
+          if [ "$NIX_BUILD_CORES" -gt 4 ]; then
+            export NIX_BUILD_CORES=4
+          fi
           export XDG_STATE_HOME="$TMPDIR/lavis-test-state"
           install -d -m 700 "$XDG_STATE_HOME"
         '';
