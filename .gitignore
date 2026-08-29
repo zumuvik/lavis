@@ -19,3 +19,4 @@
 *.sqlite3
 *.db
 *.db-journal
+/modules/cleaner/bin/
