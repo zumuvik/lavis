@@ -149,6 +149,7 @@ func (m *module) handle(req request) response {
 			base.Type = "error"
 			base.Code = "BAD_INPUT"
 			base.Message = err.Error()
+			fmt.Fprintf(os.Stderr, "execute %s %s: %v\n", req.Command, req.Arguments, err)
 		} else {
 			base.Text = text
 		}

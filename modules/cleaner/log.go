@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"math/rand"
 	"time"
@@ -119,8 +120,17 @@ func (m *module) findTopicID(ctx context.Context, peer *tg.InputPeerChannel) (in
 }
 
 func decodeForumTopics(body []byte) (int, error) {
+	// messages.forumTopics is boxed in raw.invoke responses, but gotd only
+	// generates a bare decoder for it: strip the constructor first.
+	if len(body) < 4 {
+		return 0, fmt.Errorf("decode forum topics: short body")
+	}
+	id := binary.LittleEndian.Uint32(body[:4])
+	if id != tg.MessagesForumTopicsTypeID {
+		return 0, fmt.Errorf("unexpected forum topics constructor %x", id)
+	}
 	var value tg.MessagesForumTopics
-	if err := value.DecodeBare(buffer(body)); err != nil {
+	if err := value.DecodeBare(buffer(body[4:])); err != nil {
 		return 0, fmt.Errorf("decode forum topics: %w", err)
 	}
 	for _, topic := range value.GetTopics() {

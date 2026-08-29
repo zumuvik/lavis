@@ -148,6 +148,44 @@ func TestScannerLineBoundary(t *testing.T) {
 	_ = scanner
 }
 
+
+func TestNormalizeConstructors(t *testing.T) {
+	body := []byte{0x01, 0x1c, 0xb1, 0x32, 0x1c, 0x88, 0x43, 0x77, 0x31}
+	want := []byte{0x01, 0xc6, 0x34, 0x9f, 0xd4, 0x83, 0xcc, 0xb8, 0xb1}
+	if got := normalizeConstructors(body); !bytes.Equal(got, want) {
+		t.Fatalf("got %x want %x", got, want)
+	}
+	plain := []byte{0x01, 0x02}
+	if got := normalizeConstructors(plain); !bytes.Equal(got, plain) {
+		t.Fatal("untouched body must not be copied")
+	}
+}
+
+func TestDecodeForumTopicsBoxed(t *testing.T) {
+	value := &tg.MessagesForumTopics{
+		Count: 2,
+		Topics: []tg.ForumTopicClass{
+			&tg.ForumTopicDeleted{ID: 7},
+			&tg.ForumTopic{ID: 12, Title: logTopicTitle, Date: 100, Peer: &tg.PeerChannel{ChannelID: 42}, FromID: &tg.PeerChannel{ChannelID: 42}, NotifySettings: tg.PeerNotifySettings{}},
+		},
+		Messages: []tg.MessageClass{},
+		Chats:    []tg.ChatClass{},
+		Users:    []tg.UserClass{},
+		Pts:      5,
+	}
+	var buf bin.Buffer
+	if err := value.Encode(&buf); err != nil {
+		t.Fatal(err)
+	}
+	id, err := decodeForumTopics(buf.Copy())
+	if err != nil {
+		t.Fatalf("decodeForumTopics: %v", err)
+	}
+	if id != 12 {
+		t.Fatalf("topic id mismatch: %d", id)
+	}
+}
+
 type writerFunc func(p []byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }

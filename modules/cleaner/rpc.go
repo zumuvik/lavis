@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -181,7 +182,11 @@ func (c *rawCaller) call(ctx context.Context, request bin.Encoder) ([]byte, erro
 		}
 		return nil, fmt.Errorf("telegram rpc failed")
 	}
-	return rawBody(result.Result)
+	body, err := rawBody(result.Result)
+	if err != nil {
+		return nil, err
+	}
+	return normalizeConstructors(body), nil
 }
 
 type rawResultEnvelope struct {
@@ -207,6 +212,52 @@ func rawBody(raw json.RawMessage) ([]byte, error) {
 		return nil, fmt.Errorf("raw body is not 4-byte aligned (%d)", len(body))
 	}
 	return body, nil
+}
+
+// gotd/td v0.161.0 is the newest release and predates the Telegram schema
+// revision that rotated `channel` to id 0x1c32b11c. The generated field list
+// is already identical to the current layer (only flags2.20 is unused extra),
+// so responses are normalized by rewriting the rotated id to the pinned one.
+// The 0x1c byte cannot legally appear in the string payloads that could
+// otherwise false-match.
+type constructorAlias struct {
+	rotated []byte
+	pinned  []byte
+}
+
+// Telegram rotates entity constructor ids across schema layers; gotd/td's
+// newest release still decodes the previous ids with an otherwise compatible
+// field layout. Only exact 4-byte constructor positions are rewritten; the
+// rotated ids all contain bytes (0x1c, 0x88 control ranges) that cannot
+// appear inside the string payloads of these responses.
+var constructorAliases = []constructorAlias{
+	{[]byte{0x1c, 0xb1, 0x32, 0x1c}, []byte{0xc6, 0x34, 0x9f, 0xd4}}, // 0x1c32b11c -> 0xd49f34c6 channel
+	{[]byte{0x88, 0x43, 0x77, 0x31}, []byte{0x83, 0xcc, 0xb8, 0xb1}}, // 0x31774388 -> 0xb1b8cc83 user
+}
+
+func normalizeConstructors(body []byte) []byte {
+	var out []byte
+	for _, alias := range constructorAliases {
+		if bytes.Index(body, alias.rotated) < 0 {
+			continue
+		}
+		out = make([]byte, 0, len(body))
+		for {
+			i := bytes.Index(body, alias.rotated)
+			if i < 0 {
+				break
+			}
+			out = append(out, body[:i]...)
+			out = append(out, alias.pinned...)
+			body = body[i+len(alias.rotated):]
+		}
+		out = append(out, body...)
+		body = out
+	}
+	if out == nil {
+		return body
+	}
+	return out
 }
 
 func buffer(body []byte) *bin.Buffer {

@@ -17,10 +17,12 @@ const (
 	batchSize     = 100
 	pageLimit     = 100
 
-	// getDialogs on large accounts exceeds the host's 5s per-invoke budget,
-	// so the cache is paged in small requests that each fit the deadline.
-	dialogPageLimit = 25
-	dialogMaxPages  = 8
+	// getDialogs responses embed the top message of every dialog, so even a
+	// small page can exceed the 64KB v6 line limit once base64-encoded.
+	// Pages must stay tiny and results are persisted incrementally: a slow or
+	// truncated sync still leaves a usable cache behind.
+	dialogPageLimit = 10
+	dialogMaxPages  = 30
 )
 
 // runBackground is the module's autonomous loop: a dialog-cache sync once an
@@ -92,16 +94,30 @@ func (m *module) syncDialogs(ctx context.Context) error {
 		}
 		collected = append(collected, page...)
 		pages++
+		// Persist incrementally so a partial sync is still useful to
+		// commands; offset paging repeats the boundary dialog, so dedupe by id.
+		if err := m.withState(func(s *state) error {
+			seenID := make(map[int64]bool)
+			unique := make([]groupEntry, 0, len(collected))
+			for _, entry := range collected {
+				if seenID[entry.ID] {
+					continue
+				}
+				seenID[entry.ID] = true
+				unique = append(unique, entry)
+			}
+			s.Discovered = unique
+			s.LastSync = time.Now().Unix()
+			return nil
+		}); err != nil {
+			return err
+		}
 		if !hasMore || nextPeer == nil {
 			break
 		}
 		offsetDate, offsetID, offsetPeer = nextDate, nextID, nextPeer
 	}
-	return m.withState(func(s *state) error {
-		s.Discovered = collected
-		s.LastSync = time.Now().Unix()
-		return nil
-	})
+	return nil
 }
 
 // decodeDialogPage returns the megagroup entries of one getDialogs page plus
