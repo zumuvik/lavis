@@ -11,11 +11,12 @@ import (
 )
 
 const (
-	syncInterval  = time.Hour
-	cleanInterval = 30 * time.Minute
-	maxAge        = 12 * time.Hour
-	batchSize     = 100
-	pageLimit     = 100
+	syncInterval    = time.Hour
+	cleanInterval   = 30 * time.Minute
+	maxAge          = 12 * time.Hour
+	batchSize       = 100
+	pageLimit       = 100
+	historyMaxPages = 50
 
 	// getDialogs responses embed the top message of every dialog, so even a
 	// small page can exceed the 64KB v6 line limit once base64-encoded.
@@ -299,7 +300,11 @@ func (m *module) cleanPass(ctx context.Context) error {
 }
 
 // cleanGroup deletes the account's own messages older than maxAge in one
-// group and returns the count.
+// group and returns the count. messages.search from_id filtering proved
+// unreliable through the raw transport (it returned whole-chat pages), so
+// the history is walked explicitly and every candidate is verified
+// client-side: author == self, date older than cutoff. Foreign and service
+// messages are never selected.
 func (m *module) cleanGroup(ctx context.Context, group groupEntry) (int, error) {
 	peer := &tg.InputPeerChannel{ChannelID: group.ID, AccessHash: group.AccessHash}
 	cutoff := int(time.Now().Add(-maxAge).Unix())
@@ -307,82 +312,133 @@ func (m *module) cleanGroup(ctx context.Context, group groupEntry) (int, error) 
 	deleted := 0
 	seen := make(map[int]bool)
 	offsetID := 0
-	for page := 0; page < 50; page++ {
-		body, err := m.call.call(ctx, &tg.MessagesSearchRequest{
-			Peer:      peer,
-			Q:         "",
-			FromID:    &tg.InputPeerSelf{},
-			Filter:    &tg.InputMessagesFilterEmpty{},
-			MaxDate:   cutoff,
-			OffsetID:  offsetID,
-			AddOffset: 0,
-			Limit:     pageLimit,
-			MaxID:     0,
-			MinID:     0,
-			Hash:      0,
+	selfID := m.selfID.Load()
+	for page := 0; page < historyMaxPages; page++ {
+		body, err := m.call.call(ctx, &tg.MessagesGetHistoryRequest{
+			Peer:       peer,
+			OffsetID:   offsetID,
+			OffsetDate: 0,
+			AddOffset:  0,
+			Limit:      pageLimit,
+			MaxID:      0,
+			MinID:      0,
+			Hash:       0,
 		})
 		if err != nil {
-			return deleted, fmt.Errorf("search: %w", err)
+			return deleted, fmt.Errorf("history: %w", err)
 		}
-		messages, err := decodeSearchMessages(body)
+		messages, users, err := decodeHistoryPage(body)
 		if err != nil {
-			return deleted, fmt.Errorf("decode search: %w", err)
+			return deleted, fmt.Errorf("decode history: %w", err)
 		}
 		if len(messages) == 0 {
 			break
 		}
-		var ids []int
-		for _, message := range messages {
-			id := message.GetID()
-			if id == 0 || seen[id] {
-				continue
+		if selfID == 0 {
+			selfID = findSelfID(users)
+			if selfID == 0 {
+				return deleted, fmt.Errorf("self user not present in history response")
 			}
-			seen[id] = true
-			ids = append(ids, id)
+			m.selfID.Store(selfID)
 		}
+		ids, minID := ownDeletable(messages, selfID, cutoff, seen)
 		for start := 0; start < len(ids); start += batchSize {
 			end := start + batchSize
 			if end > len(ids) {
 				end = len(ids)
 			}
 			batch := ids[start:end]
-			if err := m.deleteBatch(ctx, batch); err != nil {
-				return deleted, fmt.Errorf("deleteMessage: %w", err)
+			channel := &tg.InputChannel{ChannelID: group.ID, AccessHash: group.AccessHash}
+			if err := m.deleteBatch(ctx, channel, batch); err != nil {
+				return deleted, fmt.Errorf("deleteMessages: %w", err)
 			}
 			deleted += len(batch)
 			time.Sleep(500 * time.Millisecond)
 		}
+		if minID == 0 || (offsetID != 0 && minID >= offsetID) {
+			break
+		}
+		offsetID = minID
 		if len(messages) < pageLimit {
 			break
 		}
-		if len(ids) == 0 {
-			break
-		}
-		offsetID = ids[len(ids)-1]
 	}
 	return deleted, nil
 }
 
-func decodeSearchMessages(body []byte) ([]tg.MessageClass, error) {
+// ownDeletable selects ids of real messages authored by selfID and older
+// than cutoff, and reports the smallest message id on the page used to
+// advance the history cursor.
+func ownDeletable(messages []tg.MessageClass, selfID int64, cutoff int, seen map[int]bool) ([]int, int) {
+	var ids []int
+	minID := 0
+	for _, message := range messages {
+		id := message.GetID()
+		if id == 0 {
+			continue
+		}
+		if minID == 0 || id < minID {
+			minID = id
+		}
+		concrete, ok := message.(*tg.Message)
+		if !ok {
+			continue
+		}
+		value, has := concrete.GetFromID()
+		from, ok := value.(*tg.PeerUser)
+		if !has || !ok || from.UserID != selfID {
+			continue
+		}
+		date := concrete.GetDate()
+		if date == 0 || date >= cutoff {
+			continue
+		}
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	return ids, minID
+}
+
+func findSelfID(users []tg.UserClass) int64 {
+	for _, user := range users {
+		concrete, ok := user.(*tg.User)
+		if !ok {
+			continue
+		}
+		if concrete.GetSelf() {
+			return concrete.GetID()
+		}
+	}
+	return 0
+}
+
+func decodeHistoryPage(body []byte) ([]tg.MessageClass, []tg.UserClass, error) {
 	value, err := tg.DecodeMessagesMessages(buffer(body))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	switch m := value.(type) {
 	case *tg.MessagesMessages:
-		return m.GetMessages(), nil
+		return m.GetMessages(), m.GetUsers(), nil
 	case *tg.MessagesMessagesSlice:
-		return m.GetMessages(), nil
+		return m.GetMessages(), m.GetUsers(), nil
 	case *tg.MessagesChannelMessages:
-		return m.GetMessages(), nil
+		return m.GetMessages(), m.GetUsers(), nil
 	case *tg.MessagesMessagesNotModified:
-		return nil, nil
+		return nil, nil, nil
 	default:
-		return nil, fmt.Errorf("unexpected messages response %T", value)
+		return nil, nil, fmt.Errorf("unexpected messages response %T", value)
 	}
 }
 
-func (m *module) deleteBatch(ctx context.Context, ids []int) error {
-	_, err := m.call.call(ctx, &tg.MessagesDeleteMessagesRequest{Revoke: true, ID: ids})
+// deleteBatch revokes messages through channels.deleteMessages with an
+// explicit InputChannel. messages.deleteMessages resolves bare message ids
+// on the target DC and silently returns pts_count=0 when the ids are not
+// peer-encoded, so it cannot be used safely from a raw transport.
+func (m *module) deleteBatch(ctx context.Context, channel tg.InputChannelClass, ids []int) error {
+	_, err := m.call.call(ctx, &tg.ChannelsDeleteMessagesRequest{Channel: channel, ID: ids})
 	return err
 }
