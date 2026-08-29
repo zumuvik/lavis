@@ -17,9 +17,10 @@ const (
 	batchSize     = 100
 	pageLimit     = 100
 
-	// getDialogs responses travel as one 64KB-capped JSON line; 200 dialogs
-	// with access hashes can exceed it, so the page is deliberately smaller.
-	dialogPageLimit = 100
+	// getDialogs on large accounts exceeds the host's 5s per-invoke budget,
+	// so the cache is paged in small requests that each fit the deadline.
+	dialogPageLimit = 25
+	dialogMaxPages  = 8
 )
 
 // runBackground is the module's autonomous loop: a dialog-cache sync once an
@@ -60,48 +61,99 @@ func (m *module) runBackground() {
 	}
 }
 
-// syncDialogs refreshes the discovered-group cache via messages.getDialogs
-// and persists it. Failures are logged by the caller and never fatal.
+// syncDialogs refreshes the discovered-group cache by paging
+// messages.getDialogs and persists it. Pages are small because the host
+// aborts any single invoke that exceeds the v6 per-RPC deadline.
 func (m *module) syncDialogs(ctx context.Context) error {
-	body, err := m.call.call(ctx, &tg.MessagesGetDialogsRequest{
-		OffsetDate: 0,
-		OffsetID:   0,
-		OffsetPeer: &tg.InputPeerEmpty{},
-		Limit:      dialogPageLimit,
-		Hash:       0,
-	})
-	if err != nil {
-		return err
-	}
-	dialogs, err := decodeDialogs(body)
-	if err != nil {
-		return fmt.Errorf("decode dialogs: %w", err)
+	var collected []groupEntry
+	var offsetDate, offsetID int
+	var offsetPeer tg.InputPeerClass = &tg.InputPeerEmpty{}
+	pages := 0
+	for pages < dialogMaxPages {
+		body, err := m.call.call(ctx, &tg.MessagesGetDialogsRequest{
+			OffsetDate: offsetDate,
+			OffsetID:   offsetID,
+			OffsetPeer: offsetPeer,
+			Limit:      dialogPageLimit,
+			Hash:       0,
+		})
+		if err != nil {
+			if pages == 0 {
+				return err
+			}
+			break
+		}
+		page, nextDate, nextID, nextPeer, hasMore, err := decodeDialogPage(body)
+		if err != nil {
+			if pages == 0 {
+				return fmt.Errorf("decode dialogs: %w", err)
+			}
+			break
+		}
+		collected = append(collected, page...)
+		pages++
+		if !hasMore || nextPeer == nil {
+			break
+		}
+		offsetDate, offsetID, offsetPeer = nextDate, nextID, nextPeer
 	}
 	return m.withState(func(s *state) error {
-		s.Discovered = dialogs
+		s.Discovered = collected
 		s.LastSync = time.Now().Unix()
 		return nil
 	})
 }
 
-func decodeDialogs(body []byte) ([]groupEntry, error) {
+// decodeDialogPage returns the megagroup entries of one getDialogs page plus
+// the offset (date/id/peer) of its last dialog for the next request.
+func decodeDialogPage(body []byte) ([]groupEntry, int, int, tg.InputPeerClass, bool, error) {
 	value, err := tg.DecodeMessagesDialogs(buffer(body))
 	if err != nil {
-		return nil, err
+		return nil, 0, 0, nil, false, err
 	}
-	var chats []tg.ChatClass
+	var (
+		chatClasses []tg.ChatClass
+		dialogs     []tg.DialogClass
+		hasMore     bool
+	)
 	switch d := value.(type) {
 	case *tg.MessagesDialogs:
-		chats = d.GetChats()
+		chatClasses = d.GetChats()
+		dialogs = d.GetDialogs()
+		hasMore = len(dialogs) >= dialogPageLimit
 	case *tg.MessagesDialogsSlice:
-		chats = d.GetChats()
+		chatClasses = d.GetChats()
+		dialogs = d.GetDialogs()
+		hasMore = len(dialogs) >= dialogPageLimit
 	case *tg.MessagesDialogsNotModified:
-		return nil, fmt.Errorf("dialogs not modified")
+		return nil, 0, 0, nil, false, fmt.Errorf("dialogs not modified")
 	default:
-		return nil, fmt.Errorf("unexpected dialogs response %T", value)
+		return nil, 0, 0, nil, false, fmt.Errorf("unexpected dialogs response %T", value)
+	}
+	accessHashes := make(map[int64]int64)
+	for _, chat := range chatClasses {
+		channel, ok := chat.(*tg.Channel)
+		if !ok {
+			continue
+		}
+		if hash, has := channel.GetAccessHash(); has {
+			accessHashes[channel.GetID()] = hash
+		}
+	}
+	userHashes := make(map[int64]int64)
+	if withUsers, ok := value.(interface{ GetUsers() []tg.UserClass }); ok {
+		for _, user := range withUsers.GetUsers() {
+			concrete, ok := user.(*tg.User)
+			if !ok {
+				continue
+			}
+			if hash, has := concrete.GetAccessHash(); has {
+				userHashes[concrete.GetID()] = hash
+			}
+		}
 	}
 	var entries []groupEntry
-	for _, chat := range chats {
+	for _, chat := range chatClasses {
 		channel, ok := chat.(*tg.Channel)
 		if !ok || !channel.Megagroup {
 			continue
@@ -117,7 +169,56 @@ func decodeDialogs(body []byte) ([]groupEntry, error) {
 			Forum:      channel.Forum,
 		})
 	}
-	return entries, nil
+	if len(dialogs) == 0 {
+		return entries, 0, 0, nil, false, nil
+	}
+	messageDates := make(map[int]int)
+	if withMessages, ok := value.(interface{ GetMessages() []tg.MessageClass }); ok {
+		for _, message := range withMessages.GetMessages() {
+			if concrete, ok := message.(*tg.Message); ok {
+				messageDates[concrete.GetID()] = concrete.GetDate()
+			}
+		}
+	}
+	last := dialogs[len(dialogs)-1]
+	var peer tg.PeerClass
+	var date, id int
+	switch d := last.(type) {
+	case *tg.Dialog:
+		peer, id = d.Peer, d.TopMessage
+		if found, has := messageDates[id]; has {
+			date = found
+		}
+	case *tg.DialogFolder:
+		peer, id = d.Peer, d.TopMessage
+		if found, has := messageDates[id]; has {
+			date = found
+		}
+	default:
+		return entries, 0, 0, nil, false, nil
+	}
+	// dialog.peer is a bare Peer; the paging offset needs an InputPeer with
+	// the matching access hash resolved from the same response.
+	var next tg.InputPeerClass
+	switch p := peer.(type) {
+	case *tg.PeerChat:
+		next = &tg.InputPeerChat{ChatID: p.ChatID}
+	case *tg.PeerChannel:
+		hash, known := accessHashes[p.ChannelID]
+		if !known {
+			return entries, 0, 0, nil, false, nil
+		}
+		next = &tg.InputPeerChannel{ChannelID: p.ChannelID, AccessHash: hash}
+	case *tg.PeerUser:
+		hash, known := userHashes[p.UserID]
+		if !known {
+			return entries, 0, 0, nil, false, nil
+		}
+		next = &tg.InputPeerUser{UserID: p.UserID, AccessHash: hash}
+	default:
+		return entries, 0, 0, nil, false, nil
+	}
+	return entries, date, id, next, hasMore, nil
 }
 
 // cleanPass removes the account's own messages older than maxAge in every

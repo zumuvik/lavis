@@ -13,6 +13,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/gotd/td/bin"
+	"github.com/gotd/td/tg"
 )
 
 func TestBase64ChunksRoundTrip(t *testing.T) {
@@ -148,6 +151,53 @@ func TestScannerLineBoundary(t *testing.T) {
 type writerFunc func(p []byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
+func TestDecodeDialogPageCursor(t *testing.T) {
+	value := &tg.MessagesDialogsSlice{
+		Count: 2,
+		Dialogs: []tg.DialogClass{
+			&tg.Dialog{Peer: &tg.PeerChannel{ChannelID: 42}, TopMessage: 44},
+			&tg.Dialog{Peer: &tg.PeerChannel{ChannelID: 43}, TopMessage: 55},
+		},
+		Messages: []tg.MessageClass{
+			&tg.Message{ID: 44, Date: 100, PeerID: &tg.PeerChannel{ChannelID: 42}},
+			&tg.Message{ID: 55, Date: 200, PeerID: &tg.PeerChannel{ChannelID: 43}},
+		},
+		Chats: []tg.ChatClass{
+			(func() *tg.Channel {
+				var flags bin.Fields
+				flags.Set(0) // access_hash present
+				flags.Set(4) // megagroup
+				return &tg.Channel{Flags: flags, ID: 43, AccessHash: 99, Title: "Group", Megagroup: true, Photo: &tg.ChatPhotoEmpty{}, Date: 100}
+			})(),
+		},
+		Users: []tg.UserClass{},
+	}
+	var buf bin.Buffer
+	if err := value.Encode(&buf); err != nil {
+		t.Fatal(err)
+	}
+	entries, date, id, peer, hasMore, err := decodeDialogPage(buf.Copy())
+	if err != nil {
+		t.Fatalf("decodeDialogPage: %v", err)
+	}
+	if hasMore {
+		t.Fatal("short page must not request another")
+	}
+	if len(entries) != 1 || entries[0].ID != 43 || entries[0].AccessHash != 99 || entries[0].Title != "Group" {
+		t.Fatalf("entries mismatch: %+v", entries)
+	}
+	if date != 200 || id != 55 {
+		t.Fatalf("cursor mismatch: %d %d", date, id)
+	}
+	channel, ok := peer.(*tg.InputPeerChannel)
+	if !ok || channel.ChannelID != 43 {
+		t.Fatalf("peer mismatch: %#v", peer)
+	}
+	if channel.AccessHash != 99 {
+		t.Fatalf("access hash must be backfilled from chats: %d", channel.AccessHash)
+	}
+}
 
 func TestDispatchConsumesStaleResults(t *testing.T) {
 	rpc := newRPC(io.Discard)
