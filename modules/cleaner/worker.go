@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -11,12 +12,23 @@ import (
 )
 
 const (
-	syncInterval    = time.Hour
-	cleanInterval   = 30 * time.Minute
-	maxAge          = 12 * time.Hour
-	batchSize       = 100
-	pageLimit       = 100
-	historyMaxPages = 50
+	syncInterval  = time.Hour
+	cleanInterval = 30 * time.Minute
+	maxAge        = 12 * time.Hour
+	batchSize     = 100
+	// A getHistory page embeds message bodies plus user/chat entities and is
+	// base64-wrapped for the raw transport; 100 messages routinely exceed
+	// the 64KB line cap, so the host rejects them as invalid responses.
+	pageLimit = 25
+
+	// Number of message-id slots skipped past an unreadable oversized
+	// message when even limit=1 fails at the cursor.
+	blindSkip = 64
+
+	// One pass must be able to sweep the full history of a selected group;
+	// a 50-page cap silently stopped long before reaching older own
+	// messages (~200 left behind in practice).
+	historyMaxPages = 2000
 
 	// getDialogs responses embed the top message of every dialog, so even a
 	// small page can exceed the 64KB v6 line limit once base64-encoded.
@@ -105,12 +117,17 @@ func (m *module) syncDialogs(ctx context.Context) error {
 	var offsetPeer tg.InputPeerClass = &tg.InputPeerEmpty{}
 	pages := 0
 	for pages < dialogMaxPages {
-		body, err := m.call.call(ctx, &tg.MessagesGetDialogsRequest{
-			OffsetDate: offsetDate,
-			OffsetID:   offsetID,
-			OffsetPeer: offsetPeer,
-			Limit:      dialogPageLimit,
-			Hash:       0,
+		var body []byte
+		err := callWithFloodRetry(ctx, func() error {
+			var callErr error
+			body, callErr = m.call.call(ctx, &tg.MessagesGetDialogsRequest{
+				OffsetDate: offsetDate,
+				OffsetID:   offsetID,
+				OffsetPeer: offsetPeer,
+				Limit:      dialogPageLimit,
+				Hash:       0,
+			})
+			return callErr
 		})
 		if err != nil {
 			if pages == 0 {
@@ -313,23 +330,66 @@ func (m *module) cleanGroup(ctx context.Context, group groupEntry) (int, error) 
 	seen := make(map[int]bool)
 	offsetID := 0
 	selfID := m.selfID.Load()
+walk:
 	for page := 0; page < historyMaxPages; page++ {
-		body, err := m.call.call(ctx, &tg.MessagesGetHistoryRequest{
-			Peer:       peer,
-			OffsetID:   offsetID,
-			OffsetDate: 0,
-			AddOffset:  0,
-			Limit:      pageLimit,
-			MaxID:      0,
-			MinID:      0,
-			Hash:       0,
-		})
-		if err != nil {
-			return deleted, fmt.Errorf("history: %w", err)
+		// Media-heavy pages can still overflow the raw transport line cap
+		// even at 25 messages; an internal transport failure degrades the
+		// window size instead of aborting the walk (limit 1 always fits, a
+		// single message is far smaller than 48KB).
+		limit := pageLimit
+		var messages []tg.MessageClass
+		var users []tg.UserClass
+		skipped := false
+		for {
+			var body []byte
+			err := callWithFloodRetry(ctx, func() error {
+				var callErr error
+				body, callErr = m.call.call(ctx, &tg.MessagesGetHistoryRequest{
+					Peer:       peer,
+					OffsetID:   offsetID,
+					OffsetDate: 0,
+					AddOffset:  0,
+					Limit:      limit,
+					MaxID:      0,
+					MinID:      0,
+					Hash:       0,
+				})
+				return callErr
+			})
+			if err != nil {
+				var rpcErr *TelegramRPCError
+				if errors.As(err, &rpcErr) && rpcErr.Kind == "internal" {
+					if limit > 1 {
+						if limit > 5 {
+							limit = 5
+						} else {
+							limit = 1
+						}
+						continue
+					}
+					// A single message larger than the host raw-TL cap is
+					// unreadable forever and would wedge the cursor: lower
+					// the anchor past it. getHistory always returns the
+					// nearest older messages, so everything except the
+					// oversized one stays reachable.
+					if offsetID <= blindSkip {
+						// History bottom reached at an unreadable message.
+						break walk
+					}
+					offsetID -= blindSkip
+					skipped = true
+					break
+				}
+				return deleted, fmt.Errorf("history limit=%d offset=%d: %w", limit, offsetID, err)
+			}
+			messages, users, err = decodeHistoryPage(body)
+			if err != nil {
+				return deleted, fmt.Errorf("decode history: %w", err)
+			}
+			break
 		}
-		messages, users, err := decodeHistoryPage(body)
-		if err != nil {
-			return deleted, fmt.Errorf("decode history: %w", err)
+		if skipped {
+			continue
 		}
 		if len(messages) == 0 {
 			break
@@ -349,7 +409,9 @@ func (m *module) cleanGroup(ctx context.Context, group groupEntry) (int, error) 
 			}
 			batch := ids[start:end]
 			channel := &tg.InputChannel{ChannelID: group.ID, AccessHash: group.AccessHash}
-			if err := m.deleteBatch(ctx, channel, batch); err != nil {
+			if err := callWithFloodRetry(ctx, func() error {
+				return m.deleteBatch(ctx, channel, batch)
+			}); err != nil {
 				return deleted, fmt.Errorf("deleteMessages: %w", err)
 			}
 			deleted += len(batch)
@@ -359,8 +421,12 @@ func (m *module) cleanGroup(ctx context.Context, group groupEntry) (int, error) 
 			break
 		}
 		offsetID = minID
-		if len(messages) < pageLimit {
+		if len(messages) < limit {
 			break
+		}
+		if len(ids) == 0 {
+			// Keep pagination gentle on pages that do not delete anything.
+			time.Sleep(100 * time.Millisecond)
 		}
 	}
 	return deleted, nil

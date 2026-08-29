@@ -185,6 +185,75 @@ func TestDecodeForumTopicsBoxed(t *testing.T) {
 	}
 }
 
+func TestOwnDeletableNeverSelectsForeignOrRecent(t *testing.T) {
+	const selfID int64 = 100
+	const cutoff = 10000
+	mk := func(id int, author int64, date int) tg.MessageClass {
+		msg := &tg.Message{ID: id, Date: date, PeerID: &tg.PeerChannel{ChannelID: 7}}
+		if author != 0 {
+			msg.SetFromID(&tg.PeerUser{UserID: author})
+		}
+		return msg
+	}
+	messages := []tg.MessageClass{
+		mk(50, selfID, 9000),                   // own, old -> delete
+		mk(40, 200, 9000),                      // foreign, old -> keep
+		mk(30, selfID, 10001),                  // own, recent -> keep
+		mk(20, 0, 9000),                        // service-ish (no from) -> keep
+		&tg.MessageService{ID: 15, Date: 9000}, // service message -> keep
+		mk(10, selfID, 5000),                   // own, old -> delete
+	}
+	seen := map[int]bool{20: true}
+	ids, minID := ownDeletable(messages, selfID, cutoff, seen)
+	if len(ids) != 2 || ids[0] != 50 || ids[1] != 10 {
+		t.Fatalf("ids mismatch: %v", ids)
+	}
+	if minID != 10 {
+		t.Fatalf("cursor mismatch: %d", minID)
+	}
+	if !seen[10] || !seen[20] {
+		t.Fatalf("seen not updated: %v", seen)
+	}
+}
+
+func TestFindSelfID(t *testing.T) {
+	self := &tg.User{ID: 5}
+	self.SetSelf(true)
+	users := []tg.UserClass{
+		self,
+		&tg.User{ID: 7},
+	}
+	if got := findSelfID(users); got != 5 {
+		t.Fatalf("self id mismatch: %d", got)
+	}
+	if got := findSelfID([]tg.UserClass{&tg.User{ID: 7}}); got != 0 {
+		t.Fatalf("expected 0 without self flag, got %d", got)
+	}
+}
+
+func TestCallWithFloodRetryHonoursWait(t *testing.T) {
+	calls := 0
+	err := callWithFloodRetry(context.Background(), func() error {
+		calls++
+		if calls < 3 {
+			return &TelegramRPCError{Name: "FLOOD_WAIT", RetryAfter: 50 * time.Millisecond}
+		}
+		return nil
+	})
+	if err != nil || calls != 3 {
+		t.Fatalf("expected 3 attempts, got %d err %v", calls, err)
+	}
+
+	calls = 0
+	err = callWithFloodRetry(context.Background(), func() error {
+		calls++
+		return &TelegramRPCError{Name: "CHAT_WRITE_FORBIDDEN"}
+	})
+	if err == nil || calls != 1 {
+		t.Fatalf("non-flood errors must not retry: %d %v", calls, err)
+	}
+}
+
 type writerFunc func(p []byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }

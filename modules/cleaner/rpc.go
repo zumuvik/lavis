@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -37,6 +38,60 @@ type telegramResult struct {
 	Ok     bool            `json:"ok"`
 	Result json.RawMessage `json:"result,omitempty"`
 	Error  *rpcError       `json:"error,omitempty"`
+}
+
+// TelegramRPCError keeps the host-reported RPC failure name and the
+// FLOOD_WAIT hint so callers can sleep and retry instead of aborting.
+type TelegramRPCError struct {
+	Name       string
+	Kind       string
+	Message    string
+	RetryAfter time.Duration
+}
+
+func (e *TelegramRPCError) Error() string {
+	if e.Name != "" {
+		return "telegram " + e.Name
+	}
+	if e.Message != "" {
+		return fmt.Sprintf("telegram rpc failure kind=%s message=%s", e.Kind, e.Message)
+	}
+	return "telegram rpc failure kind=" + e.Kind
+}
+
+// asFloodWait returns how long to wait when err is a FLOOD_WAIT the caller
+// can act on, bounded so a pass never parks indefinitely.
+func asFloodWait(err error) (time.Duration, bool) {
+	var rpcErr *TelegramRPCError
+	if !errors.As(err, &rpcErr) || rpcErr.Name != "FLOOD_WAIT" {
+		return 0, false
+	}
+	if rpcErr.RetryAfter <= 0 || rpcErr.RetryAfter > 5*time.Minute {
+		return 0, false
+	}
+	return rpcErr.RetryAfter, true
+}
+
+// callWithFloodRetry runs an RPC, transparently honouring FLOOD_WAIT hints.
+func callWithFloodRetry(ctx context.Context, op func() error) error {
+	for attempt := 0; ; attempt++ {
+		err := op()
+		if err == nil {
+			return nil
+		}
+		wait, flood := asFloodWait(err)
+		if !flood || attempt >= 10 {
+			return err
+		}
+		timer := time.NewTimer(wait + time.Second)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		}
+		timer.Stop()
+	}
 }
 
 type rpcError struct {
@@ -177,10 +232,19 @@ func (c *rawCaller) call(ctx context.Context, request bin.Encoder) ([]byte, erro
 		return nil, err
 	}
 	if !result.Ok {
-		if result.Error != nil && result.Error.Name != "" {
-			return nil, fmt.Errorf("telegram %s", result.Error.Name)
+		failure := &TelegramRPCError{}
+		if result.Error != nil {
+			failure.Name = result.Error.Name
+			failure.Kind = result.Error.Kind
+			failure.Message = result.Error.Message
+			if result.Error.RetryAfterSeconds != nil && *result.Error.RetryAfterSeconds > 0 {
+				failure.RetryAfter = time.Duration(*result.Error.RetryAfterSeconds) * time.Second
+			}
 		}
-		return nil, fmt.Errorf("telegram rpc failed")
+		if failure.Name == "" && failure.Kind == "" {
+			failure.Kind = "rpc_failed"
+		}
+		return nil, failure
 	}
 	body, err := rawBody(result.Result)
 	if err != nil {
