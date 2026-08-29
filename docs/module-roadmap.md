@@ -211,6 +211,19 @@ filesystem installation.
 - Distinguish installed, registered, enabled, running, and crashed states in UX.
 - Add atomic update with version and digest comparison.
 - Add remove and rollback operations with state-preservation rules.
+- Expose imperative user commands so the server filesystem is never the only
+  surface:
+  - `lm uninstall <id>` stops the module, removes its catalog directory, and
+    applies the documented runtime-state preservation rule;
+  - `lm update [<id>] <.lmod>` reuses the approval flow to replace an existing
+    module ID while keeping the previous generation until the new one passes
+    manifest validation and an optional startup health check.
+- Keep catalog, enabled state, running handles, and `lm doctor`/`lm list`
+  reporting consistent across install/update/uninstall, including the case
+  where a catalog directory is removed while a module process is still in
+  memory. The `lm doctor` missing-catalog condition bug was fixed in `93ec590`;
+  the lifecycle events that drive the same reconciliation still need to be
+  implemented.
 - Preserve the previous generation until the replacement has passed manifest
   validation and an optional startup health check.
 - Record package source, digest, granted capabilities, granted methods, install
