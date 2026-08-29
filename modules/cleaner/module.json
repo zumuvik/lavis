@@ -1,6 +1,5 @@
 {
   "schema_version": 6,
-  "contract_revision": 2,
   "id": "cleaner",
   "name": "Cleaner",
   "version": "0.1.0",
