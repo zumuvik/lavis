@@ -183,6 +183,8 @@ func (m *module) execute(ctx context.Context, command, arguments string) (string
 				return "", fmt.Errorf("использование: cleaner remove <номер>")
 			}
 			return m.removeGroups(args[1])
+		case "run":
+			return m.runNow()
 		case "status":
 			return m.statusText()
 		case "log":
@@ -307,7 +309,7 @@ func (m *module) statusText() (string, error) {
 	})
 	b.WriteString(
 		"\nКоманды: cleaner list, cleaner add <номер>, " +
-			"cleaner remove <номер>, cleaner log, cleaner status",
+			"cleaner remove <номер>, cleaner log, cleaner status, cleaner run",
 	)
 	return strings.TrimSuffix(b.String(), "\n"), nil
 }

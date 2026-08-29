@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 )
 
 type groupEntry struct {
@@ -35,13 +36,19 @@ type moduleState struct {
 }
 
 type module struct {
-	mu    sync.Mutex
-	state *state
-	rpc   *rpcTransport
-	call  *rawCaller
-	out   *lineWriter
-	path  string
+	mu       sync.Mutex
+	state    *state
+	rpc      *rpcTransport
+	call     *rawCaller
+	out      *lineWriter
+	path     string
+	cleaning atomic.Bool
 }
+
+// beginClean/endClean serialize cleanup passes between the schedule ticker
+// and manual runs; a pass is long and must never overlap itself.
+func (m *module) beginClean() bool { return m.cleaning.CompareAndSwap(false, true) }
+func (m *module) endClean()        { m.cleaning.Store(false) }
 
 func loadModule() (*module, error) {
 	path, err := statePath()

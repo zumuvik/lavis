@@ -57,10 +57,42 @@ func (m *module) runBackground() {
 		}
 		// jitter avoids repeated restarts hitting Telegram at the same instant.
 		time.Sleep(time.Duration(rand.Int63n(10)) * time.Second)
+		if !m.beginClean() {
+			continue
+		}
 		if err := m.cleanPass(ctx); err != nil {
 			fmt.Fprintln(os.Stderr, "clean:", err)
 		}
+		m.endClean()
 	}
+}
+
+// runNow starts an immediate cleanup pass without blocking the command:
+// a full pass outlives the host's per-request deadline by design. The
+// summary is delivered through the log topic and status as usual.
+func (m *module) runNow() (string, error) {
+	var selected int
+	var enabled bool
+	m.peekState(func(s *state) {
+		selected = len(s.Selected)
+		enabled = s.Enabled
+	})
+	if !enabled {
+		return "", fmt.Errorf("cleaner выключен")
+	}
+	if selected == 0 {
+		return "", fmt.Errorf("не выбрано ни одной группы: cleaner add <номер>")
+	}
+	if !m.beginClean() {
+		return "", fmt.Errorf("прогон уже выполняется — подожди итог в лог-теме")
+	}
+	go func() {
+		defer m.endClean()
+		if err := m.cleanPass(context.Background()); err != nil {
+			fmt.Fprintln(os.Stderr, "clean:", err)
+		}
+	}()
+	return fmt.Sprintf("🧹 Прогон запущен: %d групп, критерий — свои сообщения старше 12 ч. Итог придёт в лог-тему Cleaner.", selected), nil
 }
 
 // syncDialogs refreshes the discovered-group cache by paging

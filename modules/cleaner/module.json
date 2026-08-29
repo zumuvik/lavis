@@ -2,7 +2,7 @@
   "schema_version": 6,
   "id": "cleaner",
   "name": "Cleaner",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "author": "zumuvik",
   "entrypoint": "bin/cleaner",
   "capabilities": [
@@ -21,7 +21,7 @@
       "name": "cleaner",
       "summary_ru": "Удаление своих сообщений старше 12 часов",
       "description_ru": "Показывает список доступных групп, позволяет выбрать, в каких группах автоматически удалять собственные сообщения старше 12 часов, и ведёт журнал в теме Cleaner группы Lavis.",
-      "usage": "[list|add <номер>|remove <номер>|status|log]",
+      "usage": "[list|add <номер>|remove <номер>|status|log|run]",
       "examples": [
         "cleaner",
         "list",
@@ -29,7 +29,8 @@
         "add 3",
         "remove 1",
         "status",
-        "log"
+        "log",
+        "run"
       ]
     }
   ]
