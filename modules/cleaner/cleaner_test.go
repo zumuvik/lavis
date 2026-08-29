@@ -254,6 +254,17 @@ func TestCallWithFloodRetryHonoursWait(t *testing.T) {
 	}
 }
 
+func TestFrontierStop(t *testing.T) {
+	if got := frontierStop(0); got != 0 {
+		t.Fatalf("no frontier must mean full walk, got %d", got)
+	}
+	got := frontierStop(1000000)
+	want := int64(1000000) - int64(maxAge/time.Second) - 1800
+	if got != want {
+		t.Fatalf("frontier stop mismatch: %d want %d", got, want)
+	}
+}
+
 type writerFunc func(p []byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }

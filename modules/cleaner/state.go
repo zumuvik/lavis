@@ -19,15 +19,21 @@ type groupEntry struct {
 }
 
 type state struct {
-	Enabled        bool         `json:"enabled"`
-	Selected       []groupEntry `json:"selected"`
-	Discovered     []groupEntry `json:"discovered"`
-	LastSync       int64        `json:"last_sync"`
-	LastRun        int64        `json:"last_run"`
-	LogChatID      int64        `json:"log_chat_id,omitempty"`
-	LogAccessHash  int64        `json:"log_access_hash,omitempty"`
-	LogTopicID     int          `json:"log_topic_id,omitempty"`
-	LogTopicMarker string       `json:"log_topic_marker,omitempty"`
+	Enabled    bool         `json:"enabled"`
+	Selected   []groupEntry `json:"selected"`
+	Discovered []groupEntry `json:"discovered"`
+	LastSync   int64        `json:"last_sync"`
+	LastRun    int64        `json:"last_run"`
+
+	// Frontier maps a selected group id to the unix time at which the
+	// previous cleanup pass swept that group all the way to the bottom.
+	// The next pass may then stop at messages older than frontier-12h
+	// because everything older is already gone.
+	Frontier       map[int64]int64 `json:"frontier,omitempty"`
+	LogChatID      int64           `json:"log_chat_id,omitempty"`
+	LogAccessHash  int64           `json:"log_access_hash,omitempty"`
+	LogTopicID     int             `json:"log_topic_id,omitempty"`
+	LogTopicMarker string          `json:"log_topic_marker,omitempty"`
 }
 
 type moduleState struct {
@@ -43,6 +49,7 @@ type module struct {
 	out      *lineWriter
 	path     string
 	cleaning atomic.Bool
+	selfID   atomic.Int64
 }
 
 // beginClean/endClean serialize cleanup passes between the schedule ticker

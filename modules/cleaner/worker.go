@@ -291,20 +291,42 @@ func decodeDialogPage(body []byte) ([]groupEntry, int, int, tg.InputPeerClass, b
 // selected group and reports a single summary to the log topic.
 func (m *module) cleanPass(ctx context.Context) error {
 	var groups []groupEntry
+	var frontier map[int64]int64
 	m.peekState(func(s *state) {
 		groups = append([]groupEntry(nil), s.Selected...)
+		frontier = s.Frontier
 	})
+	passStart := time.Now().Unix()
 	totalDeleted := 0
+	swept := make(map[int64]bool)
 	for _, group := range groups {
-		deleted, err := m.cleanGroup(ctx, group)
+		var prev int64
+		if frontier != nil {
+			prev = frontier[group.ID]
+		}
+		deleted, complete, err := m.cleanGroup(ctx, group, prev)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "clean:", group.Title, err)
 			continue
 		}
 		totalDeleted += deleted
+		if complete {
+			swept[group.ID] = true
+		}
 	}
 	if err := m.withState(func(s *state) error {
 		s.LastRun = time.Now().Unix()
+		if s.Frontier == nil {
+			s.Frontier = make(map[int64]int64)
+		}
+		for id := range s.Frontier {
+			if !swept[id] {
+				delete(s.Frontier, id)
+			}
+		}
+		for id := range swept {
+			s.Frontier[id] = passStart
+		}
 		return nil
 	}); err != nil {
 		fmt.Fprintln(os.Stderr, "state:", err)
@@ -322,11 +344,18 @@ func (m *module) cleanPass(ctx context.Context) error {
 // the history is walked explicitly and every candidate is verified
 // client-side: author == self, date older than cutoff. Foreign and service
 // messages are never selected.
-func (m *module) cleanGroup(ctx context.Context, group groupEntry) (int, error) {
+// cleanGroup deletes the account's own messages older than maxAge in one
+// group and returns the count plus whether the sweep completed (reached the
+// history bottom or stopped at the previous-pass frontier). A completed
+// sweep records a frontier so the next pass can stop early instead of
+// re-reading the whole history every 30 minutes.
+func (m *module) cleanGroup(ctx context.Context, group groupEntry, prevFrontier int64) (int, bool, error) {
 	peer := &tg.InputPeerChannel{ChannelID: group.ID, AccessHash: group.AccessHash}
 	cutoff := int(time.Now().Add(-maxAge).Unix())
+	stopDate := frontierStop(prevFrontier)
 
 	deleted := 0
+	complete := false
 	seen := make(map[int]bool)
 	offsetID := 0
 	selfID := m.selfID.Load()
@@ -374,17 +403,18 @@ walk:
 					// oversized one stays reachable.
 					if offsetID <= blindSkip {
 						// History bottom reached at an unreadable message.
+						complete = true
 						break walk
 					}
 					offsetID -= blindSkip
 					skipped = true
 					break
 				}
-				return deleted, fmt.Errorf("history limit=%d offset=%d: %w", limit, offsetID, err)
+				return deleted, false, fmt.Errorf("history limit=%d offset=%d: %w", limit, offsetID, err)
 			}
 			messages, users, err = decodeHistoryPage(body)
 			if err != nil {
-				return deleted, fmt.Errorf("decode history: %w", err)
+				return deleted, false, fmt.Errorf("decode history: %w", err)
 			}
 			break
 		}
@@ -392,12 +422,13 @@ walk:
 			continue
 		}
 		if len(messages) == 0 {
+			complete = true
 			break
 		}
 		if selfID == 0 {
 			selfID = findSelfID(users)
 			if selfID == 0 {
-				return deleted, fmt.Errorf("self user not present in history response")
+				return deleted, false, fmt.Errorf("self user not present in history response")
 			}
 			m.selfID.Store(selfID)
 		}
@@ -412,24 +443,59 @@ walk:
 			if err := callWithFloodRetry(ctx, func() error {
 				return m.deleteBatch(ctx, channel, batch)
 			}); err != nil {
-				return deleted, fmt.Errorf("deleteMessages: %w", err)
+				return deleted, false, fmt.Errorf("deleteMessages: %w", err)
 			}
 			deleted += len(batch)
 			time.Sleep(500 * time.Millisecond)
 		}
 		if minID == 0 || (offsetID != 0 && minID >= offsetID) {
+			complete = true
 			break
 		}
 		offsetID = minID
 		if len(messages) < limit {
+			complete = true
 			break
+		}
+		if stopDate > 0 {
+			if newest := pageNewestDate(messages); newest > 0 && newest < stopDate {
+				// Everything older was swept by the previous pass.
+				complete = true
+				break
+			}
 		}
 		if len(ids) == 0 {
 			// Keep pagination gentle on pages that do not delete anything.
 			time.Sleep(100 * time.Millisecond)
 		}
 	}
-	return deleted, nil
+	return deleted, complete, nil
+}
+
+// frontierStop returns the newest date (unix seconds) below which a
+// completed previous sweep makes re-reading unnecessary. The half-hour
+// slack covers the schedule period and clock skew.
+func frontierStop(prevFrontier int64) int64 {
+	if prevFrontier <= 0 {
+		return 0
+	}
+	return prevFrontier - int64(maxAge/time.Second) - 1800
+}
+
+// pageNewestDate reports the newest real-message date on a page; a
+// service-only page returns 0 and must never trigger an early stop.
+func pageNewestDate(messages []tg.MessageClass) int64 {
+	newest := int64(0)
+	for _, message := range messages {
+		concrete, ok := message.(*tg.Message)
+		if !ok {
+			continue
+		}
+		if d := int64(concrete.GetDate()); d > newest {
+			newest = d
+		}
+	}
+	return newest
 }
 
 // ownDeletable selects ids of real messages authored by selfID and older
