@@ -2,7 +2,7 @@
   "schema_version": 6,
   "id": "cleaner",
   "name": "Cleaner",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "author": "zumuvik",
   "entrypoint": "bin/cleaner",
   "capabilities": [

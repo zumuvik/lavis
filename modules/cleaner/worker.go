@@ -28,10 +28,9 @@ const (
 // which is permitted by the v6 contract at any time.
 func (m *module) runBackground() {
 	ctx := context.Background()
-	// jitter avoids repeated restarts hitting Telegram at the same instant.
-	time.Sleep(3*time.Second + time.Duration(rand.Int63n(7))*time.Second)
-
-	if err := m.syncDialogs(ctx, true); err != nil {
+	// The first sync runs immediately so commands can rely on a warm cache;
+	// jitter only spaces out repeated passes after restarts.
+	if err := m.syncDialogs(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, "sync:", err)
 	}
 
@@ -46,13 +45,15 @@ func (m *module) runBackground() {
 			selected = len(s.Selected)
 		})
 		if stale {
-			if err := m.syncDialogs(ctx, true); err != nil {
+			if err := m.syncDialogs(ctx); err != nil {
 				fmt.Fprintln(os.Stderr, "sync:", err)
 			}
 		}
 		if !enabled || selected == 0 {
 			continue
 		}
+		// jitter avoids repeated restarts hitting Telegram at the same instant.
+		time.Sleep(time.Duration(rand.Int63n(10)) * time.Second)
 		if err := m.cleanPass(ctx); err != nil {
 			fmt.Fprintln(os.Stderr, "clean:", err)
 		}
@@ -60,8 +61,8 @@ func (m *module) runBackground() {
 }
 
 // syncDialogs refreshes the discovered-group cache via messages.getDialogs
-// and persists it.
-func (m *module) syncDialogs(ctx context.Context, silent bool) error {
+// and persists it. Failures are logged by the caller and never fatal.
+func (m *module) syncDialogs(ctx context.Context) error {
 	body, err := m.call.call(ctx, &tg.MessagesGetDialogsRequest{
 		OffsetDate: 0,
 		OffsetID:   0,
@@ -70,10 +71,7 @@ func (m *module) syncDialogs(ctx context.Context, silent bool) error {
 		Hash:       0,
 	})
 	if err != nil {
-		if silent {
-			return nil
-		}
-		return fmt.Errorf("getDialogs: %w", err)
+		return err
 	}
 	dialogs, err := decodeDialogs(body)
 	if err != nil {

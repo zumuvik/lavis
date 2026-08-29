@@ -47,12 +47,9 @@ func (m *module) ensureLogTopic(ctx context.Context) error {
 		return nil
 	}
 	if len(cache) == 0 {
-		if err := m.syncDialogs(ctx, false); err != nil {
-			return err
-		}
-		m.peekState(func(s *state) {
-			cache = append([]groupEntry(nil), s.Discovered...)
-		})
+		// The command budget is shorter than a cold getDialogs round trip;
+		// the background sync warms the cache right after startup instead.
+		return fmt.Errorf("кэш диалогов ещё не готов — попробуй cleaner log через 15 секунд")
 	}
 	for _, candidate := range cache {
 		if candidate.Title == companionGroupTitle {
