@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 type groupEntry struct {
@@ -33,9 +35,11 @@ type moduleState struct {
 }
 
 type module struct {
+	mu    sync.Mutex
 	state *state
 	rpc   *rpcTransport
 	call  *rawCaller
+	out   *lineWriter
 	path  string
 }
 
@@ -59,11 +63,13 @@ func loadModule() (*module, error) {
 	if current.Discovered == nil {
 		current.Discovered = []groupEntry{}
 	}
-	rpc := newRPC(os.Stdout)
+	out := &lineWriter{w: os.Stdout}
+	rpc := newRPC(out)
 	return &module{
 		state: current,
 		rpc:   rpc,
 		call:  &rawCaller{rpc: rpc},
+		out:   out,
 		path:  path,
 	}, nil
 }
@@ -82,7 +88,27 @@ func statePath() (string, error) {
 	return filepath.Join(filepath.Dir(executable), "state.json"), nil
 }
 
-func (m *module) save() error {
+// peekState runs fn with the state lock held for a pure read. fn must not
+// perform RPC or block: handlers and the background loop share this lock.
+func (m *module) peekState(fn func(*state)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	fn(m.state)
+}
+
+// withState mutates the state and persists it atomically under the lock.
+// fn must not perform RPC.
+func (m *module) withState(fn func(*state) error) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := fn(m.state); err != nil {
+		return err
+	}
+	return m.saveLocked()
+}
+
+// saveLocked persists the current state; callers hold m.mu.
+func (m *module) saveLocked() error {
 	data, err := json.MarshalIndent(m.state, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode state: %w", err)
@@ -105,19 +131,18 @@ func (m *module) save() error {
 	return nil
 }
 
-// logf posts a message to the Cleaner topic asynchronously; the placeholder
-// ack channel is used only to make the provider function convenient.
+// logf posts a message to the Cleaner topic without blocking the caller.
 func (m *module) logf(format string, args ...any) {
-	go func() {
-		if err := m.sendLogMessage(fmt.Sprintf(format, args...)); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-		}
-	}()
+	m.logMessage(fmt.Sprintf(format, args...))
 }
 
 func (m *module) logMessage(text string) {
+	var ref topicRef
+	m.peekState(func(s *state) {
+		ref = topicRef{chatID: s.LogChatID, accessHash: s.LogAccessHash, topicID: s.LogTopicID}
+	})
 	go func() {
-		if err := m.sendLogMessage(text); err != nil {
+		if err := m.postToTopic(context.Background(), ref, text); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 		}
 	}()

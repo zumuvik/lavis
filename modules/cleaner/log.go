@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"time"
@@ -13,59 +14,100 @@ const (
 	logTopicTitle       = "Cleaner"
 )
 
-// ensureLogTopic resolves the Lavis companion group from the dialog cache,
-// then finds or creates the Cleaner topic in it. Results are persisted.
-func (m *module) ensureLogTopic() error {
-	if m.state.LogChatID != 0 && m.state.LogAccessHash != 0 && m.state.LogTopicID != 0 {
-		return nil
-	}
-	if len(m.state.Discovered) == 0 {
-		if err := m.syncDialogs(false); err != nil {
-			return err
-		}
-	}
-	for i := range m.state.Discovered {
-		entry := &m.state.Discovered[i]
-		if entry.Title != companionGroupTitle {
-			continue
-		}
-		if !entry.Forum {
-			return fmt.Errorf("companion group %s is not a forum", entry.Title)
-		}
-		m.state.LogChatID = entry.ID
-		m.state.LogAccessHash = entry.AccessHash
-		topicID, err := m.findOrCreateTopic(entry)
-		if err != nil {
-			return err
-		}
-		m.state.LogTopicID = topicID
-		m.state.LogTopicMarker = entry.Title
-		return m.save()
-	}
-	return fmt.Errorf("companion group %q not found", companionGroupTitle)
+// topicRef is a lock-free snapshot of the log destination.
+type topicRef struct {
+	chatID     int64
+	accessHash int64
+	topicID    int
 }
 
-func (m *module) findOrCreateTopic(group *groupEntry) (int, error) {
+func (r topicRef) valid() bool {
+	return r.chatID != 0 && r.accessHash != 0 && r.topicID != 0
+}
+
+func (r topicRef) location() string {
+	if r.chatID == 0 {
+		return "группа Lavis"
+	}
+	return fmt.Sprintf("группа Lavis (%d)", r.chatID)
+}
+
+// ensureLogTopic resolves the Lavis companion group from the dialog cache,
+// then finds or creates the Cleaner topic in it. RPCs run outside the state
+// lock; only the final assignment is persisted atomically.
+func (m *module) ensureLogTopic(ctx context.Context) error {
+	var cached, forumFound bool
+	var entry groupEntry
+	var cache []groupEntry
+	m.peekState(func(s *state) {
+		cached = s.LogChatID != 0 && s.LogAccessHash != 0 && s.LogTopicID != 0
+		cache = append([]groupEntry(nil), s.Discovered...)
+	})
+	if cached {
+		return nil
+	}
+	if len(cache) == 0 {
+		if err := m.syncDialogs(ctx, false); err != nil {
+			return err
+		}
+		m.peekState(func(s *state) {
+			cache = append([]groupEntry(nil), s.Discovered...)
+		})
+	}
+	for _, candidate := range cache {
+		if candidate.Title == companionGroupTitle {
+			entry = candidate
+			forumFound = true
+			break
+		}
+	}
+	if !forumFound {
+		return fmt.Errorf("companion group %q not found", companionGroupTitle)
+	}
+	if !entry.Forum {
+		return fmt.Errorf("companion group %s is not a forum", entry.Title)
+	}
+	topicID, err := m.findOrCreateTopic(ctx, &entry)
+	if err != nil {
+		return err
+	}
+	return m.withState(func(s *state) error {
+		s.LogChatID = entry.ID
+		s.LogAccessHash = entry.AccessHash
+		s.LogTopicID = topicID
+		s.LogTopicMarker = entry.Title
+		return nil
+	})
+}
+
+func (m *module) findOrCreateTopic(ctx context.Context, group *groupEntry) (int, error) {
 	peer := &tg.InputPeerChannel{ChannelID: group.ID, AccessHash: group.AccessHash}
 
-	topicID, err := m.findTopicID(peer)
-	if err == nil {
+	if topicID, err := m.findTopicID(ctx, peer); err == nil {
 		return topicID, nil
 	}
 
-	if _, err := m.call.call(&tg.MessagesCreateForumTopicRequest{
+	// gotd/td does not generate the messages.forumTopic constructor for the
+	// create response, so the id is read back through a short topic search.
+	// The small sleep keeps this inside the command budget while giving the
+	// search index a chance to observe the new topic.
+	if _, err := m.call.call(ctx, &tg.MessagesCreateForumTopicRequest{
 		Peer:     peer,
 		Title:    logTopicTitle,
 		RandomID: rand.Int63(),
 	}); err != nil {
 		return 0, fmt.Errorf("createForumTopic: %w", err)
 	}
-	time.Sleep(500 * time.Millisecond)
-	return m.findTopicID(peer)
+	select {
+	case <-time.After(300 * time.Millisecond):
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+	return m.findTopicID(ctx, peer)
 }
 
-func (m *module) findTopicID(peer *tg.InputPeerChannel) (int, error) {
-	body, err := m.call.call(&tg.MessagesGetForumTopicsRequest{
+func (m *module) findTopicID(ctx context.Context, peer *tg.InputPeerChannel) (int, error) {
+	body, err := m.call.call(ctx, &tg.MessagesGetForumTopicsRequest{
 		Peer:        peer,
 		Q:           logTopicTitle,
 		OffsetDate:  0,
@@ -94,18 +136,20 @@ func decodeForumTopics(body []byte) (int, error) {
 	return 0, fmt.Errorf("topic %q not found", logTopicTitle)
 }
 
-// sendLogMessage posts one message into the Cleaner topic.
-func (m *module) sendLogMessage(text string) error {
-	if m.state.LogChatID == 0 || m.state.LogTopicID == 0 {
+// postToTopic sends one message into a previously resolved topic. It never
+// touches m.state, so it is safe to run while the state lock is held by a
+// command handler.
+func (m *module) postToTopic(ctx context.Context, ref topicRef, text string) error {
+	if !ref.valid() {
 		return fmt.Errorf("log topic is not configured")
 	}
 	peer := &tg.InputPeerChannel{
-		ChannelID:  m.state.LogChatID,
-		AccessHash: m.state.LogAccessHash,
+		ChannelID:  ref.chatID,
+		AccessHash: ref.accessHash,
 	}
-	_, err := m.call.call(&tg.MessagesSendMessageRequest{
+	_, err := m.call.call(ctx, &tg.MessagesSendMessageRequest{
 		Peer:     peer,
-		ReplyTo:  &tg.InputReplyToMessage{ReplyToMsgID: m.state.LogTopicID},
+		ReplyTo:  &tg.InputReplyToMessage{ReplyToMsgID: ref.topicID},
 		Message:  text,
 		RandomID: rand.Int63(),
 	})

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -20,14 +21,15 @@ const (
 var rpcTimeout = 10 * time.Second
 
 // rpcTransport implements the protocol_v6 parentless telegram.invoke
-// transport. Frames are written synchronously to out; responses are routed by
-// the stdin loop through the pending map keyed by call_id.
+// transport. Frames are written synchronously to out (a shared lineWriter);
+// responses are routed by the stdin loop through the pending map keyed by
+// call_id. The stdin loop never runs request handlers, so a waiting invoke
+// can always receive its telegram.result.
 type rpcTransport struct {
 	mu      sync.Mutex
 	nextID  int
 	pending map[string]chan *telegramResult
 	out     io.Writer
-	fail    bool
 }
 
 type telegramResult struct {
@@ -51,19 +53,22 @@ func newRPC(out io.Writer) *rpcTransport {
 type resultFrame struct {
 	Type   string          `json:"type"`
 	CallID string          `json:"call_id"`
-	Ok     *bool           `json:"ok"`
+	Ok     bool            `json:"ok"`
 	Result json.RawMessage `json:"result,omitempty"`
 	Error  *rpcError       `json:"error,omitempty"`
 }
 
 // dispatchAsync routes a telegram.result frame to its waiting rpc.
-// Returns true when the line was consumed as an rpc result.
+// Returns true when the line was a result frame, matched or not: an
+// unmatched id means the waiter already timed out, and feeding such a frame
+// back as a request would emit an UNKNOWN_TYPE error the host cannot
+// correlate to any request.
 func (t *rpcTransport) dispatchAsync(line []byte) bool {
 	var frame resultFrame
 	if err := json.Unmarshal(line, &frame); err != nil {
 		return false
 	}
-	if frame.Type != "telegram.result" || frame.CallID == "" || frame.Ok == nil {
+	if frame.Type != "telegram.result" {
 		return false
 	}
 	t.mu.Lock()
@@ -72,22 +77,20 @@ func (t *rpcTransport) dispatchAsync(line []byte) bool {
 		delete(t.pending, frame.CallID)
 	}
 	t.mu.Unlock()
-	if !ok {
-		return false
+	if ok {
+		ch <- &telegramResult{Ok: frame.Ok, Result: frame.Result, Error: frame.Error}
+		close(ch)
 	}
-	ch <- &telegramResult{Ok: *frame.Ok, Result: frame.Result, Error: frame.Error}
-	close(ch)
 	return true
 }
 
 // invoke sends a raw.invoke frame and waits for its telegram.result.
-func (t *rpcTransport) invoke(body []byte) (*telegramResult, error) {
+func (t *rpcTransport) invoke(ctx context.Context, body []byte) (*telegramResult, error) {
 	t.mu.Lock()
 	id := fmt.Sprintf("cln-%d-%d", os.Getpid(), t.nextID)
 	t.nextID++
 	ch := make(chan *telegramResult, 1)
 	t.pending[id] = ch
-	t.fail = false
 	t.mu.Unlock()
 
 	frame := map[string]any{
@@ -99,14 +102,14 @@ func (t *rpcTransport) invoke(body []byte) (*telegramResult, error) {
 			"body_base64_chunks": base64Chunks(body, 7168),
 		},
 	}
-	line, err := json.Marshal(frame)
+	line, err := encodeFrame(frame)
 	if err != nil {
 		t.mu.Lock()
 		delete(t.pending, id)
 		t.mu.Unlock()
 		return nil, fmt.Errorf("marshal invoke: %w", err)
 	}
-	if _, err := t.out.Write(append(line, '\n')); err != nil {
+	if err := t.writeFrame(line); err != nil {
 		t.mu.Lock()
 		delete(t.pending, id)
 		t.mu.Unlock()
@@ -121,12 +124,25 @@ func (t *rpcTransport) invoke(body []byte) (*telegramResult, error) {
 			return nil, fmt.Errorf("rpc closed without result")
 		}
 		return result, nil
+	case <-ctx.Done():
+		t.mu.Lock()
+		delete(t.pending, id)
+		t.mu.Unlock()
+		return nil, fmt.Errorf("rpc cancelled: %w", ctx.Err())
 	case <-timer.C:
 		t.mu.Lock()
 		delete(t.pending, id)
 		t.mu.Unlock()
 		return nil, fmt.Errorf("rpc timeout after %s", rpcTimeout)
 	}
+}
+
+func (t *rpcTransport) writeFrame(line []byte) error {
+	if writer, ok := t.out.(*lineWriter); ok {
+		return writer.WriteLine(line)
+	}
+	_, err := t.out.Write(append(line, '\n'))
+	return err
 }
 
 func base64Chunks(body []byte, chunk int) []string {
@@ -150,12 +166,12 @@ func base64Chunks(body []byte, chunk int) []string {
 type rawCaller struct{ rpc *rpcTransport }
 
 // call encodes the request, invokes raw.invoke and returns the opaque TL body.
-func (c *rawCaller) call(request bin.Encoder) ([]byte, error) {
+func (c *rawCaller) call(ctx context.Context, request bin.Encoder) ([]byte, error) {
 	var buf bin.Buffer
 	if err := request.Encode(&buf); err != nil {
 		return nil, fmt.Errorf("encode request: %w", err)
 	}
-	result, err := c.rpc.invoke(buf.Copy())
+	result, err := c.rpc.invoke(ctx, buf.Copy())
 	if err != nil {
 		return nil, err
 	}

@@ -2,13 +2,21 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
+
+// commandBudget must terminate before the host's 5s lifecycle deadline so a
+// slow command replies with an error text instead of being SIGKILLed mid-request.
+const commandBudget = 4 * time.Second
 
 func main() {
 	module, err := loadModule()
@@ -16,27 +24,81 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	// The stdin loop must never block while a command waits for an RPC:
+	// telegram.result frames arrive here and are the only way pending
+	// invokes complete. Requests are handled on a worker goroutine instead.
+	requests := make(chan []byte, 8)
+	done := make(chan struct{})
+	go module.serveRequests(requests, done)
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 4096), maxLineBytes)
-	encoder := json.NewEncoder(os.Stdout)
-	encoder.SetEscapeHTML(false)
 	for scanner.Scan() {
-		line := scanner.Bytes()
+		line := append([]byte(nil), scanner.Bytes()...)
 		if module.rpc.dispatchAsync(line) {
 			continue
 		}
+		requests <- line
+	}
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+	}
+	// Drain already-buffered requests before exiting; otherwise responses to
+	// the last frames would be lost when stdin closes.
+	close(requests)
+	<-done
+}
+
+// lineWriter serializes every outbound frame. Response and parentless
+// telegram.invoke frames share one stdout pipe, and a frame larger than
+// PIPE_BUF is not written atomically; a torn newline corrupts both sides.
+type lineWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+// WriteLine emits one complete JSON line under the lock. Write exists so the
+// writer satisfies io.Writer, but callers must pass a whole line: a frame
+// larger than PIPE_BUF is not written atomically, and a torn newline
+// corrupts both sides of the transport.
+func (l *lineWriter) Write(data []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(data)
+}
+
+func (l *lineWriter) WriteLine(data []byte) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	_, err := l.w.Write(append(data, '\n'))
+	return err
+}
+
+func encodeFrame(value any) ([]byte, error) {
+	var buf bytes.Buffer
+	encoder := json.NewEncoder(&buf)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
+}
+
+func (m *module) serveRequests(requests <-chan []byte, done chan<- struct{}) {
+	defer close(done)
+	for line := range requests {
 		var req request
 		if err := json.Unmarshal(line, &req); err != nil {
 			continue
 		}
-		resp := module.handle(req)
-		if err := encoder.Encode(resp); err != nil {
+		data, err := encodeFrame(m.handle(req))
+		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
-			return
+			continue
 		}
-	}
-	if err := scanner.Err(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		if err := m.out.WriteLine(data); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 	}
 }
 
@@ -80,7 +142,9 @@ func (m *module) handle(req request) response {
 		os.Exit(0)
 	case "execute":
 		base.Type = "result"
-		text, err := m.execute(req.Command, req.Arguments)
+		ctx, cancel := context.WithTimeout(context.Background(), commandBudget)
+		defer cancel()
+		text, err := m.execute(ctx, req.Command, req.Arguments)
 		if err != nil {
 			base.Type = "error"
 			base.Code = "BAD_INPUT"
@@ -100,7 +164,7 @@ func (m *module) handle(req request) response {
 	return base
 }
 
-func (m *module) execute(command, arguments string) (string, error) {
+func (m *module) execute(ctx context.Context, command, arguments string) (string, error) {
 	command = strings.ToLower(strings.TrimSpace(command))
 	args := strings.Fields(arguments)
 	for _, arg := range args {
@@ -121,7 +185,7 @@ func (m *module) execute(command, arguments string) (string, error) {
 		case "status":
 			return m.statusText()
 		case "log":
-			return m.logText()
+			return m.logText(ctx)
 		default:
 			return m.statusText()
 		}
@@ -129,14 +193,17 @@ func (m *module) execute(command, arguments string) (string, error) {
 	return m.statusText()
 }
 
-// listGroups prints the discovered dialog cache with numbered entries.
+// listGroups prints the discovered-group cache with numbered entries.
 // Entry 0 is a special "add all" target; entries 1..n map to cached chats.
 func (m *module) listGroups() (string, error) {
-	cache := m.state.Discovered
+	var cache []groupEntry
 	selected := make(map[int64]bool)
-	for _, group := range m.state.Selected {
-		selected[group.ID] = true
-	}
+	m.peekState(func(s *state) {
+		cache = append([]groupEntry(nil), s.Discovered...)
+		for _, group := range s.Selected {
+			selected[group.ID] = true
+		}
+	})
 	var b strings.Builder
 	b.WriteString("🧹 Cleaner: группы с сообщениями старше 12 ч\n\n")
 	b.WriteString("0. Добавить все\n")
@@ -155,71 +222,88 @@ func (m *module) listGroups() (string, error) {
 }
 
 func (m *module) addGroups(key string) (string, error) {
-	resolved, err := m.resolveNumber(key)
+	var addedCount int
+	var message string
+	err := m.withState(func(s *state) error {
+		resolved, err := resolveNumber(s, key)
+		if err != nil {
+			return err
+		}
+		already := make(map[int64]bool)
+		for _, group := range s.Selected {
+			already[group.ID] = true
+		}
+		addedCount = 0
+		for _, entry := range resolved {
+			if already[entry.ID] {
+				continue
+			}
+			s.Selected = append(s.Selected, groupEntry{
+				ID:         entry.ID,
+				AccessHash: entry.AccessHash,
+				Title:      entry.Title,
+			})
+			already[entry.ID] = true
+			addedCount++
+		}
+		if addedCount == 0 {
+			message = "ℹ️ Ничего не добавлено: все выбранные группы уже в списке."
+			return nil
+		}
+		message = fmt.Sprintf("✅ Добавлено групп: %d. Всего в чистке: %d.", addedCount, len(s.Selected))
+		return nil
+	})
 	if err != nil {
 		return "", err
 	}
-	already := make(map[int64]bool)
-	for _, group := range m.state.Selected {
-		already[group.ID] = true
+	if addedCount > 0 {
+		m.logf("➕ Добавлены группы для чистки: %d", addedCount)
 	}
-	addedCount := 0
-	for _, entry := range resolved {
-		if already[entry.ID] {
-			continue
-		}
-		m.state.Selected = append(m.state.Selected, groupEntry{
-			ID:         entry.ID,
-			AccessHash: entry.AccessHash,
-			Title:      entry.Title,
-		})
-		already[entry.ID] = true
-		addedCount++
-	}
-	if err := m.save(); err != nil {
-		return "", err
-	}
-	if addedCount == 0 {
-		return "ℹ️ Ничего не добавлено: все выбранные группы уже в списке.", nil
-	}
-	m.logf("➕ Добавлены группы для чистки: %d", addedCount)
-	return fmt.Sprintf("✅ Добавлено групп: %d. Всего в чистке: %d.", addedCount, len(m.state.Selected)), nil
+	return message, nil
 }
 
 func (m *module) removeGroups(key string) (string, error) {
-	index, err := strconv.Atoi(key)
-	if err != nil || index < 1 {
-		return "", fmt.Errorf("номер должен быть положительным числом")
-	}
-	if index > len(m.state.Selected) {
-		return "", fmt.Errorf("нет группы с номером %d (выбрано: %d)", index, len(m.state.Selected))
-	}
-	removed := m.state.Selected[index-1]
-	m.state.Selected = append(m.state.Selected[:index-1], m.state.Selected[index-1:]...)
-	if err := m.save(); err != nil {
+	var removed groupEntry
+	var message string
+	err := m.withState(func(s *state) error {
+		index, err := strconv.Atoi(key)
+		if err != nil || index < 1 {
+			return fmt.Errorf("номер должен быть положительным числом")
+		}
+		if index > len(s.Selected) {
+			return fmt.Errorf("нет группы с номером %d (выбрано: %d)", index, len(s.Selected))
+		}
+		removed = s.Selected[index-1]
+		s.Selected = append(s.Selected[:index-1], s.Selected[index:]...)
+		message = fmt.Sprintf("🗑 Группа «%s» исключена. Осталось: %d.", removed.Title, len(s.Selected))
+		return nil
+	})
+	if err != nil {
 		return "", err
 	}
 	m.logf("➖ Группа исключена из чистки: %s", removed.Title)
-	return fmt.Sprintf("🗑 Группа «%s» исключена. Осталось: %d.", removed.Title, len(m.state.Selected)), nil
+	return message, nil
 }
 
 func (m *module) statusText() (string, error) {
 	var b strings.Builder
-	b.WriteString("🧹 Cleaner: чистка своих сообщений старше 12 часов\n")
-	if !m.state.Enabled {
-		b.WriteString("Состояние: ⏸ выключен\n")
-	} else {
-		fmt.Fprintf(&b, "Состояние: ✅ включён (последний прогон %s)\n", humanTime(m.state.LastRun))
-	}
-	fmt.Fprintf(&b, "Выбрано групп: %d\n", len(m.state.Selected))
-	for i, group := range m.state.Selected {
-		fmt.Fprintf(&b, "  %d. %s\n", i+1, group.Title)
-	}
-	if m.state.LogTopicID != 0 {
-		fmt.Fprintf(&b, "Лог-тема: Cleaner #%d\n", m.state.LogTopicID)
-	} else {
-		b.WriteString("Лог-тема: ещё не найдена (cleaner log)\n")
-	}
+	m.peekState(func(s *state) {
+		b.WriteString("🧹 Cleaner: чистка своих сообщений старше 12 часов\n")
+		if !s.Enabled {
+			b.WriteString("Состояние: ⏸ выключен\n")
+		} else {
+			fmt.Fprintf(&b, "Состояние: ✅ включён (последний прогон %s)\n", humanTime(s.LastRun))
+		}
+		fmt.Fprintf(&b, "Выбрано групп: %d\n", len(s.Selected))
+		for i, group := range s.Selected {
+			fmt.Fprintf(&b, "  %d. %s\n", i+1, group.Title)
+		}
+		if s.LogTopicID != 0 {
+			fmt.Fprintf(&b, "Лог-тема: Cleaner #%d\n", s.LogTopicID)
+		} else {
+			b.WriteString("Лог-тема: ещё не найдена (cleaner log)\n")
+		}
+	})
 	b.WriteString(
 		"\nКоманды: cleaner list, cleaner add <номер>, " +
 			"cleaner remove <номер>, cleaner log, cleaner status",
@@ -227,25 +311,29 @@ func (m *module) statusText() (string, error) {
 	return strings.TrimSuffix(b.String(), "\n"), nil
 }
 
-func (m *module) logText() (string, error) {
-	if err := m.ensureLogTopic(); err != nil {
+func (m *module) logText(ctx context.Context) (string, error) {
+	if err := m.ensureLogTopic(ctx); err != nil {
 		return "", fmt.Errorf("лог-тема недоступна: %w", err)
 	}
-	return fmt.Sprintf("📋 Лог-тема Cleaner активна: %s (topic #%d)", m.logTopicLocation(), m.state.LogTopicID), nil
+	var ref topicRef
+	m.peekState(func(s *state) {
+		ref = topicRef{chatID: s.LogChatID, topicID: s.LogTopicID}
+	})
+	return fmt.Sprintf("📋 Лог-тема Cleaner активна: %s (topic #%d)", ref.location(), ref.topicID), nil
 }
 
-func (m *module) resolveNumber(key string) ([]groupEntry, error) {
+func resolveNumber(s *state, key string) ([]groupEntry, error) {
 	index, err := strconv.Atoi(key)
 	if err != nil {
 		return nil, fmt.Errorf("<номер> должен быть числом")
 	}
 	if index == 0 {
-		return append([]groupEntry(nil), m.state.Discovered...), nil
+		return append([]groupEntry(nil), s.Discovered...), nil
 	}
-	if index < 1 || index > len(m.state.Discovered) {
-		return nil, fmt.Errorf("нет группы с номером %d (всего: %d)", index, len(m.state.Discovered))
+	if index < 1 || index > len(s.Discovered) {
+		return nil, fmt.Errorf("нет группы с номером %d (всего: %d)", index, len(s.Discovered))
 	}
-	entry := m.state.Discovered[index-1]
+	entry := s.Discovered[index-1]
 	return []groupEntry{entry}, nil
 }
 
@@ -254,11 +342,4 @@ func humanTime(unix int64) string {
 		return "никогда"
 	}
 	return time.Unix(unix, 0).Format("02.01 15:04")
-}
-
-func (m *module) logTopicLocation() string {
-	if m.state.LogChatID == 0 {
-		return "группа Lavis"
-	}
-	return fmt.Sprintf("группа Lavis (%d)", m.state.LogChatID)
 }

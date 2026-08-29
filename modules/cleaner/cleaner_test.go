@@ -3,9 +3,13 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"io"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -62,7 +66,7 @@ func TestInvokeRoundTrip(t *testing.T) {
 		return written.Write(p)
 	}))
 
-	result, err := rpc.invoke([]byte{0x11, 0x22, 0x33, 0x44})
+	result, err := rpc.invoke(context.Background(), []byte{0x11, 0x22, 0x33, 0x44})
 	if err != nil {
 		t.Fatalf("invoke: %v", err)
 	}
@@ -83,7 +87,7 @@ func TestInvokeTimeout(t *testing.T) {
 	defer func() { rpcTimeout = original }()
 	rpcTimeout = 300 * time.Millisecond
 	start := time.Now()
-	_, err := rpc.invoke([]byte{0x11, 0x22, 0x33, 0x44})
+	_, err := rpc.invoke(context.Background(), []byte{0x11, 0x22, 0x33, 0x44})
 	if err == nil {
 		t.Fatal("expected timeout error")
 	}
@@ -144,3 +148,94 @@ func TestScannerLineBoundary(t *testing.T) {
 type writerFunc func(p []byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
+func TestDispatchConsumesStaleResults(t *testing.T) {
+	rpc := newRPC(io.Discard)
+	if !rpc.dispatchAsync([]byte(`{"protocol_version":6,"type":"telegram.result","call_id":"gone","ok":true}`)) {
+		t.Fatal("stale telegram.result must be consumed, not republished as a request")
+	}
+	if rpc.dispatchAsync([]byte(`{"protocol_version":6,"type":"execute","request_id":"1"}`)) {
+		t.Fatal("request lines must not be dispatched as results")
+	}
+}
+
+func TestInvokeHonoursContextDeadline(t *testing.T) {
+	rpc := newRPC(io.Discard)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if _, err := rpc.invoke(ctx, []byte{0x11, 0x22, 0x33, 0x44}); err == nil {
+		t.Fatal("expected cancellation error")
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatal("context deadline ignored")
+	}
+	rpc.mu.Lock()
+	defer rpc.mu.Unlock()
+	if len(rpc.pending) != 0 {
+		t.Fatalf("cancelled invoke leaked %d pending calls", len(rpc.pending))
+	}
+}
+
+func TestRemoveGroupsDropsEntry(t *testing.T) {
+	m := &module{
+		state: &state{
+			Enabled:  true,
+			Selected: []groupEntry{{ID: 1, Title: "A"}, {ID: 2, Title: "B"}, {ID: 3, Title: "C"}},
+		},
+		path: filepath.Join(t.TempDir(), "state.json"),
+	}
+	if _, err := m.removeGroups("2"); err != nil {
+		t.Fatalf("removeGroups: %v", err)
+	}
+	got := m.state.Selected
+	if len(got) != 2 || got[0].ID != 1 || got[1].ID != 3 {
+		t.Fatalf("removed entry survived or wrong order: %+v", got)
+	}
+	data, err := os.ReadFile(m.path)
+	if err != nil {
+		t.Fatalf("state not persisted: %v", err)
+	}
+	var persisted state
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted.Selected) != 2 {
+		t.Fatalf("persisted state mismatch: %+v", persisted.Selected)
+	}
+}
+
+func TestLineWriterSerializesFrames(t *testing.T) {
+	var buf bytes.Buffer
+	out := &lineWriter{w: writerFunc(func(p []byte) (int, error) { return buf.Write(p) })}
+	var wg sync.WaitGroup
+	for i := range 8 {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			data, err := encodeFrame(map[string]int{"n": i})
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			if err := out.WriteLine(data); err != nil {
+				t.Error(err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	lines := bytes.Count(buf.Bytes(), []byte("\n"))
+	if lines != 8 {
+		t.Fatalf("expected 8 whole lines, got %d: %q", lines, buf.String())
+	}
+	scanner := bufio.NewScanner(bytes.NewReader(buf.Bytes()))
+	for scanner.Scan() {
+		var parsed map[string]int
+		if err := json.Unmarshal(scanner.Bytes(), &parsed); err != nil {
+			t.Fatalf("torn frame: %q: %v", scanner.Bytes(), err)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+}

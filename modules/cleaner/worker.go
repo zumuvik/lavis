@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"os"
@@ -15,6 +16,10 @@ const (
 	maxAge        = 12 * time.Hour
 	batchSize     = 100
 	pageLimit     = 100
+
+	// getDialogs responses travel as one 64KB-capped JSON line; 200 dialogs
+	// with access hashes can exceed it, so the page is deliberately smaller.
+	dialogPageLimit = 100
 )
 
 // runBackground is the module's autonomous loop: a dialog-cache sync once an
@@ -22,25 +27,33 @@ const (
 // handling; RPC frames are emitted parentlessly through the raw transport,
 // which is permitted by the v6 contract at any time.
 func (m *module) runBackground() {
+	ctx := context.Background()
 	// jitter avoids repeated restarts hitting Telegram at the same instant.
 	time.Sleep(3*time.Second + time.Duration(rand.Int63n(7))*time.Second)
 
-	if err := m.syncDialogs(true); err != nil {
+	if err := m.syncDialogs(ctx, true); err != nil {
 		fmt.Fprintln(os.Stderr, "sync:", err)
 	}
 
 	ticker := time.NewTicker(cleanInterval)
 	defer ticker.Stop()
 	for range ticker.C {
-		if time.Since(time.Unix(m.state.LastSync, 0)) > syncInterval {
-			if err := m.syncDialogs(true); err != nil {
+		var stale, enabled bool
+		var selected int
+		m.peekState(func(s *state) {
+			stale = time.Since(time.Unix(s.LastSync, 0)) > syncInterval
+			enabled = s.Enabled
+			selected = len(s.Selected)
+		})
+		if stale {
+			if err := m.syncDialogs(ctx, true); err != nil {
 				fmt.Fprintln(os.Stderr, "sync:", err)
 			}
 		}
-		if !m.state.Enabled || len(m.state.Selected) == 0 {
+		if !enabled || selected == 0 {
 			continue
 		}
-		if err := m.cleanPass(); err != nil {
+		if err := m.cleanPass(ctx); err != nil {
 			fmt.Fprintln(os.Stderr, "clean:", err)
 		}
 	}
@@ -48,12 +61,12 @@ func (m *module) runBackground() {
 
 // syncDialogs refreshes the discovered-group cache via messages.getDialogs
 // and persists it.
-func (m *module) syncDialogs(silent bool) error {
-	body, err := m.call.call(&tg.MessagesGetDialogsRequest{
+func (m *module) syncDialogs(ctx context.Context, silent bool) error {
+	body, err := m.call.call(ctx, &tg.MessagesGetDialogsRequest{
 		OffsetDate: 0,
 		OffsetID:   0,
 		OffsetPeer: &tg.InputPeerEmpty{},
-		Limit:      200,
+		Limit:      dialogPageLimit,
 		Hash:       0,
 	})
 	if err != nil {
@@ -66,9 +79,11 @@ func (m *module) syncDialogs(silent bool) error {
 	if err != nil {
 		return fmt.Errorf("decode dialogs: %w", err)
 	}
-	m.state.Discovered = dialogs
-	m.state.LastSync = time.Now().Unix()
-	return m.save()
+	return m.withState(func(s *state) error {
+		s.Discovered = dialogs
+		s.LastSync = time.Now().Unix()
+		return nil
+	})
 }
 
 func decodeDialogs(body []byte) ([]groupEntry, error) {
@@ -109,18 +124,26 @@ func decodeDialogs(body []byte) ([]groupEntry, error) {
 
 // cleanPass removes the account's own messages older than maxAge in every
 // selected group and reports a single summary to the log topic.
-func (m *module) cleanPass() error {
+func (m *module) cleanPass(ctx context.Context) error {
+	var groups []groupEntry
+	m.peekState(func(s *state) {
+		groups = append([]groupEntry(nil), s.Selected...)
+	})
 	totalDeleted := 0
-	for _, group := range m.state.Selected {
-		deleted, err := m.cleanGroup(group)
+	for _, group := range groups {
+		deleted, err := m.cleanGroup(ctx, group)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "clean:", group.Title, err)
 			continue
 		}
 		totalDeleted += deleted
 	}
-	m.state.LastRun = time.Now().Unix()
-	_ = m.save()
+	if err := m.withState(func(s *state) error {
+		s.LastRun = time.Now().Unix()
+		return nil
+	}); err != nil {
+		fmt.Fprintln(os.Stderr, "state:", err)
+	}
 
 	if totalDeleted > 0 {
 		m.logMessage(fmt.Sprintf("🧹 Cleaner: удалено сообщений старше 12 ч: %d", totalDeleted))
@@ -130,7 +153,7 @@ func (m *module) cleanPass() error {
 
 // cleanGroup deletes the account's own messages older than maxAge in one
 // group and returns the count.
-func (m *module) cleanGroup(group groupEntry) (int, error) {
+func (m *module) cleanGroup(ctx context.Context, group groupEntry) (int, error) {
 	peer := &tg.InputPeerChannel{ChannelID: group.ID, AccessHash: group.AccessHash}
 	cutoff := int(time.Now().Add(-maxAge).Unix())
 
@@ -138,7 +161,7 @@ func (m *module) cleanGroup(group groupEntry) (int, error) {
 	seen := make(map[int]bool)
 	offsetID := 0
 	for page := 0; page < 50; page++ {
-		body, err := m.call.call(&tg.MessagesSearchRequest{
+		body, err := m.call.call(ctx, &tg.MessagesSearchRequest{
 			Peer:      peer,
 			Q:         "",
 			FromID:    &tg.InputPeerSelf{},
@@ -176,7 +199,7 @@ func (m *module) cleanGroup(group groupEntry) (int, error) {
 				end = len(ids)
 			}
 			batch := ids[start:end]
-			if err := m.deleteBatch(batch); err != nil {
+			if err := m.deleteBatch(ctx, batch); err != nil {
 				return deleted, fmt.Errorf("deleteMessage: %w", err)
 			}
 			deleted += len(batch)
@@ -212,7 +235,7 @@ func decodeSearchMessages(body []byte) ([]tg.MessageClass, error) {
 	}
 }
 
-func (m *module) deleteBatch(ids []int) error {
-	_, err := m.call.call(&tg.MessagesDeleteMessagesRequest{Revoke: true, ID: ids})
+func (m *module) deleteBatch(ctx context.Context, ids []int) error {
+	_, err := m.call.call(ctx, &tg.MessagesDeleteMessagesRequest{Revoke: true, ID: ids})
 	return err
 }
