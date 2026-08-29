@@ -220,7 +220,6 @@ func (m *module) listGroups() (string, error) {
 	if len(cache) == 0 {
 		b.WriteString("\nКэш групп пуст. Фоновая синхронизация ещё не закончилась — попробуйте позже.\n")
 	}
-	b.WriteString("\nКоманды: cleaner add <номер>, cleaner remove <номер>, cleaner status, cleaner log")
 	return strings.TrimSuffix(b.String(), "\n"), nil
 }
 
@@ -301,16 +300,7 @@ func (m *module) statusText() (string, error) {
 		for i, group := range s.Selected {
 			fmt.Fprintf(&b, "  %d. %s\n", i+1, group.Title)
 		}
-		if s.LogTopicID != 0 {
-			fmt.Fprintf(&b, "Лог-тема: Cleaner #%d\n", s.LogTopicID)
-		} else {
-			b.WriteString("Лог-тема: ещё не найдена (cleaner log)\n")
-		}
 	})
-	b.WriteString(
-		"\nКоманды: cleaner list, cleaner add <номер>, " +
-			"cleaner remove <номер>, cleaner log, cleaner status, cleaner run",
-	)
 	return strings.TrimSuffix(b.String(), "\n"), nil
 }
 
