@@ -88,6 +88,7 @@ pub struct RuntimeState {
     module_installation: Option<ModuleInstallation>,
     module_control: Option<ModuleControlConfig>,
     module_approvals: ApprovalStore<SystemClock, OsRandom>,
+    external_warnings_announced: std::collections::HashSet<String>,
 }
 
 struct ModuleInstallation {
@@ -439,6 +440,7 @@ impl RuntimeState {
                     max_pending_expanded_bytes: MODULE_APPROVAL_BYTES,
                 },
             ),
+            external_warnings_announced: std::collections::HashSet::new(),
         }
     }
 
@@ -940,13 +942,17 @@ impl RuntimeState {
                     .iter()
                     .find(|d| d.id == invocation.module_id);
                 match found {
-                    Some(desc) => Response::external_result(
-                        self.locale(),
-                        text,
-                        &desc.display_name,
-                        &desc.id,
-                        &desc.version,
-                    ),
+                    Some(desc) => {
+                        let first_notice = self.external_warnings_announced.insert(desc.id.clone());
+                        Response::external_result(
+                            self.locale(),
+                            text,
+                            &desc.display_name,
+                            &desc.id,
+                            &desc.version,
+                            first_notice,
+                        )
+                    }
                     None => missing_descriptor_response(locale, text, &invocation.module_id),
                 }
             }
