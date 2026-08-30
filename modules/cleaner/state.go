@@ -54,6 +54,7 @@ type module struct {
 	selfID       atomic.Int64
 	opsecRunning atomic.Bool
 	opsecPhase   atomic.Uint64
+	selfHash     atomic.Int64
 	purging      atomic.Bool
 }
 

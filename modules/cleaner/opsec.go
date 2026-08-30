@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -180,13 +179,17 @@ func (m *module) runOpsecPurge(ctx context.Context, targets []opsecChat) {
 	var failed []string
 	for _, t := range targets {
 		channel := &tg.InputChannel{ChannelID: t.RawID, AccessHash: t.AccessHash}
+		ids := t.IDs
+		if len(ids) == 0 {
+			ids = m.collectOpsecIDs(ctx, t)
+		}
 		ok := true
-		for start := 0; start < len(t.IDs); start += batchSize {
+		for start := 0; start < len(ids); start += batchSize {
 			end := start + batchSize
-			if end > len(t.IDs) {
-				end = len(t.IDs)
+			if end > len(ids) {
+				end = len(ids)
 			}
-			batch := t.IDs[start:end]
+			batch := ids[start:end]
 			if err := callWithFloodRetry(ctx, func() error {
 				return m.deleteBatch(ctx, channel, batch)
 			}); err != nil {
@@ -229,199 +232,169 @@ func (m *module) clearOpsecChat(rawID int64) {
 
 // runOpsec walks the global self-message index via messages.search with
 // peer=inputPeerSelf, aggregating own-message counts per channel chat.
+// runOpsec aggregates the account's own message footprint per dialog chat.
+// The server does not support author-only global search, so every cached
+// dialog gets one messages.search with a concrete self from_id; the
+// returned total is the own-message count and the first hit the newest
+// message. Chats flagged left are ghosts (dialog kept, membership gone).
 func (m *module) runOpsec() {
 	defer m.opsecRunning.Store(false)
 	ctx := context.Background()
 
-	// A warm dialog cache marks which chats are still "ours"; failure here
-	// must not block the scan itself.
-	_ = m.syncDialogs(ctx)
+	if err := m.syncDialogs(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "opsec dialogs: %v\n", err)
+	}
+	if _, err := m.resolveSelfID(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "opsec self resolve: %v\n", err)
+		return
+	}
+	selfPeer := m.selfPeer()
 
-	selfID := m.selfID.Load()
-	agg := make(map[int64]*opsecChat)
-	meta := make(map[int64]tg.ChatClass)
-	limit := opsecPageLimit
-	maxDate := 0
-	seenIDs := make(map[int]bool)
-	pages := 0
-	var scanErr string
+	var dialogs []groupEntry
+	m.peekState(func(s *state) {
+		dialogs = append([]groupEntry(nil), s.Discovered...)
+	})
+	leftIDs := m.leftDialogIDs(ctx)
 
-	for pages < opsecMaxPages {
-		var body []byte
+	var chatsOut []opsecChat
+	probe := 0
+	for _, d := range dialogs {
+		if d.AccessHash == 0 {
+			continue
+		}
 		req := &tg.MessagesSearchRequest{
-			Peer:    &tg.InputPeerSelf{},
+			Peer:    &tg.InputPeerChannel{ChannelID: d.ID, AccessHash: d.AccessHash},
 			Q:       "",
 			Filter:  &tg.InputMessagesFilterEmpty{},
-			MaxDate: maxDate,
-			Limit:   limit,
+			MaxDate: 0,
+			Limit:   opsecPageLimit,
 		}
-		req.SetFromID(&tg.InputPeerSelf{})
+		req.SetFromID(selfPeer)
+		var body []byte
 		err := callWithFloodRetry(ctx, func() error {
 			var callErr error
 			body, callErr = m.call.call(ctx, req)
 			return callErr
 		})
 		if err != nil {
-			var rpcErr *TelegramRPCError
-			if errors.As(err, &rpcErr) && rpcErr.Kind == "internal" && limit > 1 {
-				if limit > 5 {
-					limit = 5
-				} else {
-					limit = 1
-				}
-				continue
+			if probe < 5 {
+				fmt.Fprintf(os.Stderr, "opsec probe %q: %v\n", d.Title, err)
 			}
-			scanErr = err.Error()
-			break
+			continue
 		}
-		messages, users, chats, err := decodeSearchPage(body)
-		if err != nil {
-			scanErr = err.Error()
-			break
+		count, newestMsg, newestDate := searchFootprint(body)
+		if probe < 5 {
+			fmt.Fprintf(os.Stderr, "opsec probe %q: total=%d newestMsg=%d\n", d.Title, count, newestMsg)
 		}
-		for _, chat := range chats {
-			if channel, ok := chat.(*tg.Channel); ok {
-				meta[channel.GetID()] = channel
-			}
+		probe++
+		if count == 0 {
+			continue
 		}
-		if selfID == 0 {
-			selfID = findSelfID(users)
-			if selfID != 0 {
-				m.selfID.Store(selfID)
-			}
-		}
-		if selfID == 0 {
-			id, idErr := m.resolveSelfID(ctx)
-			if idErr != nil {
-				scanErr = idErr.Error()
-				break
-			}
-			selfID = id
-		}
-		if len(messages) == 0 {
-			break
-		}
-		pageOldest := 0
-		newOnPage := 0
-		for _, message := range messages {
-			concrete, ok := message.(*tg.Message)
-			if !ok {
-				continue
-			}
-			id := concrete.GetID()
-			if seenIDs[id] {
-				continue
-			}
-			from, has := concrete.GetFromID()
-			peerUser, isUser := from.(*tg.PeerUser)
-			if !has || !isUser || peerUser.UserID != selfID {
-				continue
-			}
-			peerChannel, isChannel := concrete.GetPeerID().(*tg.PeerChannel)
-			if !isChannel {
-				continue
-			}
-			seenIDs[id] = true
-			newOnPage++
-			date := int64(concrete.GetDate())
-			entry := agg[peerChannel.ChannelID]
-			if entry == nil {
-				entry = &opsecChat{RawID: peerChannel.ChannelID}
-				agg[peerChannel.ChannelID] = entry
-			}
-			entry.Count++
-			if date > entry.Newest {
-				entry.Newest = date
-				entry.NewestMsg = id
-			}
-			if entry.Oldest == 0 || date < entry.Oldest {
-				entry.Oldest = date
-			}
-			if len(entry.IDs) < opsecMaxIDs {
-				entry.IDs = append(entry.IDs, id)
-			}
-			if pageOldest == 0 || date < int64(pageOldest) {
-				pageOldest = int(date)
-			}
-		}
-		pages++
-		if pages%25 == 0 {
-			fmt.Fprintf(os.Stderr, "opsec scan progress: pages=%d chats=%d seen=%d maxDate=%d\n", pages, len(agg), len(seenIDs), maxDate)
-		}
-		if pages%200 == 0 {
-			m.saveOpsecPartial(agg, meta, m.dialogSet())
-		}
-		if newOnPage == 0 && pageOldest == 0 {
-			break
-		}
-		if pageOldest == 0 || (maxDate != 0 && pageOldest >= maxDate) {
-			break
-		}
-		maxDate = pageOldest - 1
-		if len(messages) < limit {
-			break
-		}
-	}
-
-	dialogSet := m.dialogSet()
-	var chatsOut []opsecChat
-	for rawID, entry := range agg {
-		if channel, ok := meta[rawID].(*tg.Channel); ok {
-			entry.Title = channel.GetTitle()
-			if hash, has := channel.GetAccessHash(); has {
-				entry.AccessHash = hash
-			}
-		}
-		entry.InDialog = dialogSet[rawID]
-		chatsOut = append(chatsOut, *entry)
-	}
-	sort.Slice(chatsOut, func(i, j int) bool { return chatsOut[i].Count > chatsOut[j].Count })
-	if scanErr == "" || len(chatsOut) > 0 {
-		_ = m.withState(func(s *state) error {
-			if s.Opsec == nil || s.Opsec.ScannedAt == 0 {
-				s.Opsec = &opsecState{}
-			}
-			if len(chatsOut) > 0 {
-				s.Opsec.Chats = chatsOut
-				s.Opsec.ScannedAt = time.Now().Unix()
-			}
-			return nil
+		chatsOut = append(chatsOut, opsecChat{
+			RawID:      d.ID,
+			AccessHash: d.AccessHash,
+			Title:      d.Title,
+			Count:      count,
+			Newest:     newestDate,
+			NewestMsg:  newestMsg,
+			InDialog:   !leftIDs[d.ID],
+			IDs:        nil,
 		})
+		if probe%25 == 0 {
+			m.saveOpsecList(chatsOut)
+		}
 	}
-	if scanErr != "" {
-		fmt.Fprintf(os.Stderr, "opsec scan: %s\n", scanErr)
+	m.saveOpsecList(chatsOut)
+	if scanComplete := true; !scanComplete {
+		_ = scanComplete
 	}
 }
 
-// resolveSelfID fetches the account's own user id via
-// users.getFullUser(inputPeerSelf): global search responses do not carry a
-// self-flagged user in their users vector, unlike history pages.
-func (m *module) resolveSelfID(ctx context.Context) (int64, error) {
-	if id := m.selfID.Load(); id != 0 {
-		return id, nil
+// searchFootprint extracts own-message total and newest message from a
+// per-chat search page.
+func searchFootprint(body []byte) (int, int, int64) {
+	value, err := tg.DecodeMessagesMessages(buffer(body))
+	if err != nil {
+		return 0, 0, 0
 	}
+	total := 0
+	var messages []tg.MessageClass
+	switch m := value.(type) {
+	case *tg.MessagesChannelMessages:
+		total = m.GetCount()
+		messages = m.GetMessages()
+	case *tg.MessagesMessagesSlice:
+		total = m.GetCount()
+		messages = m.GetMessages()
+	case *tg.MessagesMessages:
+		messages = m.GetMessages()
+		total = len(messages)
+	}
+	newestMsg, newestDate := 0, int64(0)
+	for _, message := range messages {
+		concrete, ok := message.(*tg.Message)
+		if !ok {
+			continue
+		}
+		if id := concrete.GetID(); id > newestMsg {
+			newestMsg = id
+			newestDate = int64(concrete.GetDate())
+		}
+	}
+	return total, newestMsg, newestDate
+}
+
+// leftDialogIDs marks channels the account has left: getDialogs only
+// returns them when the dialog survived the leave, which is exactly the
+// ghost footprint opsec reports.
+func (m *module) leftDialogIDs(ctx context.Context) map[int64]bool {
+	left := make(map[int64]bool)
 	var body []byte
 	err := callWithFloodRetry(ctx, func() error {
 		var callErr error
-		body, callErr = m.call.call(ctx, &tg.UsersGetFullUserRequest{ID: &tg.InputUserSelf{}})
+		body, callErr = m.call.call(ctx, &tg.MessagesGetDialogsRequest{
+			OffsetDate: 0,
+			OffsetID:   0,
+			OffsetPeer: &tg.InputPeerEmpty{},
+			Limit:      dialogPageLimit,
+			Hash:       0,
+		})
 		return callErr
 	})
 	if err != nil {
-		return 0, err
+		return left
 	}
-	if len(body) < 4 || binary.LittleEndian.Uint32(body[:4]) != tg.UsersUserFullTypeID {
-		return 0, fmt.Errorf("unexpected getFullUser constructor")
+	value, err := tg.DecodeMessagesDialogs(buffer(body))
+	if err != nil {
+		return left
 	}
-	var full tg.UsersUserFull
-	if err := full.DecodeBare(buffer(body[4:])); err != nil {
-		return 0, fmt.Errorf("decode userFull: %w", err)
+	var chatClasses []tg.ChatClass
+	switch d := value.(type) {
+	case *tg.MessagesDialogs:
+		chatClasses = d.GetChats()
+	case *tg.MessagesDialogsSlice:
+		chatClasses = d.GetChats()
 	}
-	id := findSelfID(full.Users)
-	if id == 0 {
-		return 0, fmt.Errorf("self flag missing in userFull")
+	for _, chat := range chatClasses {
+		channel, ok := chat.(*tg.Channel)
+		if ok && channel.Left {
+			left[channel.GetID()] = true
+		}
 	}
-	m.selfID.Store(id)
-	return id, nil
+	return left
+}
+
+// saveOpsecList persists the current scan result snapshot.
+func (m *module) saveOpsecList(chats []opsecChat) {
+	sort.Slice(chats, func(i, j int) bool { return chats[i].Count > chats[j].Count })
+	_ = m.withState(func(s *state) error {
+		if s.Opsec == nil {
+			s.Opsec = &opsecState{}
+		}
+		s.Opsec.Chats = chats
+		s.Opsec.ScannedAt = time.Now().Unix()
+		return nil
+	})
 }
 
 func (m *module) dialogSet() map[int64]bool {
@@ -436,26 +409,122 @@ func (m *module) dialogSet() map[int64]bool {
 
 // saveOpsecPartial persists an in-progress aggregation so a restart does
 // not discard a long scan; reports treat it as scan results.
-func (m *module) saveOpsecPartial(agg map[int64]*opsecChat, meta map[int64]tg.ChatClass, dialogs map[int64]bool) {
-	var chatsOut []opsecChat
-	for rawID, entry := range agg {
-		e := *entry
-		if channel, ok := meta[rawID].(*tg.Channel); ok {
-			e.Title = channel.GetTitle()
-			if hash, has := channel.GetAccessHash(); has {
-				e.AccessHash = hash
+func firstCtor(body []byte) uint32 {
+	if len(body) < 4 {
+		return 0
+	}
+	return binary.LittleEndian.Uint32(body[:4])
+}
+
+// resolveSelfID fetches the account's own user id and access hash via
+// users.getFullUser(inputPeerSelf).
+func (m *module) resolveSelfID(ctx context.Context) (int64, error) {
+	if id := m.selfID.Load(); id != 0 {
+		return id, nil
+	}
+	var body []byte
+	err := callWithFloodRetry(ctx, func() error {
+		var callErr error
+		body, callErr = m.call.call(ctx, &tg.UsersGetFullUserRequest{ID: &tg.InputUserSelf{}})
+		return callErr
+	})
+	if err != nil {
+		return 0, err
+	}
+	if firstCtor(body) != tg.UsersUserFullTypeID {
+		return 0, fmt.Errorf("unexpected getFullUser constructor %x", firstCtor(body))
+	}
+	var full tg.UsersUserFull
+	if err := full.DecodeBare(buffer(body[4:])); err != nil {
+		return 0, fmt.Errorf("decode userFull: %w", err)
+	}
+	id := findSelfID(full.Users)
+	if id == 0 {
+		return 0, fmt.Errorf("self flag missing in userFull")
+	}
+	for _, user := range full.Users {
+		concrete, ok := user.(*tg.User)
+		if !ok || !concrete.GetSelf() {
+			continue
+		}
+		if hash, has := concrete.GetAccessHash(); has {
+			m.selfHash.Store(hash)
+		}
+	}
+	m.selfID.Store(id)
+	return id, nil
+}
+
+// selfPeer returns a concrete InputPeerUser for the account: the server
+// ignores from_id=inputPeerSelf in messages.search but honours the real
+// user peer.
+func (m *module) selfPeer() tg.InputPeerClass {
+	if id, hash := m.selfID.Load(), m.selfHash.Load(); id != 0 && hash != 0 {
+		return &tg.InputPeerUser{UserID: id, AccessHash: hash}
+	}
+	return &tg.InputPeerSelf{}
+}
+
+// collectOpsecIDs lazily walks the per-chat self search to gather message
+// ids for a purge, capped so one target cannot block forever.
+func (m *module) collectOpsecIDs(ctx context.Context, c opsecChat) []int {
+	peer := &tg.InputPeerChannel{ChannelID: c.RawID, AccessHash: c.AccessHash}
+	var ids []int
+	seen := make(map[int]bool)
+	limit := opsecPageLimit
+	maxDate := 0
+	for page := 0; page < opsecMaxPages && len(ids) < opsecMaxIDs; page++ {
+		req := &tg.MessagesSearchRequest{
+			Peer:    peer,
+			Q:       "",
+			Filter:  &tg.InputMessagesFilterEmpty{},
+			MaxDate: maxDate,
+			Limit:   limit,
+		}
+		req.SetFromID(m.selfPeer())
+		var body []byte
+		err := callWithFloodRetry(ctx, func() error {
+			var callErr error
+			body, callErr = m.call.call(ctx, req)
+			return callErr
+		})
+		if err != nil {
+			break
+		}
+		messages, _, _, err := decodeSearchPage(body)
+		if err != nil || len(messages) == 0 {
+			break
+		}
+		oldest := 0
+		added := 0
+		self := m.selfID.Load()
+		for _, message := range messages {
+			concrete, ok := message.(*tg.Message)
+			if !ok {
+				continue
+			}
+			from, has := concrete.GetFromID()
+			peerUser, isUser := from.(*tg.PeerUser)
+			if !has || !isUser || peerUser.UserID != self {
+				continue
+			}
+			id := concrete.GetID()
+			if !seen[id] {
+				seen[id] = true
+				ids = append(ids, id)
+				added++
+			}
+			if d := concrete.GetDate(); oldest == 0 || d < oldest {
+				oldest = d
 			}
 		}
-		e.InDialog = dialogs[rawID]
-		chatsOut = append(chatsOut, e)
-	}
-	sort.Slice(chatsOut, func(i, j int) bool { return chatsOut[i].Count > chatsOut[j].Count })
-	_ = m.withState(func(s *state) error {
-		if s.Opsec == nil {
-			s.Opsec = &opsecState{}
+		if oldest == 0 || (maxDate != 0 && oldest >= maxDate) || added == 0 && len(messages) < limit {
+			break
 		}
-		s.Opsec.Chats = chatsOut
-		s.Opsec.ScannedAt = time.Now().Unix()
-		return nil
-	})
+		maxDate = oldest - 1
+		if len(messages) < limit {
+			break
+		}
+	}
+	return ids
 }
