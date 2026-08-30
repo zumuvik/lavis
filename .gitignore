@@ -24,3 +24,6 @@
 # Build artifacts of bundled modules (regenerated per release)
 modules/**/*.lmod
 modules/**/.lmod-pkg/
+
+__pycache__/
+*.pyc
