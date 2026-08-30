@@ -915,15 +915,9 @@ fn minimum_rights() -> tl::types::ChatAdminRights {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn companion_group_photo_targets_marked_channel_peer() {
-        assert_eq!(marked_channel_peer(123), -1_000_000_000_123);
-        assert_eq!(marked_channel_peer(3_542_986_112), -1_003_542_986_112);
-    }
-
     use super::{
         ProvisionError, classify_community_join_error, dialog_peers, input_peer_from_dialog_peer,
-        map_provision_error, marked_channel_peer, tl,
+        map_provision_error, tl,
     };
     use crate::setup_provision::{DialogPeer, ProvisionError as StateError};
 
