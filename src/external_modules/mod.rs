@@ -12,6 +12,8 @@ pub mod protocol;
 pub mod source_inspection;
 pub mod state;
 pub mod v6_executor;
+pub mod v6_handles;
+pub mod v6_host;
 pub(crate) mod v6_process;
 pub mod v6_registry;
 

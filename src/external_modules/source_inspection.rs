@@ -259,6 +259,7 @@ pub struct ModuleInstallPlan {
     pub module_id: String,
     pub module_version: String,
     pub protocol_version: u32,
+    pub contract_revision: Option<u32>,
     pub entrypoint: String,
     pub default_command: Option<String>,
     pub archive_digest: ArchiveDigest,
@@ -341,6 +342,7 @@ impl ModuleInstallPlan {
             module_id: d.id.clone(),
             module_version: d.version.clone(),
             protocol_version: d.protocol_version,
+            contract_revision: d.contract_revision,
             entrypoint: entrypoint.to_string_lossy().into_owned(),
             default_command: d.default_command.clone(),
             archive_digest: digest,
@@ -361,7 +363,14 @@ impl ModuleInstallPlan {
     }
     fn canonical_fingerprint(&self) -> String {
         let mut encoded = Vec::new();
-        canonical_string(&mut encoded, "lavis-plan-v1");
+        canonical_string(
+            &mut encoded,
+            if self.protocol_version == 6 {
+                "lavis-plan-v2"
+            } else {
+                "lavis-plan-v1"
+            },
+        );
         canonical_string(
             &mut encoded,
             match self.source_kind {
@@ -379,6 +388,9 @@ impl ModuleInstallPlan {
         canonical_string(&mut encoded, &self.module_id);
         canonical_string(&mut encoded, &self.module_version);
         encoded.extend_from_slice(&self.protocol_version.to_be_bytes());
+        if self.protocol_version == 6 {
+            encoded.extend_from_slice(&self.contract_revision.unwrap_or(2).to_be_bytes());
+        }
         canonical_string(&mut encoded, &self.entrypoint);
         canonical_option(&mut encoded, self.default_command.as_deref());
         encoded.extend_from_slice(&self.archive_digest.0);
@@ -1363,6 +1375,7 @@ mod tests {
             module_id: "legacy".to_owned(),
             module_version: "1".to_owned(),
             protocol_version: 5,
+            contract_revision: None,
             entrypoint: "run".to_owned(),
             default_command: None,
             archive_digest: ArchiveDigest([0; 32]),

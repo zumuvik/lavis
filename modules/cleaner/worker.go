@@ -287,6 +287,28 @@ func decodeDialogPage(body []byte) ([]groupEntry, int, int, tg.InputPeerClass, b
 	return entries, date, id, next, hasMore, nil
 }
 
+// decodeSearchPage mirrors decodeHistoryPage but also returns the chats
+// vector: opsec needs channel titles and access hashes to purge chats that
+// are no longer present in the dialog list.
+func decodeSearchPage(body []byte) ([]tg.MessageClass, []tg.UserClass, []tg.ChatClass, error) {
+	value, err := tg.DecodeMessagesMessages(buffer(body))
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	switch m := value.(type) {
+	case *tg.MessagesMessages:
+		return m.GetMessages(), m.GetUsers(), m.GetChats(), nil
+	case *tg.MessagesMessagesSlice:
+		return m.GetMessages(), m.GetUsers(), m.GetChats(), nil
+	case *tg.MessagesChannelMessages:
+		return m.GetMessages(), m.GetUsers(), m.GetChats(), nil
+	case *tg.MessagesMessagesNotModified:
+		return nil, nil, nil, nil
+	default:
+		return nil, nil, nil, fmt.Errorf("unexpected search response %T", value)
+	}
+}
+
 // cleanPass removes the account's own messages older than maxAge in every
 // selected group and reports a single summary to the log topic.
 func (m *module) cleanPass(ctx context.Context) error {

@@ -6,6 +6,8 @@ use super::{
         V6OutboundCoreFrame,
     },
     v6_executor::{V6ExecutionContext, V6ExecutorError, V6TelegramExecutor},
+    v6_handles::{V6HandleKind, V6HandleRegistry},
+    v6_host::V6HostExecutor,
     v6_registry,
 };
 use crate::error::ExternalError;
@@ -48,6 +50,7 @@ pub(crate) struct V6Process {
     control: mpsc::Sender<Control>,
     descriptor: Arc<ExternalModuleDescriptor>,
     runtime: Arc<Mutex<V6RuntimeState>>,
+    handles: Arc<Mutex<V6HandleRegistry>>,
 }
 
 #[derive(Debug)]
@@ -96,10 +99,26 @@ fn lock_runtime_state(state: &Mutex<V6RuntimeState>) -> std::sync::MutexGuard<'_
 }
 
 impl V6Process {
+    #[allow(dead_code)]
     pub(crate) async fn start(
         descriptor: ExternalModuleDescriptor,
         executor: Arc<dyn V6TelegramExecutor>,
         restart_generation: u64,
+    ) -> Result<Self, V6StartFailure> {
+        Self::start_with_ledger(
+            descriptor,
+            executor,
+            restart_generation,
+            crate::message_provenance::SharedSelfEditLedger::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn start_with_ledger(
+        descriptor: ExternalModuleDescriptor,
+        executor: Arc<dyn V6TelegramExecutor>,
+        restart_generation: u64,
+        self_edit_ledger: crate::message_provenance::SharedSelfEditLedger,
     ) -> Result<Self, V6StartFailure> {
         if descriptor.protocol_version != 6
             || !descriptor.entrypoint.starts_with(&descriptor.module_dir)
@@ -185,7 +204,13 @@ impl V6Process {
         let (reader_tx, reader_rx) = mpsc::channel(V6_READER_QUEUE);
         let (writer_tx, writer_rx) = mpsc::channel(V6_WRITER_QUEUE);
         let (rpc_tx, rpc_rx) = mpsc::channel(V6_RPC_QUEUE);
-        let reader = tokio::spawn(read_stdout(BufReader::new(stdout), reader_tx));
+        let reader = tokio::spawn(read_stdout(
+            BufReader::new(stdout),
+            reader_tx,
+            descriptor
+                .contract_revision
+                .unwrap_or(protocol::V6_ALPHA_CONTRACT_REVISION),
+        ));
         let writer = tokio::spawn(write_stdin(stdin, writer_rx, rpc_tx.clone()));
         let stderr_capture = Arc::new(Mutex::new(StderrCapture::default()));
         let stderr_drain = tokio::spawn(process::drain_stderr(stderr, stderr_capture.clone()));
@@ -193,12 +218,24 @@ impl V6Process {
             status: process::ProcessStatus::Running,
             diagnostic: None,
         }));
+        let handles = Arc::new(Mutex::new(V6HandleRegistry::with_generation(
+            restart_generation,
+        )));
+        let host = Arc::new(V6HostExecutor::with_registry(
+            descriptor
+                .capabilities
+                .contains(&super::manifest::ExternalCapability::MessageEdit),
+            handles.clone(),
+            self_edit_ledger,
+        ));
         tokio::spawn(supervise(
             child,
             process_group,
             descriptor.clone(),
             executor,
             runtime.clone(),
+            handles.clone(),
+            host,
             SupervisorIo {
                 control_rx,
                 reader_rx,
@@ -216,6 +253,7 @@ impl V6Process {
             control: control_tx,
             descriptor: Arc::new(descriptor),
             runtime,
+            handles,
         })
     }
 
@@ -238,11 +276,12 @@ impl V6Process {
         argument_entities: &[protocol::CustomEmojiEntity],
     ) -> Result<String, ExternalError> {
         let frame = self
-            .execute(
+            .execute_with_context(
                 protocol::request_id(),
                 command.to_owned(),
                 arguments.to_owned(),
                 argument_entities.to_vec(),
+                None,
             )
             .await?;
         match frame {
@@ -297,6 +336,7 @@ impl V6Process {
         .await
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn execute(
         &self,
         request_id: String,
@@ -304,16 +344,62 @@ impl V6Process {
         arguments: String,
         argument_entities: Vec<protocol::CustomEmojiEntity>,
     ) -> Result<V6InboundFrame, ExternalError> {
+        self.execute_with_context(request_id, command, arguments, argument_entities, None)
+            .await
+    }
+
+    pub(crate) async fn execute_with_context(
+        &self,
+        request_id: String,
+        command: String,
+        arguments: String,
+        argument_entities: Vec<protocol::CustomEmojiEntity>,
+        context: Option<protocol::V6CommandContext>,
+    ) -> Result<V6InboundFrame, ExternalError> {
         self.request(
             V6OutboundCoreFrame::Execute {
                 request_id,
                 command,
                 arguments,
                 argument_entities,
+                context,
             },
             Expected::Result,
         )
         .await
+    }
+
+    pub(crate) fn register_current_message(
+        &self,
+        message: grammers_client::message::Message,
+    ) -> Result<String, ExternalError> {
+        self.handles
+            .lock()
+            .map_err(|_| ExternalError::Unavailable)?
+            .issue_message(message)
+            .map_err(|_| ExternalError::Unavailable)
+    }
+    pub(crate) fn register_reply_message(
+        &self,
+        message: grammers_client::message::Message,
+    ) -> Result<String, ExternalError> {
+        self.handles
+            .lock()
+            .map_err(|_| ExternalError::Unavailable)?
+            .issue_reply_message(message)
+            .map_err(|_| ExternalError::Unavailable)
+    }
+    pub(crate) fn release_handle(&self, handle: &str) {
+        if let Ok(mut handles) = self.handles.lock() {
+            handles.release(handle);
+        }
+    }
+    pub(crate) fn register_peer_handle(&self) -> Result<String, ExternalError> {
+        self.handles
+            .lock()
+            .map_err(|_| ExternalError::Unavailable)?
+            .issue(V6HandleKind::Peer)
+            .map_err(|_| ExternalError::Unavailable)
     }
 
     pub(crate) async fn event(
@@ -485,6 +571,10 @@ enum ActorEvent {
         call_id: String,
         result: Result<serde_json::Value, V6CallError>,
     },
+    HostComplete {
+        call_id: String,
+        result: Result<serde_json::Value, V6CallError>,
+    },
     Flushed(String),
     LifecycleFlushed(String),
     ShutdownFlushed,
@@ -504,12 +594,15 @@ struct SupervisorIo {
     stderr_capture: Arc<Mutex<StderrCapture>>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn supervise(
     mut child: Child,
     process_group: u32,
     descriptor: ExternalModuleDescriptor,
     executor: Arc<dyn V6TelegramExecutor>,
     runtime: Arc<Mutex<V6RuntimeState>>,
+    handles: Arc<Mutex<V6HandleRegistry>>,
+    host: Arc<V6HostExecutor>,
     io: SupervisorIo,
     restart_generation: u64,
 ) {
@@ -674,6 +767,51 @@ async fn supervise(
                             }
                         }
                     }
+                    V6InboundFrame::HostInvoke(V6ModuleFrame::HostInvoke { call_id, method, params }) => {
+                        if closing {
+                            // Shutdown is a writer barrier: never enqueue a
+                            // host result behind it.
+                            continue;
+                        }
+                        if active_calls.contains(&call_id) {
+                            fatal_reason = Some(FatalReason::ProtocolDecode);
+                            fatal_stage = "host";
+                            break;
+                        }
+                        if method != "message.edit" {
+                            let error = V6CallError { kind: "protocol".into(), message: "invalid host call".into(), code: None, name: None, retry_after_seconds: None };
+                            if let Err(queue_error) = queue_writer(&writer_tx, WriterCommand::Frame(V6OutboundCoreFrame::HostResult { call_id: call_id.clone(), result: Err(error) }, Flush::Call(call_id))) {
+                                fatal_reason = Some(FatalReason::from_writer(queue_error));
+                                fatal_stage = "host";
+                                break;
+                            }
+                            continue;
+                        }
+                        if active_calls.len() >= V6_MAX_ACTIVE_RPCS {
+                            let error = V6CallError { kind: "capacity".into(), message: "too many active calls".into(), code: None, name: None, retry_after_seconds: None };
+                            if let Err(queue_error) = queue_writer(&writer_tx, WriterCommand::Frame(V6OutboundCoreFrame::HostResult { call_id: call_id.clone(), result: Err(error) }, Flush::Call(call_id))) {
+                                fatal_reason = Some(FatalReason::from_writer(queue_error));
+                                fatal_stage = "host";
+                                break;
+                            }
+                            continue;
+                        }
+                        if !reserve_call_id(&mut active_calls, &call_id) {
+                            fatal_reason = Some(FatalReason::ProtocolDecode);
+                            fatal_stage = "host";
+                            break;
+                        }
+                        let host = host.clone();
+                        let tx = actor_tx.clone();
+                        workers.spawn(async move {
+                            let result = match timeout(V6_RPC_TIMEOUT, host.execute(params)).await {
+                                Ok(Ok(value)) => Ok(value),
+                                Ok(Err(message)) => Err(V6CallError { kind: "host".into(), message: message.into(), code: None, name: None, retry_after_seconds: None }),
+                                Err(_) => Err(V6CallError { kind: "timeout".into(), message: "host call timed out".into(), code: None, name: None, retry_after_seconds: None }),
+                            };
+                            let _ = tx.send(ActorEvent::HostComplete { call_id, result }).await;
+                        });
+                    }
                     frame if terminal_request_id(&frame).is_some() => {
                         let Some(terminal_id) = terminal_request_id(&frame).map(str::to_owned) else {
                             fatal_reason = Some(FatalReason::ProtocolDecode);
@@ -771,6 +909,21 @@ async fn supervise(
                             fatal_stage = "rpc";
                             break;
                         }
+                    }
+                }
+                Some(ActorEvent::HostComplete { call_id, result }) => {
+                    if closing {
+                        active_calls.remove(&call_id);
+                    } else if let Err(error) = queue_writer(
+                        &writer_tx,
+                        WriterCommand::Frame(
+                            V6OutboundCoreFrame::HostResult { call_id: call_id.clone(), result },
+                            Flush::Call(call_id),
+                        ),
+                    ) {
+                        fatal_reason = Some(FatalReason::from_writer(error));
+                        fatal_stage = "host";
+                        break;
                     }
                 }
                 Some(ActorEvent::Flushed(call_id)) => { active_calls.remove(&call_id); }
@@ -893,6 +1046,9 @@ async fn supervise(
     }
     if let Some(reply) = force_reply {
         let _ = reply.send(());
+    }
+    if let Ok(mut registry) = handles.lock() {
+        *registry = V6HandleRegistry::with_generation(restart_generation + 1);
     }
 }
 
@@ -1024,6 +1180,7 @@ fn outbound_stage(frame: &V6OutboundCoreFrame) -> &'static str {
         V6OutboundCoreFrame::Health { .. } => "health",
         V6OutboundCoreFrame::Shutdown { .. } => "shutdown",
         V6OutboundCoreFrame::TelegramResult { .. } => "rpc",
+        V6OutboundCoreFrame::HostResult { .. } => "host",
     }
 }
 
@@ -1169,6 +1326,7 @@ fn capture_exit_status(
 async fn read_stdout(
     mut stdout: BufReader<tokio::process::ChildStdout>,
     tx: mpsc::Sender<ActorEvent>,
+    contract_revision: u32,
 ) {
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
@@ -1198,7 +1356,7 @@ async fn read_stdout(
         }
         let parsed = std::str::from_utf8(&line)
             .map_err(|_| ExternalError::ProtocolDecode)
-            .and_then(protocol::parse_v6_inbound_frame);
+            .and_then(|line| protocol::parse_v6_inbound_frame_for(line, contract_revision));
         if tx.send(ActorEvent::Inbound(parsed)).await.is_err() {
             return;
         }
@@ -1358,7 +1516,7 @@ fn request_id(frame: &V6OutboundCoreFrame) -> Option<&str> {
         | V6OutboundCoreFrame::Event { request_id, .. }
         | V6OutboundCoreFrame::Health { request_id }
         | V6OutboundCoreFrame::Shutdown { request_id } => Some(request_id),
-        V6OutboundCoreFrame::TelegramResult { .. } => None,
+        V6OutboundCoreFrame::TelegramResult { .. } | V6OutboundCoreFrame::HostResult { .. } => None,
     }
 }
 
@@ -1369,7 +1527,9 @@ fn terminal_request_id(frame: &V6InboundFrame) -> Option<&str> {
         | V6InboundFrame::Error { request_id, .. }
         | V6InboundFrame::Health { request_id }
         | V6InboundFrame::EventResult { request_id, .. } => Some(request_id),
-        V6InboundFrame::Log { .. } | V6InboundFrame::TelegramInvoke(_) => None,
+        V6InboundFrame::Log { .. }
+        | V6InboundFrame::TelegramInvoke(_)
+        | V6InboundFrame::HostInvoke(_) => None,
     }
 }
 
@@ -1525,6 +1685,7 @@ mod tests {
     fn descriptor() -> ExternalModuleDescriptor {
         ExternalModuleDescriptor {
             protocol_version: 6,
+            contract_revision: Some(2),
             id: "test".to_owned(),
             display_name: "Test".to_owned(),
             version: "1".to_owned(),

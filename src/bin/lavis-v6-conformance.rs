@@ -1,8 +1,8 @@
 use std::{env, process::Stdio, time::Duration};
 
 use lavis::external_modules::protocol::{
-    MessageEvent, MessageEventKind, V6CallError, V6InboundFrame, V6OutboundCoreFrame,
-    parse_v6_inbound_frame,
+    MessageEvent, MessageEventKind, V6_CURRENT_CONTRACT_REVISION, V6CallError, V6InboundFrame,
+    V6OutboundCoreFrame, parse_v6_inbound_frame_for,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -99,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
             command: "conformance".to_owned(),
             arguments: String::new(),
             argument_entities: vec![],
+            context: None,
         },
         "result",
         "2",
@@ -181,7 +182,7 @@ async fn drive_lifecycle(
             .await
             .map_err(|_| anyhow::anyhow!("module response deadline exceeded"))??
             .ok_or_else(|| anyhow::anyhow!("module closed stdout"))?;
-        match parse_v6_inbound_frame(&line)? {
+        match parse_v6_inbound_frame_for(&line, V6_CURRENT_CONTRACT_REVISION)? {
             V6InboundFrame::TelegramInvoke(call) => {
                 let (call_id, method) = match call {
                     lavis::external_modules::protocol::V6ModuleFrame::TelegramInvoke {
@@ -189,6 +190,9 @@ async fn drive_lifecycle(
                         method,
                         ..
                     } => (call_id, method),
+                    lavis::external_modules::protocol::V6ModuleFrame::HostInvoke { .. } => {
+                        anyhow::bail!("host.invoke is outside Telegram conformance")
+                    }
                 };
                 let result: Result<serde_json::Value, V6CallError> = if method == "raw.invoke" {
                     observed.raw = true;

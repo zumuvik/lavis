@@ -25,6 +25,7 @@ pub mod fastfetch;
 pub mod help;
 pub mod i18n;
 pub mod info;
+pub mod message_provenance;
 pub mod modules;
 pub mod onboarding;
 pub mod reboot_receipt;
@@ -413,6 +414,7 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
             });
 
         let external_manager = external_modules::manager::ExternalManager::new();
+        let self_edit_ledger = message_provenance::SharedSelfEditLedger::default();
         let handle = external_modules::manager::ExternalManagerHandle::new(external_manager);
         external_handle = Some(handle.clone());
         {
@@ -424,6 +426,7 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
             mgr.set_v6_executor(external_modules::v6_executor::GrammersV6Executor::new(
                 guard.inner().module_rpc_client(),
             ));
+            mgr.set_self_edit_ledger(self_edit_ledger.clone());
         }
         handle.startup_enabled(external_state.enabled_ids()).await;
         let mut runtime = runtime::RuntimeState::new(
@@ -432,6 +435,7 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
             settings,
             config.fastfetch_profile_path.clone(),
         );
+        runtime.set_self_edit_ledger(self_edit_ledger);
         runtime.set_http_upstream();
         runtime.set_self_identity(self_identity);
         runtime.configure_setup(

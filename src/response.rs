@@ -380,27 +380,18 @@ fn is_bidi_control(c: char) -> bool {
 }
 
 impl Response {
-    /// Wraps untrusted module output with provenance. `first_notice` shows the
-    /// full no-sandbox warning; subsequent responses in the same process carry
-    /// only a short attribution so the host can never be impersonated while
-    /// the warning stops becoming wallpaper.
     pub fn external_result(
         locale: Locale,
         module_text: &str,
         display_name: &str,
         module_id: &str,
         version: &str,
-        first_notice: bool,
     ) -> Self {
         let sanitized = sanitize_external_output(module_text);
-        let provenance = if first_notice {
-            format!(
-                "\n\n{}",
-                external_module_provenance(locale, display_name, module_id, version)
-            )
-        } else {
-            format!("\n\n— {display_name} v{version}")
-        };
+        let provenance = format!(
+            "\n\n{}",
+            external_module_provenance(locale, display_name, module_id, version)
+        );
         let provenance_units = provenance.encode_utf16().count();
         if sanitized.encode_utf16().count() + provenance_units <= MAX_UTF16_UNITS {
             let text = format!("{sanitized}{provenance}");
@@ -691,7 +682,7 @@ mod tests {
     #[test]
     fn external_result_preserves_provenance() {
         let result =
-            Response::external_result(Locale::Russian, "Привет мир", "Тест", "test", "1.0.0", true);
+            Response::external_result(Locale::Russian, "Привет мир", "Тест", "test", "1.0.0");
         assert!(result.text.contains("Привет мир"));
         assert!(
             result
@@ -704,10 +695,8 @@ mod tests {
     #[test]
     fn external_result_localizes_framing_without_translating_module_text() {
         let module_text = "raw module: Привет";
-        let english =
-            Response::external_result(Locale::English, module_text, "Name", "id", "1", true);
-        let russian =
-            Response::external_result(Locale::Russian, module_text, "Name", "id", "1", true);
+        let english = Response::external_result(Locale::English, module_text, "Name", "id", "1");
+        let russian = Response::external_result(Locale::Russian, module_text, "Name", "id", "1");
         assert!(english.text.starts_with(module_text));
         assert!(russian.text.starts_with(module_text));
         assert!(
@@ -723,14 +712,6 @@ mod tests {
     }
 
     #[test]
-    fn external_result_repeated_notice_is_short_attribution() {
-        let first = Response::external_result(Locale::Russian, "выход", "Тест", "t", "1.0", true);
-        let later = Response::external_result(Locale::Russian, "выход", "Тест", "t", "1.0", false);
-        assert!(first.text.contains("код без песочницы"));
-        assert!(!later.text.contains("песочниц"));
-        assert!(later.text.ends_with("— Тест v1.0"));
-    }
-    #[test]
     fn external_provenance_preserves_brace_containing_manifest_metadata() {
         for locale in [Locale::English, Locale::Russian] {
             let result = Response::external_result(
@@ -739,7 +720,6 @@ mod tests {
                 "name {id}",
                 "id {version}",
                 "version {prefix}",
-                true,
             );
             assert!(result.text.contains("name {id}"));
             assert!(result.text.contains("id {version}"));
@@ -755,7 +735,6 @@ mod tests {
             "Тест",
             "t",
             "1.0",
-            true,
         );
         assert!(!result.text.contains("\x1b["));
         assert!(!result.text.contains('\x00'));
@@ -773,8 +752,7 @@ mod tests {
     #[test]
     fn external_result_truncates_when_text_overflows() {
         let long = "🦀".repeat(MAX_UTF16_UNITS);
-        let result =
-            Response::external_result(Locale::Russian, &long, "Длинный", "long", "0.1", true);
+        let result = Response::external_result(Locale::Russian, &long, "Длинный", "long", "0.1");
         assert!(result.text.contains("… вывод сокращён"));
         assert!(
             result
@@ -790,14 +768,8 @@ mod tests {
             (Locale::English, "… output truncated"),
             (Locale::Russian, "… вывод сокращён"),
         ] {
-            let result = Response::external_result(
-                locale,
-                &"🦀".repeat(MAX_UTF16_UNITS),
-                "Name",
-                "id",
-                "1",
-                true,
-            );
+            let result =
+                Response::external_result(locale, &"🦀".repeat(MAX_UTF16_UNITS), "Name", "id", "1");
             assert!(result.text.contains(suffix));
             assert!(result.text.encode_utf16().count() <= MAX_UTF16_UNITS);
         }
@@ -805,7 +777,7 @@ mod tests {
 
     #[test]
     fn external_result_provenance_present_even_for_empty_text() {
-        let result = Response::external_result(Locale::Russian, "", "Пусто", "empty", "0.0", true);
+        let result = Response::external_result(Locale::Russian, "", "Пусто", "empty", "0.0");
         assert!(
             result
                 .text

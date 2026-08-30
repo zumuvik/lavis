@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "protocol_version": 6,
+  "contract_revision": 3,
+  "offline": true,
+  "frames": [
+    {
+      "name": "host invoke message edit",
+      "direction": "module_to_host",
+      "frame": {
+        "protocol_version": 6,
+        "type": "host.invoke",
+        "call_id": "host-edit-1",
+        "method": "message.edit",
+        "params": {"message": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "text": "updated"}
+      },
+      "accepted_revision_3": true,
+      "accepted_revision_2": false
+    },
+    {
+      "name": "host invoke rejects lifecycle parent",
+      "direction": "module_to_host",
+      "frame": {
+        "protocol_version": 6,
+        "type": "host.invoke",
+        "request_id": "1",
+        "call_id": "host-edit-2",
+        "method": "message.edit",
+        "params": {"message": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "text": "updated"}
+      },
+      "accepted_revision_3": false
+    },
+    {
+      "name": "host result success",
+      "direction": "host_to_module",
+      "frame": {
+        "protocol_version": 6,
+        "type": "host.result",
+        "call_id": "host-edit-1",
+        "ok": true,
+        "result": null
+      },
+      "accepted_revision_3": true
+    },
+    {
+      "name": "host result full error",
+      "direction": "host_to_module",
+      "frame": {
+        "protocol_version": 6,
+        "type": "host.result",
+        "call_id": "host-edit-2",
+        "ok": false,
+        "error": {"kind": "host", "message": "edit rejected", "code": 400, "name": "MESSAGE_EDIT_NOT_ALLOWED", "retry_after_seconds": null}
+      },
+      "accepted_revision_3": true
+    }
+  ]
+}

@@ -980,6 +980,7 @@ mod tests {
         (
             ExternalModuleDescriptor {
                 protocol_version: 1,
+                contract_revision: None,
                 id: "fixture".to_owned(),
                 display_name: "Fixture module".to_owned(),
                 version: "1.0.0".to_owned(),

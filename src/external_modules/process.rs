@@ -352,6 +352,7 @@ impl ModuleProcess {
             command: command.to_owned(),
             arguments: arguments.to_owned(),
             argument_entities: argument_entities.to_vec(),
+            context: None,
         };
         self.in_flight_request = Some(req_id.clone());
         if let Err(e) = self.send(&msg).await {
@@ -1069,6 +1070,7 @@ mod capture_tests {
     fn descriptor(id: &str) -> ExternalModuleDescriptor {
         ExternalModuleDescriptor {
             protocol_version: 2,
+            contract_revision: None,
             id: id.to_owned(),
             display_name: id.to_owned(),
             version: "0.1.0".to_owned(),
@@ -1252,6 +1254,7 @@ mod metadata_tests {
     fn descriptor() -> ExternalModuleDescriptor {
         ExternalModuleDescriptor {
             protocol_version: 4,
+            contract_revision: None,
             id: "metadata-test".to_owned(),
             display_name: "Metadata test".to_owned(),
             version: "1".to_owned(),
@@ -1401,6 +1404,7 @@ if child:
         make_script(&fixture_path, ECHO_MODULE_PY);
 
         let descriptor = ExternalModuleDescriptor {
+            contract_revision: None,
             protocol_version: 2,
             id: "echo".to_owned(),
             display_name: "Echo".to_owned(),
@@ -1428,6 +1432,7 @@ if child:
         make_script(&fixture_path, CHILD_SPAWNER_PY);
 
         let descriptor = ExternalModuleDescriptor {
+            contract_revision: None,
             protocol_version: 2,
             id: "child-spawner".to_owned(),
             display_name: "ChildSpawner".to_owned(),
@@ -1455,6 +1460,7 @@ if child:
         make_script(&fixture_path, body);
 
         let descriptor = ExternalModuleDescriptor {
+            contract_revision: None,
             protocol_version: 2,
             id: id.to_owned(),
             display_name: id.to_owned(),

@@ -641,7 +641,7 @@ fn delivery_error_category(error: &anyhow::Error) -> &'static str {
 /// broke, so the client cannot prove the edit did not happen. Those must fail
 /// closed and keep the suppression armed.
 fn edit_definitely_rejected(error: &grammers_client::InvocationError) -> bool {
-    matches!(error, grammers_client::InvocationError::Rpc(_))
+    crate::message_provenance::edit_definitely_rejected(error)
 }
 
 /// Resolves the [`InvocationError`] (if any) hidden inside a media-delivery
@@ -766,11 +766,12 @@ async fn deliver_media_with_suppression<E: CommandMediaEdits>(
     runtime: &mut RuntimeState,
     plan: MediaDeliveryPlan<'_>,
 ) -> MediaDeliveryOutcome {
-    runtime.register_expected_self_edit(
-        plan.peer_id,
-        plan.message_id,
-        plan.media_caption.to_owned(),
-    );
+    if runtime
+        .register_expected_self_edit(plan.peer_id, plan.message_id, plan.media_caption.to_owned())
+        .is_err()
+    {
+        return MediaDeliveryOutcome::TextFallbackApplied { delivered: false };
+    }
     match edits
         .edit_photo(
             plan.media_url,
@@ -804,11 +805,12 @@ async fn deliver_media_with_suppression<E: CommandMediaEdits>(
             );
         }
     }
-    runtime.register_expected_self_edit(
-        plan.peer_id,
-        plan.message_id,
-        plan.fallback_text.to_owned(),
-    );
+    if runtime
+        .register_expected_self_edit(plan.peer_id, plan.message_id, plan.fallback_text.to_owned())
+        .is_err()
+    {
+        return MediaDeliveryOutcome::TextFallbackApplied { delivered: false };
+    }
     match edits
         .edit_text(plan.fallback_text, plan.fallback_entities)
         .await
@@ -932,9 +934,11 @@ async fn process_update(
             }
         }
     };
+    let authored_active_prefix = authored_by_self && message.text().starts_with(runtime.prefix());
     let event_protected = action.is_some()
         || setup_input.is_some()
-        || runtime.setup_protects_message(peer_id, authored_by_self);
+        || runtime.setup_protects_message(peer_id, authored_by_self)
+        || authored_active_prefix;
 
     // New command/setup messages stay private. If an already-projected message is
     // edited into protected content, emit a redacted edit so modules can reconcile
@@ -982,7 +986,12 @@ async fn process_update(
         let input = grammers_client::message::InputMessage::new()
             .text(rendered_text.clone())
             .fmt_entities(response.entities.clone());
-        runtime.register_expected_self_edit(peer_id, message_id, rendered_text.clone());
+        if runtime
+            .register_expected_self_edit(peer_id, message_id, rendered_text.clone())
+            .is_err()
+        {
+            return None;
+        }
         if let Err(error) = message.edit(input).await {
             let definitely_rejected = edit_definitely_rejected(&error);
             if definitely_rejected {
@@ -1043,6 +1052,19 @@ async fn process_update(
                 message: &message,
                 edited,
                 authored_by_self,
+                replied: if let Action::External(invocation) = &action
+                    && runtime.external_has_capability(
+                        &invocation.module_id,
+                        crate::external_modules::manifest::ExternalCapability::MessageRead,
+                    ) {
+                    tokio::time::timeout(Duration::from_millis(250), message.get_reply())
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .flatten()
+                } else {
+                    None
+                },
             },
         )
         .await;
@@ -1125,34 +1147,40 @@ async fn process_update(
         let input = grammers_client::message::InputMessage::new()
             .text(rendered_text.clone())
             .fmt_entities(execution.response.entities);
-        runtime.register_expected_self_edit(peer_id, message_id, rendered_text.clone());
-        source_edit_succeeded = match message.edit(input).await {
-            Ok(()) => {
-                tracing::debug!(
-                    event = "command_edit_succeeded",
-                    command = action.name(),
-                    message_id,
-                    "Edited outgoing command message"
-                );
-                true
-            }
-            Err(error) => {
-                // Fail closed on ambiguous transport/read failures: the edit
-                // may already have been applied, so its MessageEdited must stay
-                // suppressed. Only a definitive server rejection releases it.
-                if edit_definitely_rejected(&error) {
-                    runtime.remove_expected_self_edit(peer_id, message_id, &rendered_text);
+        source_edit_succeeded = if runtime
+            .register_expected_self_edit(peer_id, message_id, rendered_text.clone())
+            .is_err()
+        {
+            false
+        } else {
+            match message.edit(input).await {
+                Ok(()) => {
+                    tracing::debug!(
+                        event = "command_edit_succeeded",
+                        command = action.name(),
+                        message_id,
+                        "Edited outgoing command message"
+                    );
+                    true
                 }
-                tracing::warn!(
-                    event = "command_edit_failed",
-                    command = action.name(),
-                    message_id,
-                    error_category = invocation_error_category(&error),
-                    fail_closed = !edit_definitely_rejected(&error),
-                    error = %error,
-                    "Failed to edit outgoing command message"
-                );
-                false
+                Err(error) => {
+                    // Fail closed on ambiguous transport/read failures: the edit
+                    // may already have been applied, so its MessageEdited must stay
+                    // suppressed. Only a definitive server rejection releases it.
+                    if edit_definitely_rejected(&error) {
+                        runtime.remove_expected_self_edit(peer_id, message_id, &rendered_text);
+                    }
+                    tracing::warn!(
+                        event = "command_edit_failed",
+                        command = action.name(),
+                        message_id,
+                        error_category = invocation_error_category(&error),
+                        fail_closed = !edit_definitely_rejected(&error),
+                        error = %error,
+                        "Failed to edit outgoing command message"
+                    );
+                    false
+                }
             }
         };
     }
@@ -1327,7 +1355,14 @@ async fn telegram_reboot_receipt_edit(
     let Some(peer) = peer_ref_from_receipt_target(intent.receipt.target()) else {
         return ReceiptEditOutcome::Terminal;
     };
-    register_reboot_completion_suppression(editor.runtime, editor.self_user_id, peer.id, &intent);
+    if !register_reboot_completion_suppression(
+        editor.runtime,
+        editor.self_user_id,
+        peer.id,
+        &intent,
+    ) {
+        return ReceiptEditOutcome::Terminal;
+    }
     match tokio::time::timeout(
         REBOOT_RECEIPT_EDIT_TIMEOUT,
         editor.client.edit_message(
@@ -1353,7 +1388,12 @@ async fn fallback_reboot_edit(
     message_id: i32,
     text: String,
 ) {
-    runtime.register_expected_self_edit(peer_id, message_id, text.clone());
+    if runtime
+        .register_expected_self_edit(peer_id, message_id, text.clone())
+        .is_err()
+    {
+        return;
+    }
     if message
         .edit(grammers_client::message::InputMessage::new().text(text.clone()))
         .await
@@ -1368,16 +1408,18 @@ fn register_reboot_completion_suppression(
     self_user_id: PeerId,
     peer_id: PeerId,
     intent: &RebootReceiptEditIntent,
-) {
+) -> bool {
     let suppression_peer = match intent.receipt.target() {
         ReceiptTarget::SelfUser => self_user_id,
         _ => peer_id,
     };
-    runtime.register_expected_self_edit(
-        suppression_peer,
-        intent.receipt.message_id(),
-        intent.text.clone(),
-    );
+    runtime
+        .register_expected_self_edit(
+            suppression_peer,
+            intent.receipt.message_id(),
+            intent.text.clone(),
+        )
+        .is_ok()
 }
 
 fn should_prepare_message_event(edited: bool, event_protected: bool) -> bool {
@@ -2101,6 +2143,7 @@ mod tests {
         fn descriptor(id: &str, default_command: Option<&str>) -> ExternalModuleDescriptor {
             ExternalModuleDescriptor {
                 protocol_version: 3,
+                contract_revision: None,
                 id: id.to_owned(),
                 display_name: id.to_owned(),
                 version: "test".to_owned(),
@@ -2199,7 +2242,9 @@ mod tests {
         let mut runtime = runtime().await;
         let first_peer = PeerId::user(1).unwrap();
         let second_peer = PeerId::user(2).unwrap();
-        runtime.register_expected_self_edit(first_peer, 7, "🏓 Pong: 1 ms".to_owned());
+        runtime
+            .register_expected_self_edit(first_peer, 7, "🏓 Pong: 1 ms".to_owned())
+            .unwrap();
 
         assert!(!runtime.consume_expected_self_edit(first_peer, 7, ",ping"));
         assert_eq!(route(true, ",ping", &runtime), Some(Action::Ping));

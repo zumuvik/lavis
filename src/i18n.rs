@@ -1174,10 +1174,10 @@ pub fn lm_text(locale: Locale, key: LmText) -> &'static str {
             "⚠️ Эта операция с модулями доступна только из нового собственного сообщения в Saved Messages."
         }
         (Locale::English, LmText::InstallPlan) => {
-            "📋 Installation plan\n\nSource: {source}\nModule: {module} v{version}\nProtocol: {protocol}\nEntrypoint: {entrypoint}\nDefault command: {default_command}\nSHA-256: {sha256}\nFingerprint: {fingerprint}\nArchive: {archive_bytes} bytes, files: {file_count}, compressed: {compressed_bytes} bytes, expanded: {expanded_bytes} bytes\nCapabilities: {capabilities}\nSubscriptions: {subscriptions}\nTelegram V6 methods: {methods}\nActions: {actions}\nWarnings: {warnings}\n\nApprovalId: {approval_id}\nConfirm: {prefix}lm confirm {approval_id}\nCancel: {prefix}lm cancel {approval_id}\nExpires in: 10 minutes."
+            "📋 Installation plan\n\nSource: {source}\nModule: {module} v{version}\nProtocol: {protocol}\nContract revision: {contract_revision}\nEntrypoint: {entrypoint}\nDefault command: {default_command}\nSHA-256: {sha256}\nFingerprint: {fingerprint}\nArchive: {archive_bytes} bytes, files: {file_count}, compressed: {compressed_bytes} bytes, expanded: {expanded_bytes} bytes\nCapabilities: {capabilities}\nSubscriptions: {subscriptions}\nTelegram V6 methods: {methods}\nActions: {actions}\nWarnings: {warnings}\n\nApprovalId: {approval_id}\nConfirm: {prefix}lm confirm {approval_id}\nCancel: {prefix}lm cancel {approval_id}\nExpires in: 10 minutes."
         }
         (Locale::Russian, LmText::InstallPlan) => {
-            "📋 План установки\n\nИсточник: {source}\nМодуль: {module} v{version}\nПротокол: {protocol}\nТочка входа: {entrypoint}\nКоманда по умолчанию: {default_command}\nSHA-256: {sha256}\nОтпечаток: {fingerprint}\nАрхив: {archive_bytes} Байт, файлов: {file_count}, сжато: {compressed_bytes} Байт, распаковано: {expanded_bytes} Байт\nВозможности: {capabilities}\nПодписки: {subscriptions}\nМетоды Telegram V6: {methods}\nДействия: {actions}\nПредупреждения: {warnings}\n\nApprovalId: {approval_id}\nПодтвердите: {prefix}lm confirm {approval_id}\nОтменить: {prefix}lm cancel {approval_id}\nСрок действия: 10 минут."
+            "📋 План установки\n\nИсточник: {source}\nМодуль: {module} v{version}\nПротокол: {protocol}\nРевизия контракта: {contract_revision}\nТочка входа: {entrypoint}\nКоманда по умолчанию: {default_command}\nSHA-256: {sha256}\nОтпечаток: {fingerprint}\nАрхив: {archive_bytes} Байт, файлов: {file_count}, сжато: {compressed_bytes} Байт, распаковано: {expanded_bytes} Байт\nВозможности: {capabilities}\nПодписки: {subscriptions}\nМетоды Telegram V6: {methods}\nДействия: {actions}\nПредупреждения: {warnings}\n\nApprovalId: {approval_id}\nПодтвердите: {prefix}lm confirm {approval_id}\nОтменить: {prefix}lm cancel {approval_id}\nСрок действия: 10 минут."
         }
         (Locale::English, LmText::StateChanged) => {
             "✅ Module «{id}» is now {detail}.\n\nRun {prefix}reboot to apply the change."
@@ -1209,6 +1209,7 @@ pub struct LmInstallPlanText<'a> {
     pub module: &'a str,
     pub version: &'a str,
     pub protocol: u32,
+    pub contract_revision: Option<u32>,
     pub entrypoint: &'a str,
     pub default_command: &'a str,
     pub sha256: &'a str,
@@ -1228,6 +1229,9 @@ pub struct LmInstallPlanText<'a> {
 
 pub fn render_lm_install_plan(locale: Locale, plan: LmInstallPlanText<'_>) -> String {
     let protocol = plan.protocol.to_string();
+    let contract_revision = plan
+        .contract_revision
+        .map_or_else(|| "-".to_owned(), |revision| revision.to_string());
     let archive_bytes = plan.archive_bytes.to_string();
     let file_count = plan.file_count.to_string();
     let compressed_bytes = plan.compressed_bytes.to_string();
@@ -1250,6 +1254,7 @@ pub fn render_lm_install_plan(locale: Locale, plan: LmInstallPlanText<'_>) -> St
             ("approval_id", plan.approval_id),
             ("prefix", plan.prefix),
             ("protocol", protocol.as_str()),
+            ("contract_revision", contract_revision.as_str()),
             ("archive_bytes", archive_bytes.as_str()),
             ("file_count", file_count.as_str()),
             ("compressed_bytes", compressed_bytes.as_str()),
@@ -1697,6 +1702,7 @@ mod tests {
                     module: "module {prefix}",
                     version: "{prefix}",
                     protocol: 6,
+                    contract_revision: Some(2),
                     entrypoint: "entry {prefix}",
                     default_command: "{prefix}",
                     sha256: "hash {prefix}",

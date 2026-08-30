@@ -145,6 +145,7 @@ mod tests {
     fn descriptor(protocol_version: u32) -> ExternalModuleDescriptor {
         ExternalModuleDescriptor {
             protocol_version,
+            contract_revision: (protocol_version == 6).then_some(2),
             id: "autoreact".to_owned(),
             display_name: "AutoReact".to_owned(),
             version: "1".to_owned(),

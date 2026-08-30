@@ -171,6 +171,8 @@ func (m *module) execute(ctx context.Context, command, arguments string) (string
 	for _, arg := range args {
 		arg = strings.ToLower(arg)
 		switch arg {
+		case "opsec", "opsek":
+			return m.opsecCommand(ctx, args)
 		case "list":
 			return m.listGroups()
 		case "add":

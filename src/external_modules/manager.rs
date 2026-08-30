@@ -53,6 +53,7 @@ pub struct ExternalManager {
     /// Monotonic restart generation per module, incremented at every start
     /// attempt. Flows into crash diagnostics so restarts are distinguishable.
     restart_generations: BTreeMap<String, u64>,
+    self_edit_ledger: crate::message_provenance::SharedSelfEditLedger,
 }
 
 #[derive(Clone)]
@@ -157,6 +158,7 @@ impl ExternalManager {
             v6_executor: None,
             latest_diagnostics: BTreeMap::new(),
             restart_generations: BTreeMap::new(),
+            self_edit_ledger: crate::message_provenance::SharedSelfEditLedger::default(),
         }
     }
 
@@ -170,6 +172,12 @@ impl ExternalManager {
 
     pub fn set_v6_executor(&mut self, executor: Arc<dyn V6TelegramExecutor>) {
         self.v6_executor = Some(executor);
+    }
+    pub fn set_self_edit_ledger(
+        &mut self,
+        ledger: crate::message_provenance::SharedSelfEditLedger,
+    ) {
+        self.self_edit_ledger = ledger;
     }
 
     pub fn descriptors(&self) -> &[ExternalModuleDescriptor] {
@@ -486,7 +494,7 @@ impl ExternalManagerHandle {
     /// Starts children without retaining the manager mutex. Process I/O belongs
     /// to the individual process mutex; the manager only owns the index.
     pub async fn startup_enabled(&self, enabled_ids: &std::collections::BTreeSet<String>) {
-        let (descriptors, gateway, v6_executor) = {
+        let (descriptors, gateway, v6_executor, self_edit_ledger) = {
             let manager = self.inner.lock().await;
             (
                 manager
@@ -497,6 +505,7 @@ impl ExternalManagerHandle {
                     .collect::<Vec<_>>(),
                 manager.gateway.clone(),
                 manager.v6_executor.clone(),
+                manager.self_edit_ledger.clone(),
             )
         };
         for descriptor in descriptors {
@@ -512,8 +521,13 @@ impl ExternalManagerHandle {
                                 manager.restart_generations.insert(id.clone(), next);
                                 next
                             };
-                            match V6Process::start(descriptor.clone(), executor, restart_generation)
-                                .await
+                            match V6Process::start_with_ledger(
+                                descriptor.clone(),
+                                executor,
+                                restart_generation,
+                                self_edit_ledger.clone(),
+                            )
+                            .await
                             {
                                 Ok(process) => {
                                     let handshake: Result<(), ExternalError> = match process
@@ -672,13 +686,114 @@ impl ExternalManagerHandle {
             }
         }
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_with_message_context(
+        &self,
+        module_id: &str,
+        command_name: &str,
+        arguments: &str,
+        argument_entities: &[super::protocol::CustomEmojiEntity],
+        message: grammers_client::message::Message,
+        message_text: String,
+        replied: Option<grammers_client::message::Message>,
+    ) -> Result<String, ExternalError> {
+        let process = {
+            let manager = self.inner.lock().await;
+            manager.processes.get(module_id).cloned()
+        }
+        .ok_or(ExternalError::Unavailable)?;
+        match process {
+            ManagedProcess::Legacy { .. } => {
+                self.execute(module_id, command_name, arguments, argument_entities)
+                    .await
+            }
+            ManagedProcess::V6(process) => {
+                if process.status() != ProcessStatus::Running
+                    || process.descriptor().contract_revision.unwrap_or(2)
+                        < super::protocol::V6_HOST_CONTRACT_REVISION
+                {
+                    return self
+                        .execute(module_id, command_name, arguments, argument_entities)
+                        .await;
+                }
+                let replied = if process
+                    .descriptor()
+                    .capabilities
+                    .contains(&super::manifest::ExternalCapability::MessageRead)
+                {
+                    replied
+                } else {
+                    None
+                };
+                let message_handle = process.register_current_message(message)?;
+                let peer_handle = match process.register_peer_handle() {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        process.release_handle(&message_handle);
+                        return Err(error);
+                    }
+                };
+                let reply_context = replied.and_then(|reply| {
+                    process
+                        .register_reply_message(reply.clone())
+                        .ok()
+                        .map(|handle| super::protocol::V6ReplyContext {
+                            message: handle,
+                            text: bounded_context_text(reply.text()),
+                        })
+                });
+                let reply_handle = reply_context.as_ref().map(|reply| reply.message.clone());
+                let result = match process
+                    .execute_with_context(
+                        super::protocol::request_id(),
+                        command_name.to_owned(),
+                        arguments.to_owned(),
+                        argument_entities.to_vec(),
+                        Some(super::protocol::V6CommandContext {
+                            peer: peer_handle.clone(),
+                            message: message_handle.clone(),
+                            text: message_text,
+                            replied: reply_context.clone(),
+                        }),
+                    )
+                    .await
+                {
+                    Ok(super::protocol::V6InboundFrame::Result { text, .. }) => Ok(text),
+                    Ok(_) => Err(ExternalError::ModuleError),
+                    Err(error) => Err(error),
+                };
+                process.release_handle(&message_handle);
+                if let Some(reply) = reply_handle {
+                    process.release_handle(&reply);
+                }
+                process.release_handle(&peer_handle);
+                result
+            }
+        }
+    }
+}
+
+fn bounded_context_text(text: &str) -> String {
+    const MAX_CONTEXT_UTF16: usize = 4096;
+    let mut units = 0;
+    let mut end = 0;
+    for (index, character) in text.char_indices() {
+        let width = character.len_utf16();
+        if units + width > MAX_CONTEXT_UTF16 {
+            break;
+        }
+        units += width;
+        end = index + character.len_utf8();
+    }
+    text[..end].to_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         ExternalManager, ExternalModuleRuntimeStatus, ManagedProcess, ProcessStartKind,
-        process_start_kind,
+        bounded_context_text, process_start_kind,
     };
     use crate::external_modules::manifest::{ExternalCommandDescriptor, ExternalModuleDescriptor};
     use std::path::PathBuf;
@@ -686,6 +801,7 @@ mod tests {
     fn descriptor(id: &str, version: &str) -> ExternalModuleDescriptor {
         ExternalModuleDescriptor {
             protocol_version: 2,
+            contract_revision: None,
             id: id.to_owned(),
             display_name: "Sample".to_owned(),
             version: version.to_owned(),
@@ -1057,5 +1173,21 @@ mod tests {
         drop(guard);
         handle.shutdown_all().await;
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reply_context_text_is_bounded_without_splitting_utf16_scalars() {
+        assert_eq!(
+            bounded_context_text(&"x".repeat(5000))
+                .encode_utf16()
+                .count(),
+            4096
+        );
+        assert_eq!(
+            bounded_context_text(&"😀".repeat(3000))
+                .encode_utf16()
+                .count(),
+            4096
+        );
     }
 }

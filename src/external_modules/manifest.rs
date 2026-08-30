@@ -23,6 +23,7 @@ const MAX_V6_TELEGRAM_METHODS: usize = v6_registry::METHOD_SPECS.len();
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalModuleDescriptor {
     pub protocol_version: u32,
+    pub contract_revision: Option<u32>,
     pub id: String,
     pub display_name: String,
     pub version: String,
@@ -57,6 +58,7 @@ pub enum ExternalCapability {
     MessageReact,
     TelegramAccountStatus,
     TelegramRaw,
+    MessageEdit,
 }
 
 impl ExternalCapability {
@@ -71,6 +73,7 @@ impl ExternalCapability {
             Self::MessageReact => "message.react",
             Self::TelegramAccountStatus => "telegram.account.status",
             Self::TelegramRaw => "telegram.raw",
+            Self::MessageEdit => "message.edit",
         }
     }
 
@@ -86,6 +89,7 @@ impl ExternalCapability {
             Self::TelegramAccountStatus => "изменение статуса аккаунта Telegram",
             // This grants arbitrary Telegram RPC authority, not a sandbox boundary.
             Self::TelegramRaw => "полный доступ к Telegram RPC без песочницы",
+            Self::MessageEdit => "редактирование собственных сообщений",
         }
     }
 
@@ -100,6 +104,7 @@ impl ExternalCapability {
             "message.react" => Some(Self::MessageReact),
             "telegram.account.status" => Some(Self::TelegramAccountStatus),
             "telegram.raw" => Some(Self::TelegramRaw),
+            "message.edit" => Some(Self::MessageEdit),
             _ => None,
         }
     }
@@ -141,6 +146,8 @@ impl ExternalAction {
 #[serde(deny_unknown_fields)]
 struct ManifestFile {
     schema_version: u32,
+    #[serde(default)]
+    contract_revision: Option<u32>,
     id: String,
     name: String,
     version: String,
@@ -345,6 +352,24 @@ pub fn validate_manifest_at(
         return Err(ExternalError::MalformedManifest);
     }
 
+    if manifest.schema_version <= 5 && manifest.contract_revision.is_some() {
+        return Err(ExternalError::MalformedManifest);
+    }
+    let contract_revision = if manifest.schema_version == 6 {
+        let revision = manifest
+            .contract_revision
+            .unwrap_or(super::protocol::V6_ALPHA_CONTRACT_REVISION);
+        if !(super::protocol::V6_ALPHA_CONTRACT_REVISION
+            ..=super::protocol::V6_CURRENT_CONTRACT_REVISION)
+            .contains(&revision)
+        {
+            return Err(ExternalError::UnsupportedSchemaVersion);
+        }
+        Some(revision)
+    } else {
+        None
+    };
+
     if !matches!(manifest.schema_version, 2..=6) {
         return Err(ExternalError::UnsupportedSchemaVersion);
     }
@@ -544,9 +569,17 @@ pub fn validate_manifest_at(
     {
         return Err(ExternalError::InvalidCapability);
     }
+    if seen_capabilities.contains(&ExternalCapability::MessageEdit)
+        && (manifest.schema_version != 6
+            || contract_revision
+                .is_none_or(|revision| revision < super::protocol::V6_HOST_CONTRACT_REVISION))
+    {
+        return Err(ExternalError::InvalidCapability);
+    }
 
     Ok(ExternalModuleDescriptor {
         protocol_version: manifest.schema_version,
+        contract_revision,
         id: manifest.id,
         display_name: manifest.name,
         version: manifest.version,

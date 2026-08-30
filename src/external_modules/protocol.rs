@@ -13,6 +13,8 @@ pub const V6_MAX_JSON_DEPTH: usize = 8;
 pub const V6_MAX_JSON_STRING_BYTES: usize = 8 * 1024;
 pub const V6_MAX_JSON_COLLECTION_ITEMS: usize = 64;
 pub const V6_ALPHA_CONTRACT_REVISION: u32 = 2;
+pub const V6_CURRENT_CONTRACT_REVISION: u32 = 3;
+pub const V6_HOST_CONTRACT_REVISION: u32 = 3;
 pub const V6_TIMEOUT_START: &str = "after_write_flush";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +54,20 @@ pub struct MessageEvent {
     pub entities: Vec<CustomEmojiEntity>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V6ReplyContext {
+    pub message: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V6CommandContext {
+    pub peer: String,
+    pub message: String,
+    pub text: String,
+    pub replied: Option<V6ReplyContext>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ReactionSpec {
     Emoji(String),
@@ -77,6 +93,7 @@ pub enum CoreMessage {
         command: String,
         arguments: String,
         argument_entities: Vec<CustomEmojiEntity>,
+        context: Option<V6CommandContext>,
     },
     Health {
         request_id: String,
@@ -112,6 +129,11 @@ pub enum V6ModuleFrame {
         method: String,
         params: Box<RawValue>,
     },
+    HostInvoke {
+        call_id: String,
+        method: String,
+        params: Box<RawValue>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +151,10 @@ pub enum V6CoreFrame {
         call_id: String,
         result: Result<serde_json::Value, V6CallError>,
     },
+    HostResult {
+        call_id: String,
+        result: Result<serde_json::Value, V6CallError>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -142,6 +168,7 @@ pub enum V6OutboundCoreFrame {
         command: String,
         arguments: String,
         argument_entities: Vec<CustomEmojiEntity>,
+        context: Option<V6CommandContext>,
     },
     Event {
         request_id: String,
@@ -158,6 +185,10 @@ pub enum V6OutboundCoreFrame {
         call_id: String,
         result: Result<serde_json::Value, V6CallError>,
     },
+    HostResult {
+        call_id: String,
+        result: Result<serde_json::Value, V6CallError>,
+    },
 }
 
 impl V6OutboundCoreFrame {
@@ -169,10 +200,8 @@ impl V6OutboundCoreFrame {
             } => serialize_v6_lifecycle(
                 request_id,
                 serde_json::json!({
-                    "protocol_version": 6,
-                    "type": "initialize",
-                    "request_id": request_id,
-                    "module_id": module_id,
+                    "protocol_version": 6, "type": "initialize",
+                    "request_id": request_id, "module_id": module_id,
                 }),
             ),
             Self::Execute {
@@ -180,24 +209,31 @@ impl V6OutboundCoreFrame {
                 command,
                 arguments,
                 argument_entities,
-            } => serialize_v6_lifecycle(
-                request_id,
-                serde_json::json!({
-                    "protocol_version": 6,
-                    "type": "execute",
-                    "request_id": request_id,
-                    "command": command,
-                    "arguments": arguments,
-                    "context": {
-                        "argument_entities": argument_entities.iter().map(|entity| serde_json::json!({
-                            "type": "custom_emoji",
-                            "offset_utf16": entity.offset_utf16,
-                            "length_utf16": entity.length_utf16,
-                            "document_id": entity.document_id,
-                        })).collect::<Vec<_>>(),
-                    },
-                }),
-            ),
+                context,
+            } => {
+                let mut wire_context = serde_json::json!({
+                    "argument_entities": argument_entities.iter().map(|entity| serde_json::json!({
+                        "type": "custom_emoji", "offset_utf16": entity.offset_utf16,
+                        "length_utf16": entity.length_utf16, "document_id": entity.document_id,
+                    })).collect::<Vec<_>>(),
+                });
+                if let Some(context) = context {
+                    wire_context["peer"] = serde_json::json!(context.peer);
+                    wire_context["message"] = serde_json::json!(context.message);
+                    wire_context["text"] = serde_json::json!(context.text);
+                    if let Some(reply) = &context.replied {
+                        wire_context["replied"] =
+                            serde_json::json!({"message": reply.message, "text": reply.text});
+                    }
+                }
+                serialize_v6_lifecycle(
+                    request_id,
+                    serde_json::json!({
+                        "protocol_version": 6, "type": "execute", "request_id": request_id,
+                        "command": command, "arguments": arguments, "context": wire_context,
+                    }),
+                )
+            }
             Self::Event {
                 request_id,
                 event,
@@ -249,6 +285,9 @@ impl V6OutboundCoreFrame {
             Self::TelegramResult { call_id, result } => {
                 serialize_v6_core_result(call_id, result.clone())
             }
+            Self::HostResult { call_id, result } => {
+                serialize_v6_host_result(call_id, result.clone())
+            }
         }
     }
 }
@@ -298,6 +337,7 @@ pub enum V6InboundFrame {
         actions: Vec<EventAction>,
     },
     TelegramInvoke(V6ModuleFrame),
+    HostInvoke(V6ModuleFrame),
 }
 
 #[derive(Deserialize)]
@@ -355,6 +395,17 @@ struct V6WireInvoke {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct V6WireHostInvoke {
+    protocol_version: u32,
+    #[serde(rename = "type")]
+    message_type: String,
+    call_id: String,
+    method: String,
+    params: Box<RawValue>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct V6WireSuccess {
     protocol_version: u32,
     #[serde(rename = "type")]
@@ -389,7 +440,35 @@ struct V6WireError {
 }
 
 pub fn parse_v6_inbound_frame(line: &str) -> Result<V6InboundFrame, ExternalError> {
+    parse_v6_inbound_frame_for(line, V6_ALPHA_CONTRACT_REVISION)
+}
+
+pub fn parse_v6_inbound_frame_for(
+    line: &str,
+    contract_revision: u32,
+) -> Result<V6InboundFrame, ExternalError> {
+    validate_v6_contract_revision(contract_revision)?;
     let value = parse_v6_value(line)?;
+    if value.get("type").and_then(serde_json::Value::as_str) == Some("host.invoke") {
+        if contract_revision < V6_HOST_CONTRACT_REVISION {
+            return Err(ExternalError::ProtocolDecode);
+        }
+        let wire: V6WireHostInvoke =
+            serde_json::from_str(line).map_err(|_| ExternalError::ProtocolDecode)?;
+        if wire.protocol_version != 6
+            || wire.message_type != "host.invoke"
+            || !is_v6_call_id(&wire.call_id)
+            || wire.method.is_empty()
+            || validate_v6_raw_params(&wire.params).is_err()
+        {
+            return Err(ExternalError::ProtocolDecode);
+        }
+        return Ok(V6InboundFrame::HostInvoke(V6ModuleFrame::HostInvoke {
+            call_id: wire.call_id,
+            method: wire.method,
+            params: wire.params,
+        }));
+    }
     if value.get("type").and_then(serde_json::Value::as_str) == Some("telegram.invoke") {
         let wire: V6WireInvoke =
             serde_json::from_str(line).map_err(|_| ExternalError::ProtocolDecode)?;
@@ -477,6 +556,19 @@ pub fn parse_v6_inbound_frame(line: &str) -> Result<V6InboundFrame, ExternalErro
     }
 }
 
+/// Parse module calls for a negotiated V6 contract.  Host calls were added in
+/// revision 3; keeping this revision explicit prevents revision-2 modules from
+/// accidentally acquiring a new capability surface.
+pub fn parse_v6_module_frame_for(
+    line: &str,
+    contract_revision: u32,
+) -> Result<V6ModuleFrame, ExternalError> {
+    match parse_v6_inbound_frame_for(line, contract_revision)? {
+        V6InboundFrame::TelegramInvoke(frame) | V6InboundFrame::HostInvoke(frame) => Ok(frame),
+        _ => Err(ExternalError::ProtocolDecode),
+    }
+}
+
 pub fn parse_v6_module_frame(line: &str) -> Result<V6ModuleFrame, ExternalError> {
     match parse_v6_inbound_frame(line)? {
         V6InboundFrame::TelegramInvoke(frame) => Ok(frame),
@@ -485,7 +577,29 @@ pub fn parse_v6_module_frame(line: &str) -> Result<V6ModuleFrame, ExternalError>
 }
 
 pub fn parse_v6_core_frame(line: &str) -> Result<V6CoreFrame, ExternalError> {
+    parse_v6_core_frame_for(line, V6_ALPHA_CONTRACT_REVISION)
+}
+
+pub fn parse_v6_core_frame_for(
+    line: &str,
+    contract_revision: u32,
+) -> Result<V6CoreFrame, ExternalError> {
+    validate_v6_contract_revision(contract_revision)?;
     let _ = parse_v6_value(line)?;
+    let message_type = serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+    if message_type.as_deref() == Some("host.result") {
+        if contract_revision < V6_HOST_CONTRACT_REVISION {
+            return Err(ExternalError::ProtocolDecode);
+        }
+        return parse_v6_host_result(line);
+    }
     let success = serde_json::from_str::<V6WireSuccess>(line);
     if let Ok(success) = success {
         if success.protocol_version == 6
@@ -522,6 +636,49 @@ pub fn parse_v6_core_frame(line: &str) -> Result<V6CoreFrame, ExternalError> {
     })
 }
 
+fn parse_v6_host_result(line: &str) -> Result<V6CoreFrame, ExternalError> {
+    if let Ok(success) = serde_json::from_str::<V6WireSuccess>(line) {
+        if success.protocol_version != 6
+            || success.message_type != "host.result"
+            || !success.ok
+            || !is_v6_call_id(&success.call_id)
+        {
+            return Err(ExternalError::ProtocolDecode);
+        }
+        return Ok(V6CoreFrame::HostResult {
+            call_id: success.call_id,
+            result: Ok(success.result),
+        });
+    }
+    let failure: V6WireFailure =
+        serde_json::from_str(line).map_err(|_| ExternalError::ProtocolDecode)?;
+    if failure.protocol_version != 6
+        || failure.message_type != "host.result"
+        || failure.ok
+        || !is_v6_call_id(&failure.call_id)
+        || failure.error.kind.is_empty()
+    {
+        return Err(ExternalError::ProtocolDecode);
+    }
+    Ok(V6CoreFrame::HostResult {
+        call_id: failure.call_id,
+        result: Err(V6CallError {
+            kind: failure.error.kind,
+            message: failure.error.message,
+            code: failure.error.code,
+            name: failure.error.name,
+            retry_after_seconds: failure.error.retry_after_seconds,
+        }),
+    })
+}
+
+fn validate_v6_contract_revision(revision: u32) -> Result<(), ExternalError> {
+    (V6_ALPHA_CONTRACT_REVISION..=V6_CURRENT_CONTRACT_REVISION)
+        .contains(&revision)
+        .then_some(())
+        .ok_or(ExternalError::ProtocolDecode)
+}
+
 pub fn serialize_v6_core_result(
     call_id: &str,
     result: Result<serde_json::Value, V6CallError>,
@@ -552,6 +709,29 @@ pub fn serialize_v6_core_result(
         return Err(ExternalError::ProtocolEncode);
     }
     Ok(line)
+}
+
+pub fn serialize_v6_host_result(
+    call_id: &str,
+    result: Result<serde_json::Value, V6CallError>,
+) -> Result<String, ExternalError> {
+    if !is_v6_call_id(call_id) {
+        return Err(ExternalError::ProtocolEncode);
+    }
+    let value = match result {
+        Ok(result) => {
+            serde_json::json!({"protocol_version":6,"type":"host.result","call_id":call_id,"ok":true,"result":result})
+        }
+        Err(error) if !error.kind.is_empty() => {
+            serde_json::json!({"protocol_version":6,"type":"host.result","call_id":call_id,"ok":false,"error":{"kind":error.kind,"message":error.message,"code":error.code,"name":error.name,"retry_after_seconds":error.retry_after_seconds}})
+        }
+        Err(_) => return Err(ExternalError::ProtocolEncode),
+    };
+    guard_v6_json(&value, 0).map_err(|_| ExternalError::ProtocolEncode)?;
+    let line = serde_json::to_string(&value).map_err(|_| ExternalError::ProtocolEncode)?;
+    (line.len() <= MAX_LINE_BYTES)
+        .then_some(line)
+        .ok_or(ExternalError::ProtocolEncode)
 }
 
 fn parse_v6_value(line: &str) -> Result<serde_json::Value, ExternalError> {
@@ -687,6 +867,7 @@ impl CoreMessage {
                 command,
                 arguments,
                 argument_entities,
+                context,
             } => {
                 let mut message = serde_json::json!({
                     "protocol_version": protocol_version,
@@ -696,7 +877,7 @@ impl CoreMessage {
                     "arguments": arguments,
                 });
                 if protocol_version >= 3 {
-                    message["context"] = serde_json::json!({
+                    let mut context_value = serde_json::json!({
                         "argument_entities": argument_entities.iter().map(|entity| serde_json::json!({
                             "type": "custom_emoji",
                             "offset_utf16": entity.offset_utf16,
@@ -704,6 +885,12 @@ impl CoreMessage {
                             "document_id": entity.document_id,
                         })).collect::<Vec<_>>(),
                     });
+                    if let Some(context) = context {
+                        context_value["peer"] = serde_json::json!(context.peer);
+                        context_value["message"] = serde_json::json!(context.message);
+                        context_value["text"] = serde_json::json!(context.text);
+                    }
+                    message["context"] = context_value;
                 }
                 serde_json::to_string(&message)
             }
@@ -1097,6 +1284,30 @@ mod tests {
     }
 
     #[test]
+    fn revision_three_host_transcript_is_offline_and_revision_gated() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../protocol/v6/revision-3-host-transcript.json"
+        ))
+        .unwrap();
+        assert_eq!(fixture["contract_revision"], V6_HOST_CONTRACT_REVISION);
+        for case in fixture["frames"].as_array().unwrap() {
+            let line = serde_json::to_string(&case["frame"]).unwrap();
+            let accepted = case["accepted_revision_3"].as_bool().unwrap();
+            if case["direction"] == "module_to_host" {
+                assert_eq!(parse_v6_inbound_frame_for(&line, 3).is_ok(), accepted);
+                if case.get("accepted_revision_2").is_some() {
+                    assert_eq!(
+                        parse_v6_inbound_frame_for(&line, 2).is_ok(),
+                        case["accepted_revision_2"]
+                    );
+                }
+            } else {
+                assert_eq!(parse_v6_core_frame_for(&line, 3).is_ok(), accepted);
+            }
+        }
+    }
+
+    #[test]
     fn v6_alpha_contract_fixture_conforms_to_its_schema_invariants() {
         // The frozen artifact must stay structurally consistent with
         // protocol/v6/alpha-contract.schema.json. The schema requires the
@@ -1191,7 +1402,10 @@ mod tests {
             call_id,
             method,
             params,
-        } = parse_v6_module_frame(invoke).unwrap();
+        } = parse_v6_module_frame(invoke).unwrap()
+        else {
+            panic!("expected telegram invoke");
+        };
         assert_eq!(call_id, "call_1");
         assert_eq!(method, "account.updateStatus");
         assert_eq!(params.get(), r#"{"offline":true}"#);
@@ -1399,6 +1613,7 @@ mod tests {
             command: "run".to_owned(),
             arguments: "args".to_owned(),
             argument_entities: vec![],
+            context: None,
         };
         let event = V6OutboundCoreFrame::Event {
             request_id: "3".to_owned(),
@@ -1445,6 +1660,7 @@ mod tests {
                 length_utf16: 2,
                 document_id: "5456140674028019486".to_owned(),
             }],
+            context: None,
         };
         let value: serde_json::Value = serde_json::from_str(&frame.serialize().unwrap()).unwrap();
 
@@ -1458,6 +1674,38 @@ mod tests {
         assert_eq!(
             value["context"]["argument_entities"][0]["document_id"],
             "5456140674028019486"
+        );
+    }
+
+    #[test]
+    fn revision_three_context_contains_only_handles_and_bounded_text_fields() {
+        let frame = V6OutboundCoreFrame::Execute {
+            request_id: "14".to_owned(),
+            command: "run".to_owned(),
+            arguments: String::new(),
+            argument_entities: vec![],
+            context: Some(V6CommandContext {
+                peer: "a".repeat(64),
+                message: "b".repeat(64),
+                text: "current".to_owned(),
+                replied: Some(V6ReplyContext {
+                    message: "c".repeat(64),
+                    text: "reply".to_owned(),
+                }),
+            }),
+        };
+        let value: serde_json::Value = serde_json::from_str(&frame.serialize().unwrap()).unwrap();
+        let encoded = value.to_string();
+        assert!(encoded.contains("current"));
+        assert!(encoded.contains("reply"));
+        assert!(!encoded.contains("access_hash"));
+        assert_eq!(value["context"]["peer"].as_str().unwrap().len(), 64);
+        assert_eq!(
+            value["context"]["replied"]["message"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
         );
     }
 
@@ -1630,6 +1878,7 @@ mod tests {
             command: "repeat".to_owned(),
             arguments: "Привет".to_owned(),
             argument_entities: Vec::new(),
+            context: None,
         };
         let json = msg.serialize().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1652,6 +1901,7 @@ mod tests {
                 length_utf16: 2,
                 document_id: "5456140674028019486".to_owned(),
             }],
+            context: None,
         };
         for version in [3, 4] {
             let parsed: serde_json::Value =

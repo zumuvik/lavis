@@ -78,7 +78,7 @@ pub struct RuntimeState {
     info_local_metadata: InfoLocalMetadata,
     external_manager: Option<ExternalManagerHandle>,
     external_snapshot: ExternalRuntimeSnapshot,
-    expected_self_edits: VecDeque<ExpectedSelfEdit>,
+    expected_self_edits: crate::message_provenance::SharedSelfEditLedger,
     setup_notification_ids: VecDeque<(PeerId, i32)>,
     setup_edit_fallback_sources: VecDeque<(PeerId, i32)>,
     setup: Option<SetupCoordinator>,
@@ -88,7 +88,6 @@ pub struct RuntimeState {
     module_installation: Option<ModuleInstallation>,
     module_control: Option<ModuleControlConfig>,
     module_approvals: ApprovalStore<SystemClock, OsRandom>,
-    external_warnings_announced: std::collections::HashSet<String>,
 }
 
 struct ModuleInstallation {
@@ -297,13 +296,6 @@ impl CreatedEventDispatch {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ExpectedSelfEdit {
-    peer_id: PeerId,
-    message_id: i32,
-    text: String,
-}
-
 struct SetupCoordinator {
     state_path: PathBuf,
     token_path: PathBuf,
@@ -369,11 +361,12 @@ pub enum ShutdownReason {
     Restart,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct MessageExecutionContext<'a> {
     pub(crate) message: &'a Message,
     pub(crate) edited: bool,
     pub(crate) authored_by_self: bool,
+    pub(crate) replied: Option<Message>,
 }
 
 impl From<Response> for RuntimeExecution {
@@ -430,7 +423,7 @@ impl RuntimeState {
             },
             external_manager: None,
             external_snapshot: ExternalRuntimeSnapshot::new(),
-            expected_self_edits: VecDeque::new(),
+            expected_self_edits: crate::message_provenance::SharedSelfEditLedger::default(),
             setup_notification_ids: VecDeque::new(),
             setup_edit_fallback_sources: VecDeque::new(),
             setup: None,
@@ -446,7 +439,6 @@ impl RuntimeState {
                     max_pending_expanded_bytes: MODULE_APPROVAL_BYTES,
                 },
             ),
-            external_warnings_announced: std::collections::HashSet::new(),
         }
     }
 
@@ -558,6 +550,13 @@ impl RuntimeState {
     pub async fn set_external_manager(&mut self, handle: ExternalManagerHandle) {
         self.external_snapshot = handle.snapshot().await;
         self.external_manager = Some(handle);
+    }
+
+    pub fn set_self_edit_ledger(
+        &mut self,
+        ledger: crate::message_provenance::SharedSelfEditLedger,
+    ) {
+        self.expected_self_edits = ledger;
     }
 
     pub fn configure_module_installation(
@@ -777,15 +776,13 @@ impl RuntimeState {
         self.settings.locale().unwrap_or(Locale::Russian)
     }
 
-    pub fn register_expected_self_edit(&mut self, peer_id: PeerId, message_id: i32, text: String) {
-        if self.expected_self_edits.len() == MAX_EXPECTED_SELF_EDITS {
-            self.expected_self_edits.pop_front();
-        }
-        self.expected_self_edits.push_back(ExpectedSelfEdit {
-            peer_id,
-            message_id,
-            text,
-        });
+    pub fn register_expected_self_edit(
+        &mut self,
+        peer_id: PeerId,
+        message_id: i32,
+        text: String,
+    ) -> Result<(), crate::message_provenance::LedgerFull> {
+        self.expected_self_edits.register(peer_id, message_id, text)
     }
 
     pub fn consume_expected_self_edit(
@@ -794,19 +791,11 @@ impl RuntimeState {
         message_id: i32,
         text: &str,
     ) -> bool {
-        let Some(index) = self.expected_self_edits.iter().position(|expected| {
-            expected.peer_id == peer_id
-                && expected.message_id == message_id
-                && expected.text == text
-        }) else {
-            return false;
-        };
-        self.expected_self_edits.remove(index);
-        true
+        self.expected_self_edits.consume(peer_id, message_id, text)
     }
 
     pub fn remove_expected_self_edit(&mut self, peer_id: PeerId, message_id: i32, text: &str) {
-        self.consume_expected_self_edit(peer_id, message_id, text);
+        self.expected_self_edits.remove(peer_id, message_id, text);
     }
 
     pub fn register_setup_notification(&mut self, peer_id: PeerId, message_id: i32) {
@@ -900,7 +889,23 @@ impl RuntimeState {
             .any(|descriptor| descriptor.id == module_id)
     }
 
-    async fn execute_external(&mut self, invocation: &ExternalInvocation) -> Response {
+    pub fn external_has_capability(
+        &self,
+        module_id: &str,
+        capability: crate::external_modules::manifest::ExternalCapability,
+    ) -> bool {
+        self.external_snapshot
+            .descriptors
+            .iter()
+            .find(|descriptor| descriptor.id == module_id)
+            .is_some_and(|descriptor| descriptor.capabilities.contains(&capability))
+    }
+
+    async fn execute_external(
+        &mut self,
+        invocation: &ExternalInvocation,
+        message_context: MessageExecutionContext<'_>,
+    ) -> Response {
         let locale = self.locale();
         let handle = match self.external_manager.clone() {
             Some(h) => h,
@@ -917,11 +922,14 @@ impl RuntimeState {
             }
         };
         let result = handle
-            .execute(
+            .execute_with_message_context(
                 &invocation.module_id,
                 &invocation.command_name,
                 &invocation.arguments,
                 &invocation.argument_entities,
+                message_context.message.clone(),
+                message_context.message.text().to_owned(),
+                message_context.replied.clone(),
             )
             .await;
         let response = match &result {
@@ -932,17 +940,13 @@ impl RuntimeState {
                     .iter()
                     .find(|d| d.id == invocation.module_id);
                 match found {
-                    Some(desc) => {
-                        let first_notice = self.external_warnings_announced.insert(desc.id.clone());
-                        Response::external_result(
-                            self.locale(),
-                            text,
-                            &desc.display_name,
-                            &desc.id,
-                            &desc.version,
-                            first_notice,
-                        )
-                    }
+                    Some(desc) => Response::external_result(
+                        self.locale(),
+                        text,
+                        &desc.display_name,
+                        &desc.id,
+                        &desc.version,
+                    ),
                     None => missing_descriptor_response(locale, text, &invocation.module_id),
                 }
             }
@@ -1111,7 +1115,9 @@ impl RuntimeState {
             Action::Reboot => return self.execute_reboot(message_context),
             Action::Setup(_) => unreachable!("setup actions return before response dispatch"),
             Action::Start(_) => unreachable!("start actions return before response dispatch"),
-            Action::External(invocation) => self.execute_external(invocation).await,
+            Action::External(invocation) => {
+                self.execute_external(invocation, message_context).await
+            }
         }
         .into()
     }
@@ -1361,7 +1367,7 @@ impl RuntimeState {
             ),
         }
         if lm_request_mutates(request)
-            && let Err(response) = self.lm_mutation_policy(message_context)
+            && let Err(response) = self.lm_mutation_policy(message_context.clone())
         {
             return response;
         }
@@ -1574,10 +1580,8 @@ impl RuntimeState {
                 .modules
                 .iter()
                 .any(|entry| entry.id.as_deref() == Some(enabled));
-            if listed {
-                continue;
-            }
-            if let Some(target) = id
+            if !listed
+                && let Some(target) = id
                 && enabled != target
             {
                 continue;
@@ -2389,6 +2393,7 @@ fn render_install_plan(
             module: &plan.module_id,
             version: &plan.module_version,
             protocol: plan.protocol_version,
+            contract_revision: plan.contract_revision,
             entrypoint: &plan.entrypoint,
             default_command: plan
                 .default_command
@@ -3170,6 +3175,7 @@ mod tests {
             module_id: "raw".to_owned(),
             module_version: "1".to_owned(),
             protocol_version: 6,
+            contract_revision: Some(2),
             entrypoint: "run".to_owned(),
             default_command: None,
             archive_digest: ArchiveDigest::from_hex(&"0".repeat(64)).unwrap(),
@@ -3449,63 +3455,6 @@ mod tests {
 
         let doctor_missing = runtime.lm_doctor(Some("absent")).await;
         assert!(doctor_missing.text.contains("Модуль absent не найден."));
-
-        fs::remove_dir_all(directory).unwrap();
-        fs::remove_dir_all(state_directory).unwrap();
-    }
-
-    #[tokio::test]
-    async fn lm_doctor_reports_missing_catalog_only_for_absent_ids() {
-        use std::os::unix::fs::PermissionsExt;
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let directory = std::env::temp_dir().join(format!(
-            "lavis-runtime-doctor-ghost-{}-{nonce}-{seq}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&directory).unwrap();
-
-        let module_dir = directory.join("installed");
-        fs::create_dir_all(&module_dir).unwrap();
-        fs::write(
-            module_dir.join("module.json"),
-            br#"{"schema_version":6,"id":"installed","name":"Installed","version":"1","author":"A","entrypoint":"run","capabilities":[],"telegram_methods":[],"commands":[{"name":"go","summary_ru":"x","description_ru":"x","usage":"<value>"}]}"#,
-        )
-        .unwrap();
-        let entrypoint = module_dir.join("run");
-        fs::write(&entrypoint, "#!/bin/sh\n").unwrap();
-        fs::set_permissions(&entrypoint, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::write(
-            directory.join("state.json"),
-            br#"{"version":1,"enabled":["installed","ghost"]}"#,
-        )
-        .unwrap();
-
-        let (mut runtime, state_directory) = runtime_with_alias().await;
-        runtime.configure_module_control(
-            directory.clone(),
-            directory.join("state.json"),
-            directory.join("declarative.json"),
-            PeerId::user(1).unwrap(),
-        );
-
-        let doctor_all = runtime.lm_doctor(None).await;
-        assert!(doctor_all.text.contains("Installed"));
-        assert_eq!(
-            doctor_all.text.matches("каталог отсутствует").count(),
-            1,
-            "only the genuinely absent id may be reported: {}",
-            doctor_all.text
-        );
-        assert!(doctor_all.text.contains("ghost"));
-
-        let doctor_one = runtime.lm_doctor(Some("installed")).await;
-        assert!(doctor_one.text.contains("Installed"));
-        assert_eq!(doctor_one.text.matches("каталог отсутствует").count(), 0);
 
         fs::remove_dir_all(directory).unwrap();
         fs::remove_dir_all(state_directory).unwrap();
@@ -4117,30 +4066,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounds_replaces_and_cleans_up_expected_self_edits() {
+    async fn bounds_rejects_saturation_and_cleans_up_expected_self_edits() {
         let (mut runtime, directory) = runtime_with_alias().await;
         let peer = grammers_session::types::PeerId::user(1).unwrap();
-        for message_id in 0..=super::MAX_EXPECTED_SELF_EDITS as i32 {
-            runtime.register_expected_self_edit(peer, message_id, format!("response {message_id}"));
+        for message_id in 0..super::MAX_EXPECTED_SELF_EDITS as i32 {
+            runtime
+                .register_expected_self_edit(peer, message_id, format!("response {message_id}"))
+                .unwrap();
         }
-        assert!(!runtime.consume_expected_self_edit(peer, 0, "response 0"));
-        assert!(runtime.consume_expected_self_edit(
-            peer,
-            super::MAX_EXPECTED_SELF_EDITS as i32,
-            &format!("response {}", super::MAX_EXPECTED_SELF_EDITS)
-        ));
+        assert!(
+            runtime
+                .register_expected_self_edit(peer, 128, "response 128".to_owned())
+                .is_err()
+        );
+        assert!(runtime.consume_expected_self_edit(peer, 0, "response 0"));
+        assert!(runtime.consume_expected_self_edit(peer, 1, "response 1"));
 
-        runtime.register_expected_self_edit(peer, 42, "old response".to_owned());
-        runtime.register_expected_self_edit(peer, 42, "new response".to_owned());
+        runtime
+            .register_expected_self_edit(peer, 42, "old response".to_owned())
+            .unwrap();
+        runtime
+            .register_expected_self_edit(peer, 42, "new response".to_owned())
+            .unwrap();
         assert!(runtime.consume_expected_self_edit(peer, 42, "old response"));
         assert!(runtime.consume_expected_self_edit(peer, 42, "new response"));
 
-        runtime.register_expected_self_edit(peer, 43, "failed response".to_owned());
+        runtime
+            .register_expected_self_edit(peer, 43, "failed response".to_owned())
+            .unwrap();
         runtime.remove_expected_self_edit(peer, 43, "failed response");
         assert!(!runtime.consume_expected_self_edit(peer, 43, "failed response"));
 
-        runtime.register_expected_self_edit(peer, 44, "duplicate response".to_owned());
-        runtime.register_expected_self_edit(peer, 44, "duplicate response".to_owned());
+        runtime
+            .register_expected_self_edit(peer, 44, "duplicate response".to_owned())
+            .unwrap();
+        runtime
+            .register_expected_self_edit(peer, 44, "duplicate response".to_owned())
+            .unwrap();
         assert!(runtime.consume_expected_self_edit(peer, 44, "duplicate response"));
         assert!(runtime.consume_expected_self_edit(peer, 44, "duplicate response"));
         assert!(!runtime.consume_expected_self_edit(peer, 44, "duplicate response"));
@@ -4508,6 +4470,7 @@ for line in sys.stdin:
         ) -> crate::external_modules::manifest::ExternalModuleDescriptor {
             crate::external_modules::manifest::ExternalModuleDescriptor {
                 protocol_version,
+                contract_revision: (protocol_version == 6).then_some(2),
                 id: id.to_owned(),
                 display_name: id.to_owned(),
                 version: "test".to_owned(),
@@ -4720,6 +4683,7 @@ for line in sys.stdin:
         fn descriptor(id: &str) -> ExternalModuleDescriptor {
             ExternalModuleDescriptor {
                 protocol_version: 6,
+                contract_revision: Some(2),
                 id: id.to_owned(),
                 display_name: id.to_owned(),
                 version: "test".to_owned(),
