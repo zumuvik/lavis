@@ -6,7 +6,7 @@ use super::{
         V6OutboundCoreFrame,
     },
     v6_executor::{V6ExecutionContext, V6ExecutorError, V6TelegramExecutor},
-    v6_handles::{V6HandleKind, V6HandleRegistry},
+    v6_handles::V6HandleRegistry,
     v6_host::V6HostExecutor,
     v6_registry,
 };
@@ -17,7 +17,10 @@ use std::{
     future,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
@@ -51,6 +54,8 @@ pub(crate) struct V6Process {
     descriptor: Arc<ExternalModuleDescriptor>,
     runtime: Arc<Mutex<V6RuntimeState>>,
     handles: Arc<Mutex<V6HandleRegistry>>,
+    host_active: Arc<AtomicUsize>,
+    pending_handle_releases: Arc<Mutex<Vec<String>>>,
 }
 
 #[derive(Debug)]
@@ -221,6 +226,8 @@ impl V6Process {
         let handles = Arc::new(Mutex::new(V6HandleRegistry::with_generation(
             restart_generation,
         )));
+        let host_active = Arc::new(AtomicUsize::new(0));
+        let pending_handle_releases = Arc::new(Mutex::new(Vec::new()));
         let host = Arc::new(V6HostExecutor::with_registry(
             descriptor
                 .capabilities
@@ -235,6 +242,8 @@ impl V6Process {
             executor,
             runtime.clone(),
             handles.clone(),
+            host_active.clone(),
+            pending_handle_releases.clone(),
             host,
             SupervisorIo {
                 control_rx,
@@ -254,6 +263,8 @@ impl V6Process {
             descriptor: Arc::new(descriptor),
             runtime,
             handles,
+            host_active,
+            pending_handle_releases,
         })
     }
 
@@ -372,11 +383,12 @@ impl V6Process {
     pub(crate) fn register_current_message(
         &self,
         message: grammers_client::message::Message,
+        editable: bool,
     ) -> Result<String, ExternalError> {
         self.handles
             .lock()
             .map_err(|_| ExternalError::Unavailable)?
-            .issue_message(message)
+            .issue_message(message, editable)
             .map_err(|_| ExternalError::Unavailable)
     }
     pub(crate) fn register_reply_message(
@@ -390,15 +402,26 @@ impl V6Process {
             .map_err(|_| ExternalError::Unavailable)
     }
     pub(crate) fn release_handle(&self, handle: &str) {
+        if self.host_active.load(Ordering::Acquire) != 0 {
+            if let Ok(mut pending) = self.pending_handle_releases.lock()
+                && !pending.iter().any(|item| item == handle)
+            {
+                pending.push(handle.to_owned());
+            }
+            return;
+        }
         if let Ok(mut handles) = self.handles.lock() {
             handles.release(handle);
         }
     }
-    pub(crate) fn register_peer_handle(&self) -> Result<String, ExternalError> {
+    pub(crate) fn register_peer_handle(
+        &self,
+        peer: grammers_session::types::PeerId,
+    ) -> Result<String, ExternalError> {
         self.handles
             .lock()
             .map_err(|_| ExternalError::Unavailable)?
-            .issue(V6HandleKind::Peer)
+            .issue_peer(peer)
             .map_err(|_| ExternalError::Unavailable)
     }
 
@@ -602,6 +625,8 @@ async fn supervise(
     executor: Arc<dyn V6TelegramExecutor>,
     runtime: Arc<Mutex<V6RuntimeState>>,
     handles: Arc<Mutex<V6HandleRegistry>>,
+    host_active: Arc<AtomicUsize>,
+    pending_handle_releases: Arc<Mutex<Vec<String>>>,
     host: Arc<V6HostExecutor>,
     io: SupervisorIo,
     restart_generation: u64,
@@ -736,6 +761,7 @@ async fn supervise(
                             fatal_stage = "rpc";
                             break;
                         }
+                        host_active.fetch_add(1, Ordering::AcqRel);
                         if active_calls.len() > V6_MAX_ACTIVE_RPCS {
                             let error = V6CallError { kind: "capacity".to_owned(), message: "too many active calls".to_owned(), code: None, name: None, retry_after_seconds: None };
                             if let Err(queue_error) = queue_writer(&writer_tx, WriterCommand::Frame(V6OutboundCoreFrame::TelegramResult { call_id: call_id.clone(), result: Err(error) }, Flush::Call(call_id))) {
@@ -779,22 +805,14 @@ async fn supervise(
                             break;
                         }
                         if method != "message.edit" {
-                            let error = V6CallError { kind: "protocol".into(), message: "invalid host call".into(), code: None, name: None, retry_after_seconds: None };
-                            if let Err(queue_error) = queue_writer(&writer_tx, WriterCommand::Frame(V6OutboundCoreFrame::HostResult { call_id: call_id.clone(), result: Err(error) }, Flush::Call(call_id))) {
-                                fatal_reason = Some(FatalReason::from_writer(queue_error));
-                                fatal_stage = "host";
-                                break;
-                            }
-                            continue;
+                            fatal_reason = Some(FatalReason::ProtocolDecode);
+                            fatal_stage = "host";
+                            break;
                         }
                         if active_calls.len() >= V6_MAX_ACTIVE_RPCS {
-                            let error = V6CallError { kind: "capacity".into(), message: "too many active calls".into(), code: None, name: None, retry_after_seconds: None };
-                            if let Err(queue_error) = queue_writer(&writer_tx, WriterCommand::Frame(V6OutboundCoreFrame::HostResult { call_id: call_id.clone(), result: Err(error) }, Flush::Call(call_id))) {
-                                fatal_reason = Some(FatalReason::from_writer(queue_error));
-                                fatal_stage = "host";
-                                break;
-                            }
-                            continue;
+                            fatal_reason = Some(FatalReason::Backpressure);
+                            fatal_stage = "host";
+                            break;
                         }
                         if !reserve_call_id(&mut active_calls, &call_id) {
                             fatal_reason = Some(FatalReason::ProtocolDecode);
@@ -914,6 +932,7 @@ async fn supervise(
                 Some(ActorEvent::HostComplete { call_id, result }) => {
                     if closing {
                         active_calls.remove(&call_id);
+                        finish_host_call(&host_active, &pending_handle_releases, &handles);
                     } else if let Err(error) = queue_writer(
                         &writer_tx,
                         WriterCommand::Frame(
@@ -924,6 +943,8 @@ async fn supervise(
                         fatal_reason = Some(FatalReason::from_writer(error));
                         fatal_stage = "host";
                         break;
+                    } else {
+                        finish_host_call(&host_active, &pending_handle_releases, &handles);
                     }
                 }
                 Some(ActorEvent::Flushed(call_id)) => { active_calls.remove(&call_id); }
@@ -1114,6 +1135,21 @@ fn handle_rpc_complete(
 
 fn reserve_call_id(active_calls: &mut HashSet<String>, call_id: &str) -> bool {
     active_calls.insert(call_id.to_owned())
+}
+
+fn finish_host_call(
+    active: &AtomicUsize,
+    pending: &Arc<Mutex<Vec<String>>>,
+    handles: &Arc<Mutex<V6HandleRegistry>>,
+) {
+    if active.fetch_sub(1, Ordering::AcqRel) == 1
+        && let Ok(mut pending) = pending.lock()
+        && let Ok(mut handles) = handles.lock()
+    {
+        for handle in pending.drain(..) {
+            handles.release(&handle);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -697,6 +697,8 @@ impl ExternalManagerHandle {
         message: grammers_client::message::Message,
         message_text: String,
         replied: Option<grammers_client::message::Message>,
+        peer_id: grammers_session::types::PeerId,
+        authored_by_self: bool,
     ) -> Result<String, ExternalError> {
         let process = {
             let manager = self.inner.lock().await;
@@ -726,8 +728,8 @@ impl ExternalManagerHandle {
                 } else {
                     None
                 };
-                let message_handle = process.register_current_message(message)?;
-                let peer_handle = match process.register_peer_handle() {
+                let message_handle = process.register_current_message(message, authored_by_self)?;
+                let peer_handle = match process.register_peer_handle(peer_id) {
                     Ok(handle) => handle,
                     Err(error) => {
                         process.release_handle(&message_handle);

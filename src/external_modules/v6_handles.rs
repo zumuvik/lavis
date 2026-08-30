@@ -1,4 +1,5 @@
 use grammers_client::message::Message;
+use grammers_session::types::PeerId;
 use std::{
     collections::HashMap,
     time::{Duration, Instant},
@@ -16,7 +17,7 @@ pub enum V6HandleKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) enum V6HandleTarget {
-    Peer(String),
+    Peer(PeerId),
     Message { peer: String, message: i32 },
 }
 
@@ -39,7 +40,7 @@ struct Entry {
 pub struct V6HandleRegistry {
     entries: HashMap<String, Entry>,
     generation: u64,
-    peer_handle: Option<String>,
+    peer_handles: HashMap<PeerId, String>,
 }
 
 #[allow(dead_code)]
@@ -51,22 +52,25 @@ impl V6HandleRegistry {
         Self {
             entries: HashMap::new(),
             generation,
-            peer_handle: None,
+            peer_handles: HashMap::new(),
         }
     }
     pub(crate) fn issue(&mut self, kind: V6HandleKind) -> Result<String, V6HandleError> {
         self.issue_target(match kind {
-            V6HandleKind::Peer => V6HandleTarget::Peer(String::new()),
+            V6HandleKind::Peer => V6HandleTarget::Peer(PeerId::user(1).ok_or(V6HandleError)?),
             V6HandleKind::Message => V6HandleTarget::Message {
                 peer: String::new(),
                 message: 0,
             },
         })
     }
+    pub(crate) fn issue_peer(&mut self, peer: PeerId) -> Result<String, V6HandleError> {
+        self.issue_target(V6HandleTarget::Peer(peer))
+    }
     pub(crate) fn issue_target(&mut self, target: V6HandleTarget) -> Result<String, V6HandleError> {
         self.purge_expired();
-        if matches!(target, V6HandleTarget::Peer(_))
-            && let Some(handle) = self.peer_handle.clone()
+        if let V6HandleTarget::Peer(ref peer) = target
+            && let Some(handle) = self.peer_handles.get(peer).cloned()
             && self.entries.contains_key(&handle)
         {
             return Ok(handle);
@@ -96,21 +100,25 @@ impl V6HandleRegistry {
                     editable: false,
                 },
             );
-            if kind == V6HandleKind::Peer {
-                self.peer_handle = Some(handle.clone());
+            if let V6HandleTarget::Peer(peer) = target {
+                self.peer_handles.insert(peer, handle.clone());
             }
             return Ok(handle);
         }
         Err(V6HandleError)
     }
-    pub(crate) fn issue_message(&mut self, message: Message) -> Result<String, V6HandleError> {
+    pub(crate) fn issue_message(
+        &mut self,
+        message: Message,
+        editable: bool,
+    ) -> Result<String, V6HandleError> {
         self.issue_target_with_authority(
             V6HandleTarget::Message {
                 peer: String::new(),
                 message: 0,
             },
             Some(message),
-            true,
+            editable,
         )
     }
     pub(crate) fn issue_reply_message(
@@ -194,9 +202,8 @@ impl V6HandleRegistry {
         }
     }
     pub(crate) fn release(&mut self, handle: &str) {
-        if self.peer_handle.as_deref() != Some(handle) {
-            self.entries.remove(handle);
-        }
+        self.entries.remove(handle);
+        self.peer_handles.retain(|_, cached| cached != handle);
     }
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
@@ -242,8 +249,11 @@ mod tests {
     #[test]
     fn peer_handles_are_reused_and_released_messages_free_capacity() {
         let mut registry = V6HandleRegistry::new();
-        let first = registry.issue(V6HandleKind::Peer).unwrap();
-        assert_eq!(registry.issue(V6HandleKind::Peer).unwrap(), first);
+        let first = registry.issue_peer(PeerId::user(1).unwrap()).unwrap();
+        assert_eq!(
+            registry.issue_peer(PeerId::user(1).unwrap()).unwrap(),
+            first
+        );
         let message = registry.issue(V6HandleKind::Message).unwrap();
         registry.release(&message);
         assert!(registry.issue(V6HandleKind::Message).is_ok());

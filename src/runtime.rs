@@ -932,6 +932,8 @@ impl RuntimeState {
                 message_context.message.clone(),
                 message_context.message.text().to_owned(),
                 message_context.replied.clone(),
+                message_context.message.peer_id(),
+                message_context.authored_by_self,
             )
             .await;
         let response = match &result {
