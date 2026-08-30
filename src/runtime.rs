@@ -1586,8 +1586,10 @@ impl RuntimeState {
                 .modules
                 .iter()
                 .any(|entry| entry.id.as_deref() == Some(enabled));
-            if !listed
-                && let Some(target) = id
+            if listed {
+                continue;
+            }
+            if let Some(target) = id
                 && enabled != target
             {
                 continue;
@@ -3461,6 +3463,63 @@ mod tests {
 
         let doctor_missing = runtime.lm_doctor(Some("absent")).await;
         assert!(doctor_missing.text.contains("Модуль absent не найден."));
+
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(state_directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn lm_doctor_reports_missing_catalog_only_for_absent_ids() {
+        use std::os::unix::fs::PermissionsExt;
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "lavis-runtime-doctor-ghost-{}-{nonce}-{seq}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+
+        let module_dir = directory.join("installed");
+        fs::create_dir_all(&module_dir).unwrap();
+        fs::write(
+            module_dir.join("module.json"),
+            br#"{"schema_version":6,"id":"installed","name":"Installed","version":"1","author":"A","entrypoint":"run","capabilities":[],"telegram_methods":[],"commands":[{"name":"go","summary_ru":"x","description_ru":"x","usage":"<value>"}]}"#,
+        )
+        .unwrap();
+        let entrypoint = module_dir.join("run");
+        fs::write(&entrypoint, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&entrypoint, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(
+            directory.join("state.json"),
+            br#"{"version":1,"enabled":["installed","ghost"]}"#,
+        )
+        .unwrap();
+
+        let (mut runtime, state_directory) = runtime_with_alias().await;
+        runtime.configure_module_control(
+            directory.clone(),
+            directory.join("state.json"),
+            directory.join("declarative.json"),
+            PeerId::user(1).unwrap(),
+        );
+
+        let doctor_all = runtime.lm_doctor(None).await;
+        assert!(doctor_all.text.contains("Installed"));
+        assert_eq!(
+            doctor_all.text.matches("каталог отсутствует").count(),
+            1,
+            "only the genuinely absent id may be reported: {}",
+            doctor_all.text
+        );
+        assert!(doctor_all.text.contains("ghost"));
+
+        let doctor_one = runtime.lm_doctor(Some("installed")).await;
+        assert!(doctor_one.text.contains("Installed"));
+        assert_eq!(doctor_one.text.matches("каталог отсутствует").count(), 0);
 
         fs::remove_dir_all(directory).unwrap();
         fs::remove_dir_all(state_directory).unwrap();
