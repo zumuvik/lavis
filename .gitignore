@@ -20,3 +20,7 @@
 *.db
 *.db-journal
 /modules/cleaner/bin/
+
+# Build artifacts of bundled modules (regenerated per release)
+modules/**/*.lmod
+modules/**/.lmod-pkg/
