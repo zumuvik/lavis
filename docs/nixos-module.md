@@ -198,7 +198,7 @@ Extensions can be installed from package/path outputs:
 services.lavis.extensions = [
   {
     id = "gaf";
-    package = lavis.packages.x86_64-linux.lavis-extension-gaf;
+    package = lavis.packages.${pkgs.system}.lavis-extension-gaf;
     enable = true;
   }
 ];
@@ -271,7 +271,7 @@ declare extensions you trust.
     extensions = [
       {
         id = "gaf";
-        package = lavis.packages.x86_64-linux.lavis-extension-gaf;
+        package = lavis.packages.${pkgs.system}.lavis-extension-gaf;
       }
       {
         id = "my-module";
@@ -285,13 +285,13 @@ declare extensions you trust.
 
 ## Flake outputs
 
-The flake provides:
+The flake provides (`<system>` is `x86_64-linux` or `aarch64-linux`):
 
 ```text
 nixosModules.default
-packages.x86_64-linux.default
-packages.x86_64-linux.lavis-extension-gaf
-lib.x86_64-linux.buildLavisExtensionFromLmod
+packages.<system>.default
+packages.<system>.lavis-extension-gaf
+lib.<system>.buildLavisExtensionFromLmod
 ```
 
 `buildLavisExtensionFromLmod` accepts a fetched `.lmod` source and unpacks it
@@ -299,7 +299,7 @@ into a directory package:
 
 ```nix
 let
-  myExtension = lavis.lib.x86_64-linux.buildLavisExtensionFromLmod {
+  myExtension = lavis.lib.${pkgs.system}.buildLavisExtensionFromLmod {
     id = "my-module";
     src = pkgs.fetchurl {
       url = "https://example.invalid/my-module.lmod";

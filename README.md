@@ -260,12 +260,67 @@ Declarative external modules are also supported:
 services.lavis.extensions = [
   {
     id = "gaf";
-    package = inputs.lavis.packages.x86_64-linux.lavis-extension-gaf;
+    package = inputs.lavis.packages.${pkgs.system}.lavis-extension-gaf;
   }
 ];
 ```
 
 See [NixOS module](docs/nixos-module.md) for service, recovery and declarative extension details.
+
+---
+
+## Any other Linux
+
+The same flake ships `x86_64-linux` and `aarch64-linux` outputs, so Lavis runs on
+any Linux distribution with Nix and flakes enabled — no NixOS required. The binary
+package is fully self-contained in the Nix store; `fastfetch` is already wired into
+the wrapper's `PATH`.
+
+Add the binary cache to `~/.config/nix/nix.conf` so future updates are substituted
+instead of compiled locally (aarch64 outputs are usually not cached yet):
+
+```ini
+extra-substituters = https://lavis.cachix.org
+extra-trusted-public-keys = lavis.cachix.org-1:EXJoSAQxNZb8j/p/2DrBBLmOXHP0VemCUZ5FdifeHbg=
+```
+
+Install and authorize once interactively:
+
+```bash
+nix profile install 'git+https://tangled.org/zumuvik.tngl.sh/lavis'
+lavis auth
+```
+
+Run it as a systemd user service in `~/.config/systemd/user/lavis.service`:
+
+```ini
+[Unit]
+Description=Lavis Telegram userbot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/.nix-profile/bin/lavis run
+WorkingDirectory=%h
+Environment=LAVIS_SERVICE=1
+Restart=on-failure
+# Status 78 means interactive reauthorization is required; retrying cannot fix it.
+RestartPreventExitStatus=78
+RestartSec=5s
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now lavis.service
+loginctl enable-linger "$USER"
+```
+
+Update with `nix profile upgrade '.*'` followed by
+`systemctl --user restart lavis.service`; rollback is `nix profile rollback`.
+State lives in the XDG directories below and survives updates.
 
 ---
 

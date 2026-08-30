@@ -260,12 +260,66 @@ sudo systemctl start lavis.service
 services.lavis.extensions = [
   {
     id = "gaf";
-    package = inputs.lavis.packages.x86_64-linux.lavis-extension-gaf;
+    package = inputs.lavis.packages.${pkgs.system}.lavis-extension-gaf;
   }
 ];
 ```
 
 Полное описание сервиса, recovery и declarative extensions: [NixOS module](docs/nixos-module.md).
+
+---
+
+## Любой другой Linux
+
+Тот же flake собирает outputs для `x86_64-linux` и `aarch64-linux`, так что Lavis
+работает на любом Linux-дистрибутиве с Nix и включёнными флейками — NixOS не
+обязателен. Бинарный пакет полностью замкнут в Nix store, `fastfetch` уже прописан
+в `PATH` обёртки.
+
+Добавь бинарный кеш в `~/.config/nix/nix.conf`, чтобы будущие обновления
+скачивались, а не компилировались локально (aarch64-артефакты обычно ещё не в кеше):
+
+```ini
+extra-substituters = https://lavis.cachix.org
+extra-trusted-public-keys = lavis.cachix.org-1:EXJoSAQxNZb8j/p/2DrBBLmOXHP0VemCUZ5FdifeHbg=
+```
+
+Ставим и один раз авторизуемся интерактивно:
+
+```bash
+nix profile install 'git+https://tangled.org/zumuvik.tngl.sh/lavis'
+lavis auth
+```
+
+Запускаем как systemd user-сервис в `~/.config/systemd/user/lavis.service`:
+
+```ini
+[Unit]
+Description=Lavis Telegram userbot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/.nix-profile/bin/lavis run
+WorkingDirectory=%h
+Environment=LAVIS_SERVICE=1
+Restart=on-failure
+# Код 78 означает, что нужна интерактивная повторная авторизация — перезапуск его не лечит.
+RestartPreventExitStatus=78
+RestartSec=5s
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now lavis.service
+loginctl enable-linger "$USER"
+```
+
+Обновление: `nix profile upgrade '.*'`, затем `systemctl --user restart lavis.service`;
+откат — `nix profile rollback`. Состояние живёт в XDG-каталогах ниже и переживает обновления.
 
 ---
 
