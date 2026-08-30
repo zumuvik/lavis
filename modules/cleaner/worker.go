@@ -450,9 +450,14 @@ walk:
 		if selfID == 0 {
 			selfID = findSelfID(users)
 			if selfID == 0 {
-				return deleted, false, fmt.Errorf("self user not present in history response")
+				id, idErr := m.resolveSelfID(ctx)
+				if idErr != nil {
+					return deleted, false, fmt.Errorf("resolve self id: %w", idErr)
+				}
+				selfID = id
+			} else {
+				m.selfID.Store(selfID)
 			}
-			m.selfID.Store(selfID)
 		}
 		ids, minID := ownDeletable(messages, selfID, cutoff, seen)
 		for start := 0; start < len(ids); start += batchSize {

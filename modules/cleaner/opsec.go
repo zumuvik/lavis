@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -290,8 +291,12 @@ func (m *module) runOpsec() {
 			}
 		}
 		if selfID == 0 {
-			scanErr = "self id not found"
-			break
+			id, idErr := m.resolveSelfID(ctx)
+			if idErr != nil {
+				scanErr = idErr.Error()
+				break
+			}
+			selfID = id
 		}
 		if len(messages) == 0 {
 			break
@@ -340,6 +345,12 @@ func (m *module) runOpsec() {
 			}
 		}
 		pages++
+		if pages%25 == 0 {
+			fmt.Fprintf(os.Stderr, "opsec scan progress: pages=%d chats=%d seen=%d maxDate=%d\n", pages, len(agg), len(seenIDs), maxDate)
+		}
+		if pages%200 == 0 {
+			m.saveOpsecPartial(agg, meta, m.dialogSet())
+		}
 		if newOnPage == 0 && pageOldest == 0 {
 			break
 		}
@@ -352,12 +363,7 @@ func (m *module) runOpsec() {
 		}
 	}
 
-	dialogSet := make(map[int64]bool)
-	m.peekState(func(s *state) {
-		for _, d := range s.Discovered {
-			dialogSet[d.ID] = true
-		}
-	})
+	dialogSet := m.dialogSet()
 	var chatsOut []opsecChat
 	for rawID, entry := range agg {
 		if channel, ok := meta[rawID].(*tg.Channel); ok {
@@ -385,4 +391,71 @@ func (m *module) runOpsec() {
 	if scanErr != "" {
 		fmt.Fprintf(os.Stderr, "opsec scan: %s\n", scanErr)
 	}
+}
+
+// resolveSelfID fetches the account's own user id via
+// users.getFullUser(inputPeerSelf): global search responses do not carry a
+// self-flagged user in their users vector, unlike history pages.
+func (m *module) resolveSelfID(ctx context.Context) (int64, error) {
+	if id := m.selfID.Load(); id != 0 {
+		return id, nil
+	}
+	var body []byte
+	err := callWithFloodRetry(ctx, func() error {
+		var callErr error
+		body, callErr = m.call.call(ctx, &tg.UsersGetFullUserRequest{ID: &tg.InputUserSelf{}})
+		return callErr
+	})
+	if err != nil {
+		return 0, err
+	}
+	if len(body) < 4 || binary.LittleEndian.Uint32(body[:4]) != tg.UsersUserFullTypeID {
+		return 0, fmt.Errorf("unexpected getFullUser constructor")
+	}
+	var full tg.UsersUserFull
+	if err := full.DecodeBare(buffer(body[4:])); err != nil {
+		return 0, fmt.Errorf("decode userFull: %w", err)
+	}
+	id := findSelfID(full.Users)
+	if id == 0 {
+		return 0, fmt.Errorf("self flag missing in userFull")
+	}
+	m.selfID.Store(id)
+	return id, nil
+}
+
+func (m *module) dialogSet() map[int64]bool {
+	set := make(map[int64]bool)
+	m.peekState(func(s *state) {
+		for _, d := range s.Discovered {
+			set[d.ID] = true
+		}
+	})
+	return set
+}
+
+// saveOpsecPartial persists an in-progress aggregation so a restart does
+// not discard a long scan; reports treat it as scan results.
+func (m *module) saveOpsecPartial(agg map[int64]*opsecChat, meta map[int64]tg.ChatClass, dialogs map[int64]bool) {
+	var chatsOut []opsecChat
+	for rawID, entry := range agg {
+		e := *entry
+		if channel, ok := meta[rawID].(*tg.Channel); ok {
+			e.Title = channel.GetTitle()
+			if hash, has := channel.GetAccessHash(); has {
+				e.AccessHash = hash
+			}
+		}
+		e.InDialog = dialogs[rawID]
+		chatsOut = append(chatsOut, e)
+	}
+	sort.Slice(chatsOut, func(i, j int) bool { return chatsOut[i].Count > chatsOut[j].Count })
+	_ = m.withState(func(s *state) error {
+		if s.Opsec == nil {
+			s.Opsec = &opsecState{}
+		}
+		s.Opsec.Chats = chatsOut
+		s.Opsec.ScannedAt = time.Now().Unix()
+		return nil
+	})
 }
