@@ -1368,13 +1368,28 @@ async fn telegram_reboot_receipt_edit(
         editor.client.edit_message(
             peer,
             intent.receipt.message_id(),
-            grammers_client::message::InputMessage::new().text(intent.text),
+            grammers_client::message::InputMessage::new().text(intent.text.clone()),
         ),
     )
     .await
     {
         Ok(Ok(())) => ReceiptEditOutcome::Applied,
-        Ok(Err(error)) if error.is("MESSAGE_NOT_MODIFIED") => ReceiptEditOutcome::AlreadyApplied,
+        Ok(Err(error)) if edit_definitely_rejected(&error) => {
+            let suppression_peer = match intent.receipt.target() {
+                ReceiptTarget::SelfUser => editor.self_user_id,
+                _ => peer.id,
+            };
+            editor.runtime.remove_expected_self_edit(
+                suppression_peer,
+                intent.receipt.message_id(),
+                &intent.text,
+            );
+            if error.is("MESSAGE_NOT_MODIFIED") {
+                ReceiptEditOutcome::AlreadyApplied
+            } else {
+                ReceiptEditOutcome::Terminal
+            }
+        }
         Ok(Err(error)) if is_temporary_telegram_error(&error) => ReceiptEditOutcome::Temporary,
         Ok(Err(_)) => ReceiptEditOutcome::Terminal,
         Err(_) => ReceiptEditOutcome::Temporary,
