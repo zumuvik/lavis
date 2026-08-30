@@ -180,7 +180,8 @@ pub trait ProvisionTransport: Send + Sync {
     fn get_app_config<'a>(&'a self) -> ProvisionFuture<'a, FolderCapacity>;
     fn get_forum_group<'a>(&'a self, group: ForumGroup) -> ProvisionFuture<'a, Option<ForumGroup>>;
     fn create_forum_group<'a>(&'a self, title: &'a str) -> ProvisionFuture<'a, ForumGroup>;
-    /// Best-effort companion group avatar from the bundled assets.
+    /// Best-effort companion group avatar from the bundled assets; runs on
+    /// every provision so repair restores a missing or deleted photo.
     fn set_forum_group_photo<'a>(&'a self, group: ForumGroup) -> ProvisionFuture<'a, ()>;
     fn get_forum_topic<'a>(
         &'a self,
@@ -417,13 +418,6 @@ pub async fn provision(
             .ok_or(ProvisionError::GroupUnavailable)?,
         None => {
             let group = transport.create_forum_group(COMPANION_GROUP_TITLE).await?;
-            if let Err(error) = transport.set_forum_group_photo(group).await {
-                tracing::warn!(
-                    event = "setup_group_photo_failed",
-                    error = ?error,
-                    "Companion group was created without its avatar"
-                );
-            }
             state.identities.companion_chat_id = Some(group.id);
             state.identities.companion_chat_access_hash = group.access_hash;
             state.stages.forum_group_created = true;
@@ -431,6 +425,15 @@ pub async fn provision(
             group
         }
     };
+    // Best-effort avatar on every provision, so `setup repair` can restore
+    // a group photo deleted or predating the asset pipeline.
+    if let Err(error) = transport.set_forum_group_photo(group).await {
+        tracing::warn!(
+            event = "setup_group_photo_failed",
+            error = ?error,
+            "Companion group kept its current avatar"
+        );
+    }
 
     if !state.stages.forum_group_created {
         state.stages.forum_group_created = true;
