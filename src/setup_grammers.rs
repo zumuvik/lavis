@@ -873,9 +873,6 @@ fn input_channel(identity: InputIdentity) -> tl::enums::InputChannel {
 /// `messages.editChatPhoto` addresses channels by their marked peer id,
 /// while provisioning identities store the raw channel id (the same value
 /// `InputPeerChannel.channel_id` expects).
-fn marked_channel_peer(raw_channel_id: i64) -> i64 {
-    -(1_000_000_000_000 + raw_channel_id)
-}
 
 fn input_peer_channel(identity: InputIdentity) -> tl::enums::InputPeer {
     tl::enums::InputPeer::Channel(tl::types::InputPeerChannel {
