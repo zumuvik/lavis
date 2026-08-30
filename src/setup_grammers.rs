@@ -273,15 +273,26 @@ impl ProvisionTransport for GrammersTransport<'_> {
             // best-effort caller.
             let bytes: &[u8] = include_bytes!("../assets/grouplogo.png");
             let mut stream = std::io::Cursor::new(bytes.to_vec());
-            let uploaded = self
+            let uploaded = match self
                 .client
                 .upload_stream(&mut stream, bytes.len(), "lavis-group.png".to_string())
                 .await
-                .map_err(|_| setup_provision::ProvisionError::SetGroupPhoto)?;
+            {
+                Ok(uploaded) => uploaded,
+                Err(error) => {
+                    tracing::warn!(
+                        event = "setup_group_photo_upload_failed",
+                        error = %error,
+                        "Could not upload the companion group avatar"
+                    );
+                    return Err(setup_provision::ProvisionError::SetGroupPhoto);
+                }
+            };
             let file = uploaded.raw;
-            self.client
+            let response = self
+                .client
                 .invoke(&tl::functions::messages::EditChatPhoto {
-                    chat_id: marked_channel_peer(group.id),
+                    chat_id: group.id,
                     photo: tl::enums::InputChatPhoto::InputChatUploadedPhoto(
                         tl::types::InputChatUploadedPhoto {
                             file: Some(file),
@@ -291,9 +302,19 @@ impl ProvisionTransport for GrammersTransport<'_> {
                         },
                     ),
                 })
-                .await
-                .map_err(|_| setup_provision::ProvisionError::SetGroupPhoto)?;
-            Ok(())
+                .await;
+            match response {
+                Ok(_) => Ok(()),
+                Err(error) => {
+                    tracing::warn!(
+                        event = "setup_group_photo_edit_failed",
+                        error = %error,
+                        chat_id = group.id,
+                        "Telegram rejected the companion group avatar"
+                    );
+                    Err(setup_provision::ProvisionError::SetGroupPhoto)
+                }
+            }
         })
     }
 
