@@ -200,29 +200,75 @@ func (m *module) execute(ctx context.Context, command, arguments string) (string
 
 // listGroups prints the discovered-group cache with numbered entries.
 // Entry 0 is a special "add all" target; entries 1..n map to cached chats.
+// listGroups prints the discovered dialog cache with numbered entries.
+// Entry 0 is a special "add all" target; entries 1..n map to cached chats.
+// Once an opsec scan exists, every chat gains its own-message count and a
+// clickable link to the newest own message. The card is capped to the
+// Telegram caption budget, so very long dialog lists keep the head rows.
 func (m *module) listGroups() (string, error) {
 	var cache []groupEntry
+	type footprint struct {
+		count int
+		msg   int
+		date  int64
+	}
+	foot := make(map[int64]footprint)
 	selected := make(map[int64]bool)
 	m.peekState(func(s *state) {
 		cache = append([]groupEntry(nil), s.Discovered...)
 		for _, group := range s.Selected {
 			selected[group.ID] = true
 		}
+		if s.Opsec != nil && s.Opsec.ScannedAt != 0 {
+			for _, c := range s.Opsec.Chats {
+				foot[c.RawID] = footprint{count: c.Count, msg: c.NewestMsg, date: c.Newest}
+			}
+		}
 	})
 	var b strings.Builder
 	b.WriteString("🧹 Cleaner: группы с сообщениями старше 12 ч\n\n")
 	b.WriteString("0. Добавить все\n")
+	const listBudget = 3500
+	overflow := 0
 	for i, entry := range cache {
 		marker := "  "
 		if selected[entry.ID] {
 			marker = "✅"
 		}
-		fmt.Fprintf(&b, "%s%d. %s\n", marker, i+1, entry.Title)
+		line := fmt.Sprintf("%s%d. %s", marker, i+1, entry.Title)
+		if entry.Left {
+			line += " 👻"
+		}
+		link := ""
+		if fp, ok := foot[entry.ID]; ok {
+			line += fmt.Sprintf(" — %d твоих (посл. %s)", fp.count, humanTime(fp.date))
+			if fp.msg != 0 && entry.AccessHash != 0 {
+				link = fmt.Sprintf("\n     https://t.me/c/%d/%d", entry.ID, fp.msg)
+			}
+		} else if s_opsecScanned(m) {
+			line += " — 0 твоих"
+		}
+		if b.Len()+len(line)+len(link)+1 > listBudget {
+			overflow = len(cache) - i
+			break
+		}
+		b.WriteString(line + link + "\n")
+	}
+	if overflow > 0 {
+		fmt.Fprintf(&b, "\n… и ещё %d диалогов — полная картина в cleaner opsec", overflow)
 	}
 	if len(cache) == 0 {
 		b.WriteString("\nКэш групп пуст. Фоновая синхронизация ещё не закончилась — попробуйте позже.\n")
 	}
 	return strings.TrimSuffix(b.String(), "\n"), nil
+}
+
+func s_opsecScanned(m *module) bool {
+	scanned := false
+	m.peekState(func(s *state) {
+		scanned = s.Opsec != nil && s.Opsec.ScannedAt != 0
+	})
+	return scanned
 }
 
 func (m *module) addGroups(key string) (string, error) {
