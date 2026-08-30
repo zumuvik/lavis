@@ -153,6 +153,7 @@ pub enum ProvisionError {
     CommunityInvalidPeer,
     CommunityJoin,
     CommunityUnavailable,
+    SetGroupPhoto,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -179,6 +180,8 @@ pub trait ProvisionTransport: Send + Sync {
     fn get_app_config<'a>(&'a self) -> ProvisionFuture<'a, FolderCapacity>;
     fn get_forum_group<'a>(&'a self, group: ForumGroup) -> ProvisionFuture<'a, Option<ForumGroup>>;
     fn create_forum_group<'a>(&'a self, title: &'a str) -> ProvisionFuture<'a, ForumGroup>;
+    /// Best-effort companion group avatar from the bundled assets.
+    fn set_forum_group_photo<'a>(&'a self, group: ForumGroup) -> ProvisionFuture<'a, ()>;
     fn get_forum_topic<'a>(
         &'a self,
         group: ForumGroup,
@@ -414,6 +417,13 @@ pub async fn provision(
             .ok_or(ProvisionError::GroupUnavailable)?,
         None => {
             let group = transport.create_forum_group(COMPANION_GROUP_TITLE).await?;
+            if let Err(error) = transport.set_forum_group_photo(group).await {
+                tracing::warn!(
+                    event = "setup_group_photo_failed",
+                    error = ?error,
+                    "Companion group was created without its avatar"
+                );
+            }
             state.identities.companion_chat_id = Some(group.id);
             state.identities.companion_chat_access_hash = group.access_hash;
             state.stages.forum_group_created = true;
@@ -732,6 +742,9 @@ mod tests {
                     access_hash: Some(1),
                 })
             })
+        }
+        fn set_forum_group_photo<'a>(&'a self, _: ForumGroup) -> ProvisionFuture<'a, ()> {
+            Box::pin(async move { Ok(()) })
         }
         fn get_forum_topic<'a>(
             &'a self,

@@ -29,6 +29,7 @@ pub enum ProvisionError {
     CreatedGroupMissing,
     GroupUnavailable,
     GroupChanged,
+    SetGroupPhoto,
     GeneralTopicLookup,
     ForumTopics,
     CreateTopic,
@@ -260,6 +261,39 @@ impl ProvisionTransport for GrammersTransport<'_> {
                 id: identity.id,
                 access_hash: Some(identity.access_hash),
             })
+        })
+    }
+
+    fn set_forum_group_photo<'a>(&'a self, group: ForumGroup) -> ProvisionFuture<'a, ()> {
+        Box::pin(async move {
+            // The companion group avatar ships with the binary (assets/
+            // grouplogo.png, tracked in git and included by the Nix source
+            // filter). A missing or rejected photo must never abort setup,
+            // so every failure path surfaces as SetGroupPhoto for the
+            // best-effort caller.
+            let bytes: &[u8] = include_bytes!("../assets/grouplogo.png");
+            let mut stream = std::io::Cursor::new(bytes.to_vec());
+            let uploaded = self
+                .client
+                .upload_stream(&mut stream, bytes.len(), "lavis-group.png".to_string())
+                .await
+                .map_err(|_| setup_provision::ProvisionError::SetGroupPhoto)?;
+            let file = uploaded.raw;
+            self.client
+                .invoke(&tl::functions::messages::EditChatPhoto {
+                    chat_id: marked_channel_peer(group.id),
+                    photo: tl::enums::InputChatPhoto::InputChatUploadedPhoto(
+                        tl::types::InputChatUploadedPhoto {
+                            file: Some(file),
+                            video: None,
+                            video_start_ts: None,
+                            video_emoji_markup: None,
+                        },
+                    ),
+                })
+                .await
+                .map_err(|_| setup_provision::ProvisionError::SetGroupPhoto)?;
+            Ok(())
         })
     }
 
@@ -577,6 +611,7 @@ fn map_provision_error(error: setup_provision::ProvisionError) -> ProvisionError
         setup_provision::ProvisionError::Storage => ProvisionError::Storage,
         setup_provision::ProvisionError::GroupUnavailable => ProvisionError::GroupUnavailable,
         setup_provision::ProvisionError::GroupChanged => ProvisionError::GroupChanged,
+        setup_provision::ProvisionError::SetGroupPhoto => ProvisionError::SetGroupPhoto,
         setup_provision::ProvisionError::GeneralTopicLookup => ProvisionError::GeneralTopicLookup,
         setup_provision::ProvisionError::FolderCapacity => ProvisionError::FolderCapacity,
         setup_provision::ProvisionError::FolderNameConflict => ProvisionError::FolderNameConflict,
@@ -814,6 +849,13 @@ fn input_channel(identity: InputIdentity) -> tl::enums::InputChannel {
         access_hash: identity.access_hash,
     })
 }
+/// `messages.editChatPhoto` addresses channels by their marked peer id,
+/// while provisioning identities store the raw channel id (the same value
+/// `InputPeerChannel.channel_id` expects).
+fn marked_channel_peer(raw_channel_id: i64) -> i64 {
+    -(1_000_000_000_000 + raw_channel_id)
+}
+
 fn input_peer_channel(identity: InputIdentity) -> tl::enums::InputPeer {
     tl::enums::InputPeer::Channel(tl::types::InputPeerChannel {
         channel_id: identity.id,
@@ -859,9 +901,15 @@ fn minimum_rights() -> tl::types::ChatAdminRights {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn companion_group_photo_targets_marked_channel_peer() {
+        assert_eq!(marked_channel_peer(123), -1_000_000_000_123);
+        assert_eq!(marked_channel_peer(3_542_986_112), -1_003_542_986_112);
+    }
+
     use super::{
         ProvisionError, classify_community_join_error, dialog_peers, input_peer_from_dialog_peer,
-        map_provision_error, tl,
+        map_provision_error, marked_channel_peer, tl,
     };
     use crate::setup_provision::{DialogPeer, ProvisionError as StateError};
 
