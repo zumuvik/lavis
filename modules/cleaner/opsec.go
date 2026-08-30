@@ -254,7 +254,6 @@ func (m *module) runOpsec() {
 	m.peekState(func(s *state) {
 		dialogs = append([]groupEntry(nil), s.Discovered...)
 	})
-	leftIDs := m.leftDialogIDs(ctx)
 
 	var chatsOut []opsecChat
 	probe := 0
@@ -297,7 +296,7 @@ func (m *module) runOpsec() {
 			Count:      count,
 			Newest:     newestDate,
 			NewestMsg:  newestMsg,
-			InDialog:   !leftIDs[d.ID],
+			InDialog:   !d.Left,
 			IDs:        nil,
 		})
 		if probe%25 == 0 {
@@ -342,46 +341,6 @@ func searchFootprint(body []byte) (int, int, int64) {
 		}
 	}
 	return total, newestMsg, newestDate
-}
-
-// leftDialogIDs marks channels the account has left: getDialogs only
-// returns them when the dialog survived the leave, which is exactly the
-// ghost footprint opsec reports.
-func (m *module) leftDialogIDs(ctx context.Context) map[int64]bool {
-	left := make(map[int64]bool)
-	var body []byte
-	err := callWithFloodRetry(ctx, func() error {
-		var callErr error
-		body, callErr = m.call.call(ctx, &tg.MessagesGetDialogsRequest{
-			OffsetDate: 0,
-			OffsetID:   0,
-			OffsetPeer: &tg.InputPeerEmpty{},
-			Limit:      dialogPageLimit,
-			Hash:       0,
-		})
-		return callErr
-	})
-	if err != nil {
-		return left
-	}
-	value, err := tg.DecodeMessagesDialogs(buffer(body))
-	if err != nil {
-		return left
-	}
-	var chatClasses []tg.ChatClass
-	switch d := value.(type) {
-	case *tg.MessagesDialogs:
-		chatClasses = d.GetChats()
-	case *tg.MessagesDialogsSlice:
-		chatClasses = d.GetChats()
-	}
-	for _, chat := range chatClasses {
-		channel, ok := chat.(*tg.Channel)
-		if ok && channel.Left {
-			left[channel.GetID()] = true
-		}
-	}
-	return left
 }
 
 // saveOpsecList persists the current scan result snapshot.

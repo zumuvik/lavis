@@ -233,6 +233,7 @@ func decodeDialogPage(body []byte) ([]groupEntry, int, int, tg.InputPeerClass, b
 			AccessHash: accessHash,
 			Title:      channel.GetTitle(),
 			Forum:      channel.Forum,
+			Left:       channel.Left,
 		})
 	}
 	if len(dialogs) == 0 {

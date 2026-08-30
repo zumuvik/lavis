@@ -16,6 +16,9 @@ type groupEntry struct {
 	AccessHash int64  `json:"access_hash,omitempty"`
 	Title      string `json:"title"`
 	Forum      bool   `json:"forum,omitempty"`
+	// Left marks a channel the account has exited but whose dialog is
+	// still present: exactly the ghost footprint opsec must surface.
+	Left bool `json:"left,omitempty"`
 }
 
 type state struct {
