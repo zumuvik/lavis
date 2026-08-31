@@ -145,6 +145,8 @@ An external Lavis module is a separate executable communicating with the core th
 
 Modules can be written in Rust, Go, Python, or any other suitable language. The current Module API v6 supports capability-gated Telegram operations, message events and a bounded raw MTProto escape hatch.
 
+The repository ships a reference external module, **Cleaner** (`modules/cleaner`): scheduled deferred cleanup of your own messages, per-group management, and an `opsec` scan that surfaces ghost chats still holding your messages — `,cleaner [list|add <n>|remove <n>|status|log|run|opsec [add <n>]]`.
+
 Local module operations:
 
 ```bash

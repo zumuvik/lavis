@@ -280,6 +280,26 @@ Lavis must still enforce these boundaries:
 Per-module fairness/concurrency limits are separate follow-up work; the current
 v6 contract does not claim they already exist.
 
+## Peer and message handles
+
+Invocations receive scoped handles instead of raw chat identifiers.
+
+- The peer handle is issued for the invocation's real `PeerId`. Repeated
+  invocations from the same chat reuse the same peer handle within one process
+  generation; a handle issued for one chat is never observable from an
+  invocation of another chat.
+- The current-message handle carries an editable authority flag: it is
+  editable only when the triggering message was authored by the signed-in
+  user. Handles for other messages (for example the replied-to message) are
+  never editable.
+- A handle release requested while a host call is active is deferred until
+  that host call completes, and the deferred releases are drained then.
+- Host calls are restricted to `message.edit`. A host frame carrying any
+  other method, or a host call beyond the active-call capacity, terminates
+  the process as a fatal protocol or backpressure violation (retained in
+  diagnostics). Over-capacity Telegram RPC calls, in contrast, still receive
+  a soft `capacity` error result.
+
 ## Resource limits
 
 V6 remains a bounded protocol.

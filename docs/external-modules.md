@@ -12,8 +12,9 @@ External modules extend Lavis with commands implemented in any language. Each en
 | v2–v3 | Базовый manifest и JSON Lines: [Module API v2/v3](module-api-v2.md). |
 | v4 | Редактирование сообщений и наборы реакций: [Module API v4](module-api-v4.md). |
 | v5 | Gateway статуса аккаунта: [Module API v5](module-api-v5.md). |
+| v6 | Capability-gated raw MTProto, peer/message handles: [Module API v6](module-api-v6.md). |
 
-V1–V4 сохраняют свои существующие wire-контракты; выбор v5 не изменяет их
+V1–V5 сохраняют свои существующие wire-контракты; выбор v6 не изменяет их
 manifest или сообщения.
 
 ## End-to-end workflow
@@ -250,11 +251,14 @@ Show discovered modules and persistent enabled state.
 ,lm cancel <ApprovalId>
 ,lm enable <id>
 ,lm disable <id>
+,lm logs <id>
+,lm doctor [id]
 ,help lm
 ```
 
 `install`, `confirm`, `cancel`, `enable` and `disable` are state-changing and require a new
-own message in Saved Messages. `lm`, `lm list` and `lm info <id>` are read-only.
+own message in Saved Messages. `lm`, `lm list`, `lm info <id>`, `lm logs <id>` and
+`lm doctor [id]` are read-only.
 
 ## Command and help resolution
 
@@ -288,8 +292,10 @@ Help for a discovered module card is available by module ID even while it is dis
 
 Schema 3 may also receive `message.created` events and return one scoped
 `message.react` action. Schema 4 adds edited-message support; schema 5 adds the
-allowlisted core account-status gateway. See [Module API v5](module-api-v5.md);
-v2–v4 behavior remains unchanged.
+allowlisted core account-status gateway; schema 6 adds capability-gated raw
+MTProto (`telegram.raw`, `raw.invoke`, `contract_revision`) and scoped
+peer/message handles. See [Module API v5](module-api-v5.md) and
+[Module API v6](module-api-v6.md); v2–v5 behavior remains unchanged.
 
 ### Environment
 

@@ -221,7 +221,7 @@ filesystem installation.
 - Keep catalog, enabled state, running handles, and `lm doctor`/`lm list`
   reporting consistent across install/update/uninstall, including the case
   where a catalog directory is removed while a module process is still in
-  memory. The `lm doctor` missing-catalog condition bug was fixed in `93ec590`;
+  memory. The `lm doctor` missing-catalog condition bug was fixed in `ca00c8f`;
   the lifecycle events that drive the same reconciliation still need to be
   implemented.
 - Preserve the previous generation until the replacement has passed manifest

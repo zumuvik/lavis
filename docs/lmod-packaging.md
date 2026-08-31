@@ -40,8 +40,9 @@ Validate before packaging:
 lavis modules validate ./my-module/module.json
 ```
 
-The archive may contain a schema 2, 3, 4, or 5 manifest. Package the selected
-schema unchanged; V5 gateway fields are documented in [Module API v5](module-api-v5.md).
+The archive may contain a schema 2, 3, 4, 5, or 6 manifest. Package the selected
+schema unchanged; V5 gateway fields are documented in [Module API v5](module-api-v5.md),
+and V6 raw-Telegram fields in [Module API v6](module-api-v6.md).
 
 ## Create a compatible archive
 

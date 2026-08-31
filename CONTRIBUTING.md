@@ -6,6 +6,9 @@ Lavis — статически типизированный Telegram userbot н�
 
 - [Module API v1](docs/module-api-v1.md) — встроенный compile-time registry;
 - [Module API v2/v3](docs/module-api-v2.md) — внешние manifests и JSON-line protocol;
+- [Module API v4](docs/module-api-v4.md) — редактирование сообщений и реакции;
+- [Module API v5](docs/module-api-v5.md) — gateway статуса аккаунта;
+- [Module API v6](docs/module-api-v6.md) — capability-gated raw MTProto;
 - [External Modules](docs/external-modules.md) — lifecycle внешних модулей;
 - [Packaging `.lmod`](docs/lmod-packaging.md) — installer package boundary.
 

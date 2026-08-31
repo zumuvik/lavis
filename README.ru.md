@@ -145,6 +145,8 @@ nix run 'git+https://tangled.org/zumuvik.tngl.sh/lavis' -- auth
 
 Модули можно писать на Rust, Go, Python или любом другом подходящем языке. Текущий Module API v6 поддерживает capability-gated Telegram-операции, события сообщений и ограниченный raw MTProto escape hatch.
 
+В репозитории поставляется референсный внешний модуль **Cleaner** (`modules/cleaner`): отложенная очистка собственных сообщений по расписанию, управление группами и `opsec`-скан, который находит «призрачные» чаты, всё ещё хранящие ваши сообщения — `,cleaner [list|add <номер>|remove <номер>|status|log|run|opsec [add <номер>]]`.
+
 Локальные операции с модулями:
 
 ```bash
