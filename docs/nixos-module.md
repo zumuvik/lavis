@@ -170,25 +170,9 @@ This writes:
 $XDG_STATE_HOME/lavis/settings.json
 ```
 
-Set a Fastfetch profile declaratively:
-
-```nix
-services.lavis.fastfetchProfile = {
-  version = 1;
-  logo = "NixOS";
-  structure = [ "title" "os" "kernel" "cpu" "memory" ];
-  separator = " -> ";
-};
-```
-
-This writes:
-
-```text
-$XDG_CONFIG_HOME/lavis/fastfetch.json
-```
-
-The values must match the schema accepted by Lavis at runtime. See the
-Fastfetch section in [README.md](../README.md#fastfetch).
+The `,fastfetch` command runs the system `fastfetch` binary and passes
+user arguments through to it. No Lavis-side profile configuration is
+required.
 
 ## Declarative extensions
 
@@ -261,12 +245,6 @@ declare extensions you trust.
     credentialsEnvironmentFile = "/run/secrets/lavis.env";
 
     settings.prefix = ",";
-
-    fastfetchProfile = {
-      version = 1;
-      logo = "NixOS";
-      structure = [ "title" "os" "kernel" ];
-    };
 
     extensions = [
       {

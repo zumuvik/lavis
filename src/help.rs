@@ -474,14 +474,14 @@ fn fastfetch_primary(
 ) -> String {
     if locale == Locale::English {
         return format!(
-            "{}\n\nUsage: {prefix}{}\nModule: {module_name}\nRisk: {}\n\nExamples:\n{prefix}fastfetch --logo NixOS\n{prefix}fastfetch --logo-padding-right 3\n{prefix}fastfetch --separator \" -> \"\n{prefix}fastfetch --structure OS:Kernel:CPU\n\nLogos: none, Alpine, Arch, Debian, Fedora, FreeBSD, Linux, MacOS, NixOS, OpenBSD, Ubuntu, Windows.\nStructure: title, separator, os, kernel, uptime, cpu, memory, gpu, packages, shell, terminal, terminalsize, host, display, wm, de, theme, icons, font, cursor, disk, swap, localip, battery, poweradapter, locale.\nSeparator: 1–64 printable ASCII characters.\nLogo padding: --logo-padding-left <n>, --logo-padding-right <n>, --logo-padding-top <n>; 0–32.\n\nProfile fields: logo_padding_left, logo_padding_right, logo_padding_top (integers from 0–32).\n\n{prefix}fastfetch --no-profile does not read the profile. Profile: $XDG_CONFIG_HOME/lavis/fastfetch.json or $HOME/.config/lavis/fastfetch.json.\nMinimal JSON: {{ \"version\": 1 }}\nPrecedence: Fastfetch defaults < profile < command options.\nAlias: {prefix}alias add sys fastfetch --logo arch; then {prefix}sys.\n\nQuotes group arguments for shell-words parsing; no shell is run and shell metacharacters remain data. Each process runs only with --config none --pipe; native Fastfetch configurations and presets are prohibited. Output may reveal host, network, display, power, and hardware data.",
+            "{}\n\nUsage: {prefix}{}\nModule: {module_name}\nRisk: {}\n\nExamples:\n{prefix}fastfetch --logo NixOS\n{prefix}fastfetch --structure OS:Kernel:CPU\n{prefix}fastfetch --separator \" -> \"\n\nAny Fastfetch option is passed through to the system binary. Each process runs with --config none --pipe plus your arguments.\n\nAlias: {prefix}alias add sys fastfetch --logo arch; then {prefix}sys.\n\nQuotes group arguments for shell-words parsing; no shell is run and shell metacharacters remain data. Output may reveal host, network, display, power, and hardware data.",
             command_description(command, locale),
             command.usage,
             risk_label(command.risk, locale)
         );
     }
     format!(
-        "{}\n\nИспользование: {prefix}{}\nМодуль: {module_name}\nРиск: {}\n\nПримеры:\n{prefix}fastfetch --logo NixOS\n{prefix}fastfetch --logo-padding-right 3\n{prefix}fastfetch --separator \" -> \"\n{prefix}fastfetch --structure OS:Kernel:CPU\n\nЛоготипы: none, Alpine, Arch, Debian, Fedora, FreeBSD, Linux, MacOS, NixOS, OpenBSD, Ubuntu, Windows.\nСтруктура: title, separator, os, kernel, uptime, cpu, memory, gpu, packages, shell, terminal, terminalsize, host, display, wm, de, theme, icons, font, cursor, disk, swap, localip, battery, poweradapter, locale.\nРазделитель: 1–64 печатных ASCII-символа.\nОтступ логотипа: --logo-padding-left <n>, --logo-padding-right <n>, --logo-padding-top <n>; 0–32.\n\nПоля профиля: logo_padding_left, logo_padding_right, logo_padding_top (0–32, целые числа).\n\n{prefix}fastfetch --no-profile не читает профиль. Профиль: $XDG_CONFIG_HOME/lavis/fastfetch.json или $HOME/.config/lavis/fastfetch.json.\nМинимальный JSON: {{ \"version\": 1 }}\nПриоритет: значения Fastfetch по умолчанию < профиль < параметры команды.\nПсевдоним: {prefix}alias add sys fastfetch --logo arch; затем {prefix}sys.\n\nКавычки группируют аргументы для разбора shell-words; оболочка не запускается, а shell-метасимволы остаются данными. Каждый процесс запускается только с --config none --pipe; нативные конфиги и пресеты Fastfetch запрещены. Вывод может раскрыть данные хоста, сети, дисплея, питания и оборудования.",
+        "{}\n\nИспользование: {prefix}{}\nМодуль: {module_name}\nРиск: {}\n\nПримеры:\n{prefix}fastfetch --logo NixOS\n{prefix}fastfetch --structure OS:Kernel:CPU\n{prefix}fastfetch --separator \" -> \"\n\nЛюбые параметры Fastfetch передаются системному бинарнику. Процесс запускается с --config none --pipe плюс ваши аргументы.\n\nПсевдоним: {prefix}alias add sys fastfetch --logo arch; затем {prefix}sys.\n\nКавычки группируют аргументы для разбора shell-words; оболочка не запускается, а shell-метасимволы остаются данными. Вывод может раскрыть данные хоста, сети, дисплея, питания и оборудования.",
         command_description(command, locale),
         command.usage,
         risk_label(command.risk, locale)
@@ -1203,7 +1203,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn command_cards_use_documentation_entities_and_symbolic_fastfetch_paths() {
+    async fn command_cards_use_documentation_entities_and_shell_words_notes() {
         let response = render(
             &HelpRequest::Topic("fastfetch".to_owned()),
             "🦀",
@@ -1211,16 +1211,11 @@ mod tests {
         )
         .response;
         assert_eq!(response.entities.len(), 2);
-        assert!(
-            response
-                .text
-                .contains("$XDG_CONFIG_HOME/lavis/fastfetch.json")
-        );
-        assert!(response.text.contains("$HOME/.config/lavis/fastfetch.json"));
         assert!(response.text.contains("--config none"));
-        assert!(response.text.contains("🦀fastfetch --no-profile"));
+        assert!(response.text.contains("🦀fastfetch --logo NixOS"));
         assert!(response.text.contains("shell-words"));
         assert!(response.text.contains("shell-метасимволы остаются данными"));
+        assert!(!response.text.contains("fastfetch.json"));
         assert!(!response.text.contains("/tmp/"));
         let grammers_client::tl::enums::MessageEntity::Blockquote(primary) = &response.entities[0]
         else {
@@ -1518,15 +1513,14 @@ mod tests {
         )
         .response;
         assert!(response.text.contains("🦀fastfetch --logo NixOS"));
-        assert!(response.text.contains("🦀fastfetch --logo-padding-right 3"));
-        assert!(response.text.contains("🦀fastfetch --separator \" -> \""));
         assert!(
             response
                 .text
                 .contains("🦀fastfetch --structure OS:Kernel:CPU")
         );
+        assert!(response.text.contains("🦀fastfetch --separator \" -> \""));
         assert!(!response.text.contains("/home/"));
-        assert!(response.text.contains("🦀fastfetch --no-profile"));
+        assert!(!response.text.contains("fastfetch.json"));
     }
 
     #[tokio::test]
@@ -1537,11 +1531,6 @@ mod tests {
             &aliases().await,
         )
         .response;
-        assert!(
-            response
-                .text
-                .contains("$XDG_CONFIG_HOME/lavis/fastfetch.json")
-        );
         assert!(response.text.contains("--config none"));
         assert!(response.text.contains("shell-words"));
         assert!(response.text.contains("shell-метасимволы остаются данными"));

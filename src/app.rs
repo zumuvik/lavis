@@ -429,12 +429,7 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
             mgr.set_self_edit_ledger(self_edit_ledger.clone());
         }
         handle.startup_enabled(external_state.enabled_ids()).await;
-        let mut runtime = runtime::RuntimeState::new(
-            started_at,
-            aliases,
-            settings,
-            config.fastfetch_profile_path.clone(),
-        );
+        let mut runtime = runtime::RuntimeState::new(started_at, aliases, settings);
         runtime.set_self_edit_ledger(self_edit_ledger);
         runtime.set_http_upstream();
         runtime.set_self_identity(self_identity);

@@ -215,15 +215,6 @@
                         user = "lavis-test";
                         credentialsEnvironmentFile = "/build/lavis-test home/secrets/lavis.env";
                         settings.prefix = ".";
-                        fastfetchProfile = {
-                          version = 1;
-                          logo = "NixOS";
-                          structure = [
-                            "title"
-                            "os"
-                            "kernel"
-                          ];
-                        };
                         extensions = [
                           {
                             id = "fixture";

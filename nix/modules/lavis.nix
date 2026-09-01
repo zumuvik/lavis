@@ -65,12 +65,6 @@ let
     id: builtins.match "[a-z][a-z0-9-]{0,31}" id != null
   );
 
-  fastfetchProfileFile =
-    if cfg.fastfetchProfile == null then
-      null
-    else
-      pkgs.writeText "lavis-fastfetch.json" (builtins.toJSON cfg.fastfetchProfile);
-
   extensionModule =
     { ... }:
     {
@@ -223,11 +217,6 @@ except BaseException:
         pass
     raise
 PY
-    ''}
-
-    ${lib.optionalString (fastfetchProfileFile != null) ''
-      install -m 600 \
-        ${lib.escapeShellArg fastfetchProfileFile} ${lib.escapeShellArg "${lavisConfigDir}/fastfetch.json"}
     ''}
 
     install_lavis_extension() {
@@ -446,19 +435,6 @@ in
       default = null;
       description = "Optional declarative command prefix written to Lavis settings.json.";
       example = ",";
-    };
-
-    fastfetchProfile = mkOption {
-      type = types.nullOr types.attrs;
-      default = null;
-      description = "Optional fastfetch profile written to Lavis fastfetch.json.";
-      example = literalExpression ''
-        {
-          version = 1;
-          logo = "NixOS";
-          structure = [ "title" "os" "kernel" ];
-        }
-      '';
     };
 
     extensions = mkOption {

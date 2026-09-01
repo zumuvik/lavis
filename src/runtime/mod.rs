@@ -38,7 +38,7 @@ use crate::{
         manager::{ExternalManagerHandle, ExternalModuleRuntimeStatus, ExternalRuntimeSnapshot},
         state::ExternalStateStore,
     },
-    fastfetch::{self, FastfetchInputError, FastfetchProfileError, FastfetchResult},
+    fastfetch::{self, FastfetchInputError, FastfetchResult},
     help::{
         render_modules_invalid_usage, render_modules_overview_with_external_locale,
         render_with_external_locale,
@@ -110,7 +110,6 @@ pub struct RuntimeState {
     recognized_commands: u64,
     aliases: AliasStore,
     settings: SettingsStore,
-    fastfetch_profile_path: PathBuf,
     self_identity: Option<SelfIdentity>,
     upstream: Option<Box<dyn UpstreamRev>>,
     upstream_revision_cache: UpstreamSnapshot,
@@ -317,18 +316,12 @@ impl From<Response> for RuntimeExecution {
 }
 
 impl RuntimeState {
-    pub fn new(
-        started_at: Instant,
-        aliases: AliasStore,
-        settings: SettingsStore,
-        fastfetch_profile_path: PathBuf,
-    ) -> Self {
+    pub fn new(started_at: Instant, aliases: AliasStore, settings: SettingsStore) -> Self {
         Self {
             started_at,
             recognized_commands: 0,
             aliases,
             settings,
-            fastfetch_profile_path,
             self_identity: None,
             upstream: None,
             upstream_revision_cache: UpstreamSnapshot::Never,
@@ -1094,7 +1087,7 @@ mod tests {
             ArchiveDigest, ArchiveStatistics, InspectionTimes, InspectionWarning,
             ModuleInstallPlan, SourceIdentity, SourceKind,
         },
-        fastfetch::{FastfetchInputError, FastfetchProfileError, FastfetchResult},
+        fastfetch::{FastfetchInputError, FastfetchResult},
         i18n::{
             Locale, PingText, RuntimeText, SensitiveText, ping_text, runtime_text, sensitive_text,
         },
@@ -1281,12 +1274,7 @@ mod tests {
             .await
             .unwrap();
         (
-            super::RuntimeState::new(
-                Instant::now(),
-                aliases,
-                settings,
-                directory.join("fastfetch.json"),
-            ),
+            super::RuntimeState::new(Instant::now(), aliases, settings),
             directory,
         )
     }
@@ -2306,31 +2294,25 @@ mod tests {
         for (locale, invalid, failure) in [
             (
                 Locale::English,
-                "⚠️ Fastfetch input error: invalid --logo value. See !help fastfetch",
+                "⚠️ Fastfetch input error: invalid quoting. See !help fastfetch",
                 "⚠️ Fastfetch timed out. See !help fastfetch",
             ),
             (
                 Locale::Russian,
-                "⚠️ Ошибка ввода Fastfetch: неверное значение --logo. См. !help fastfetch",
+                "⚠️ Ошибка ввода Fastfetch: неверные кавычки. См. !help fastfetch",
                 "⚠️ Fastfetch превысил время ожидания. См. !help fastfetch",
             ),
         ] {
             assert_eq!(
                 fastfetch_response(
-                    FastfetchResult::InvalidArguments(FastfetchInputError::InvalidLogo),
+                    FastfetchResult::InvalidArguments(FastfetchInputError::Tokenization),
                     locale,
                     "!",
-                    std::path::Path::new("/tmp/fastfetch.json"),
                 ),
                 Response::plain(invalid)
             );
             assert_eq!(
-                fastfetch_response(
-                    FastfetchResult::TimedOut,
-                    locale,
-                    "!",
-                    std::path::Path::new("/tmp/fastfetch.json"),
-                ),
+                fastfetch_response(FastfetchResult::TimedOut, locale, "!",),
                 Response::plain(failure)
             );
         }
@@ -2595,7 +2577,6 @@ for line in sys.stdin:
                 },
                 Locale::English,
                 "!",
-                std::path::Path::new("/tmp/fastfetch.json"),
             )
             .text,
             "⚠️ Fastfetch failed (exit code 1). See !help fastfetch"
@@ -2607,24 +2588,17 @@ for line in sys.stdin:
         let (runtime, directory) = runtime_with_alias().await;
         assert_eq!(
             fastfetch_response(
-                FastfetchResult::InvalidArguments(FastfetchInputError::InvalidLogo),
+                FastfetchResult::InvalidArguments(FastfetchInputError::Tokenization),
                 Locale::English,
                 "🦀",
-                std::path::Path::new("/tmp/fastfetch.json"),
             ),
-            Response::plain("⚠️ Fastfetch input error: invalid --logo value. See 🦀help fastfetch")
+            Response::plain("⚠️ Fastfetch input error: invalid quoting. See 🦀help fastfetch")
         );
-        let profile_path = PathBuf::from("/tmp/profile\nfastfetch.json");
-        let response = fastfetch_response(
-            FastfetchResult::ProfileError(FastfetchProfileError::Malformed),
-            Locale::English,
-            "🦀",
-            &profile_path,
+        assert!(
+            fastfetch_response(FastfetchResult::TimedOut, Locale::English, "🦀",)
+                .text
+                .contains("🦀help fastfetch")
         );
-        assert!(response.text.contains("profile is malformed"));
-        assert!(response.text.contains(&format!("{profile_path:?}")));
-        assert!(!response.text.contains("/tmp/profile\nfastfetch.json"));
-        assert!(response.text.contains("🦀help fastfetch"));
         assert_eq!(
             runtime.resolve_alias("mini", "'"),
             Some(Action::Fastfetch("'".to_owned()))

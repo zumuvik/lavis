@@ -272,10 +272,9 @@ impl RuntimeState {
                 rendered.response
             }
             Action::Fastfetch(arguments) => fastfetch_response(
-                fastfetch::run(self.locale(), arguments, &self.fastfetch_profile_path).await,
+                fastfetch::run(self.locale(), arguments).await,
                 self.locale(),
                 &prefix,
-                &self.fastfetch_profile_path,
             ),
             Action::Alias(request) => self.execute_alias(request, &prefix).await,
             Action::Prefix(request) => self.execute_prefix(request).await,

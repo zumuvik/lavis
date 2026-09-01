@@ -191,7 +191,6 @@ pub(super) fn fastfetch_response(
     result: FastfetchResult,
     locale: Locale,
     prefix: &str,
-    profile_path: &std::path::Path,
 ) -> Response {
     match result {
         FastfetchResult::Success(response) => response,
@@ -209,29 +208,9 @@ pub(super) fn fastfetch_response(
         FastfetchResult::UnexpectedStatus => {
             fastfetch_failure(locale, FastfetchText::UnexpectedStatus, prefix)
         }
-        FastfetchResult::InvalidArguments(error) => {
-            fastfetch_failure(locale, fastfetch_input_text(error), prefix)
+        FastfetchResult::InvalidArguments(FastfetchInputError::Tokenization) => {
+            fastfetch_failure(locale, FastfetchText::InputTokenization, prefix)
         }
-        FastfetchResult::ProfileError(error) => Response::plain_with_locale(
-            locale,
-            fastfetch_text(locale, fastfetch_profile_error_text(error))
-                .replace("{path}", &format!("{profile_path:?}"))
-                .replace("{prefix}", prefix),
-        ),
-    }
-}
-
-fn fastfetch_profile_error_text(error: FastfetchProfileError) -> FastfetchText {
-    match error {
-        FastfetchProfileError::NotReadable => FastfetchText::ProfileNotReadable,
-        FastfetchProfileError::Malformed => FastfetchText::ProfileMalformed,
-        FastfetchProfileError::UnsupportedVersion => FastfetchText::ProfileUnsupportedVersion,
-        FastfetchProfileError::TooLarge => FastfetchText::ProfileTooLarge,
-        FastfetchProfileError::UnsafePath => FastfetchText::ProfileUnsafePath,
-        FastfetchProfileError::InvalidLogo => FastfetchText::ProfileInvalidLogo,
-        FastfetchProfileError::InvalidStructure => FastfetchText::ProfileInvalidStructure,
-        FastfetchProfileError::InvalidSeparator => FastfetchText::ProfileInvalidSeparator,
-        FastfetchProfileError::InvalidLogoPadding => FastfetchText::ProfileInvalidLogoPadding,
     }
 }
 
@@ -240,19 +219,6 @@ fn fastfetch_failure(locale: Locale, key: FastfetchText, prefix: &str) -> Respon
         locale,
         fastfetch_text(locale, key).replace("{prefix}", prefix),
     )
-}
-
-fn fastfetch_input_text(error: FastfetchInputError) -> FastfetchText {
-    match error {
-        FastfetchInputError::Tokenization => FastfetchText::InputTokenization,
-        FastfetchInputError::UnsupportedOption => FastfetchText::InputUnsupportedOption,
-        FastfetchInputError::MissingValue => FastfetchText::InputMissingValue,
-        FastfetchInputError::DuplicateOption => FastfetchText::InputDuplicateOption,
-        FastfetchInputError::InvalidLogo => FastfetchText::InputInvalidLogo,
-        FastfetchInputError::InvalidStructure => FastfetchText::InputInvalidStructure,
-        FastfetchInputError::InvalidSeparator => FastfetchText::InputInvalidSeparator,
-        FastfetchInputError::InvalidLogoPadding => FastfetchText::InputInvalidLogoPadding,
-    }
 }
 
 pub(super) async fn telegram_ping(

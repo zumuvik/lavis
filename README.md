@@ -57,7 +57,7 @@ The default prefix is `,`, but it can be changed at runtime.
 | 🐧 **NixOS integration** | Flake, package, dev shell and ready-to-use NixOS module |
 | 🔧 **Prefixes and aliases** | Persistent aliases and configurable command prefix |
 | 🤖 **Companion bot** | Optional BotFather-backed companion/workspace setup |
-| 🖥️ **Fastfetch** | Restricted and validated system information output |
+| 🖥️ **Fastfetch** | Fastfetch passthrough with user arguments |
 | 🌐 **English / Russian UI** | Persistent interface language and onboarding |
 
 ---
@@ -115,7 +115,7 @@ Choose the interface language explicitly if needed:
 | `stats` | Uptime, latency, process and host statistics |
 | `prefix` | Show, set or reset the command prefix |
 | `alias` | Manage persistent command aliases |
-| `fastfetch` | Validated Fastfetch output |
+| `fastfetch` | Runs the system fastfetch with passed arguments |
 | `setup` | Companion bot/workspace setup and repair |
 | `lm` | Install and control external `.lmod` modules |
 | `reboot` | Restart the Lavis process |
@@ -331,7 +331,7 @@ State lives in the XDG directories below and survives updates.
 Lavis keeps mutable data outside the Nix store under XDG paths:
 
 ```text
-$XDG_CONFIG_HOME/lavis/       # credentials, companion token, Fastfetch profile
+$XDG_CONFIG_HOME/lavis/       # credentials, companion token
 $XDG_STATE_HOME/lavis/        # MTProto session, settings, aliases and runtime state
 $XDG_DATA_HOME/lavis/         # installed modules and staging data
 ```

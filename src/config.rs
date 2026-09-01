@@ -13,7 +13,6 @@ pub struct Config {
     pub state_dir: PathBuf,
     pub aliases_path: PathBuf,
     pub settings_path: PathBuf,
-    pub fastfetch_profile_path: PathBuf,
 }
 
 impl fmt::Debug for Config {
@@ -24,7 +23,6 @@ impl fmt::Debug for Config {
             .field("api_hash", &"[REDACTED]")
             .field("default_prefix", &self.default_prefix)
             .field("session_path", &self.session_path)
-            .field("fastfetch_profile_path", &self.fastfetch_profile_path)
             .finish()
     }
 }
@@ -177,7 +175,6 @@ impl Config {
             session_path: paths.session_path,
             aliases_path: state_dir.join("aliases.json"),
             settings_path: state_dir.join("settings.json"),
-            fastfetch_profile_path: paths.config_dir.join("fastfetch.json"),
             state_dir,
         })
     }
@@ -256,10 +253,6 @@ mod tests {
         assert_eq!(config.state_dir, PathBuf::from("/tmp"));
         assert_eq!(config.aliases_path, PathBuf::from("/tmp/aliases.json"));
         assert_eq!(config.settings_path, PathBuf::from("/tmp/settings.json"));
-        assert_eq!(
-            config.fastfetch_profile_path,
-            PathBuf::from("/tmp/lavis-config/fastfetch.json")
-        );
         assert_eq!(config.api_hash, "test-api-hash");
         assert!(!format!("{config:?}").contains("test-api-hash"));
     }
@@ -326,10 +319,6 @@ mod tests {
         assert_eq!(
             config.settings_path,
             PathBuf::from("/tmp/state/lavis/settings.json")
-        );
-        assert_eq!(
-            config.fastfetch_profile_path,
-            PathBuf::from("/tmp/config/lavis/fastfetch.json")
         );
         assert_eq!(
             ConfigPaths::default_with(&home).unwrap().session_path,

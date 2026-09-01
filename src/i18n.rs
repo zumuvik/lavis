@@ -563,22 +563,6 @@ pub enum FastfetchText {
     NonZero,
     UnexpectedStatus,
     InputTokenization,
-    InputUnsupportedOption,
-    InputMissingValue,
-    InputDuplicateOption,
-    InputInvalidLogo,
-    InputInvalidStructure,
-    InputInvalidSeparator,
-    InputInvalidLogoPadding,
-    ProfileNotReadable,
-    ProfileMalformed,
-    ProfileUnsupportedVersion,
-    ProfileTooLarge,
-    ProfileUnsafePath,
-    ProfileInvalidLogo,
-    ProfileInvalidStructure,
-    ProfileInvalidSeparator,
-    ProfileInvalidLogoPadding,
 }
 
 pub fn fastfetch_text(locale: Locale, key: FastfetchText) -> &'static str {
@@ -618,102 +602,6 @@ pub fn fastfetch_text(locale: Locale, key: FastfetchText) -> &'static str {
         }
         (Locale::Russian, FastfetchText::InputTokenization) => {
             "⚠️ Ошибка ввода Fastfetch: неверные кавычки. См. {prefix}help fastfetch"
-        }
-        (Locale::English, FastfetchText::InputUnsupportedOption) => {
-            "⚠️ Fastfetch input error: unsupported option. See {prefix}help fastfetch"
-        }
-        (Locale::Russian, FastfetchText::InputUnsupportedOption) => {
-            "⚠️ Ошибка ввода Fastfetch: неподдерживаемый параметр. См. {prefix}help fastfetch"
-        }
-        (Locale::English, FastfetchText::InputMissingValue) => {
-            "⚠️ Fastfetch input error: option value is missing. See {prefix}help fastfetch"
-        }
-        (Locale::Russian, FastfetchText::InputMissingValue) => {
-            "⚠️ Ошибка ввода Fastfetch: отсутствует значение параметра. См. {prefix}help fastfetch"
-        }
-        (Locale::English, FastfetchText::InputDuplicateOption) => {
-            "⚠️ Fastfetch input error: option is repeated. See {prefix}help fastfetch"
-        }
-        (Locale::Russian, FastfetchText::InputDuplicateOption) => {
-            "⚠️ Ошибка ввода Fastfetch: параметр повторяется. См. {prefix}help fastfetch"
-        }
-        (Locale::English, FastfetchText::InputInvalidLogo) => {
-            "⚠️ Fastfetch input error: invalid --logo value. See {prefix}help fastfetch"
-        }
-        (Locale::Russian, FastfetchText::InputInvalidLogo) => {
-            "⚠️ Ошибка ввода Fastfetch: неверное значение --logo. См. {prefix}help fastfetch"
-        }
-        (Locale::English, FastfetchText::InputInvalidStructure) => {
-            "⚠️ Fastfetch input error: invalid --structure value. See {prefix}help fastfetch"
-        }
-        (Locale::Russian, FastfetchText::InputInvalidStructure) => {
-            "⚠️ Ошибка ввода Fastfetch: неверное значение --structure. См. {prefix}help fastfetch"
-        }
-        (Locale::English, FastfetchText::InputInvalidSeparator) => {
-            "⚠️ Fastfetch input error: invalid --separator value. See {prefix}help fastfetch"
-        }
-        (Locale::Russian, FastfetchText::InputInvalidSeparator) => {
-            "⚠️ Ошибка ввода Fastfetch: неверное значение --separator. См. {prefix}help fastfetch"
-        }
-        (Locale::English, FastfetchText::InputInvalidLogoPadding) => {
-            "⚠️ Fastfetch input error: invalid --logo-padding value. See {prefix}help fastfetch"
-        }
-        (Locale::Russian, FastfetchText::InputInvalidLogoPadding) => {
-            "⚠️ Ошибка ввода Fastfetch: неверное значение --logo-padding. См. {prefix}help fastfetch"
-        }
-        (Locale::English, FastfetchText::ProfileNotReadable) => {
-            "⚠️ Fastfetch profile cannot be read at {path}. See {prefix}help fastfetch"
-        }
-        (Locale::Russian, FastfetchText::ProfileNotReadable) => {
-            "⚠️ Не удалось прочитать профиль Fastfetch в {path}. См. {prefix}help fastfetch"
-        }
-        (Locale::English, FastfetchText::ProfileMalformed) => {
-            "⚠️ Fastfetch profile is malformed at {path}. See {prefix}help fastfetch"
-        }
-        (Locale::Russian, FastfetchText::ProfileMalformed) => {
-            "⚠️ Профиль Fastfetch содержит ошибку в {path}. См. {prefix}help fastfetch"
-        }
-        (Locale::English, FastfetchText::ProfileUnsupportedVersion) => {
-            "⚠️ Fastfetch profile version is unsupported at {path}. See {prefix}help fastfetch"
-        }
-        (Locale::Russian, FastfetchText::ProfileUnsupportedVersion) => {
-            "⚠️ Версия профиля Fastfetch не поддерживается в {path}. См. {prefix}help fastfetch"
-        }
-        (Locale::English, FastfetchText::ProfileTooLarge) => {
-            "⚠️ Fastfetch profile is too large at {path}. See {prefix}help fastfetch"
-        }
-        (Locale::Russian, FastfetchText::ProfileTooLarge) => {
-            "⚠️ Профиль Fastfetch слишком большой в {path}. См. {prefix}help fastfetch"
-        }
-        (Locale::English, FastfetchText::ProfileUnsafePath) => {
-            "⚠️ Fastfetch profile path is unsafe: {path}. See {prefix}help fastfetch"
-        }
-        (Locale::Russian, FastfetchText::ProfileUnsafePath) => {
-            "⚠️ Небезопасный путь профиля Fastfetch: {path}. См. {prefix}help fastfetch"
-        }
-        (Locale::English, FastfetchText::ProfileInvalidLogo) => {
-            "⚠️ Fastfetch profile has an invalid logo at {path}. See {prefix}help fastfetch"
-        }
-        (Locale::Russian, FastfetchText::ProfileInvalidLogo) => {
-            "⚠️ Профиль Fastfetch содержит неверный логотип в {path}. См. {prefix}help fastfetch"
-        }
-        (Locale::English, FastfetchText::ProfileInvalidStructure) => {
-            "⚠️ Fastfetch profile has an invalid structure at {path}. See {prefix}help fastfetch"
-        }
-        (Locale::Russian, FastfetchText::ProfileInvalidStructure) => {
-            "⚠️ Профиль Fastfetch содержит неверную структуру в {path}. См. {prefix}help fastfetch"
-        }
-        (Locale::English, FastfetchText::ProfileInvalidSeparator) => {
-            "⚠️ Fastfetch profile has an invalid separator at {path}. See {prefix}help fastfetch"
-        }
-        (Locale::Russian, FastfetchText::ProfileInvalidSeparator) => {
-            "⚠️ Профиль Fastfetch содержит неверный разделитель в {path}. См. {prefix}help fastfetch"
-        }
-        (Locale::English, FastfetchText::ProfileInvalidLogoPadding) => {
-            "⚠️ Fastfetch profile has invalid logo padding at {path}. See {prefix}help fastfetch"
-        }
-        (Locale::Russian, FastfetchText::ProfileInvalidLogoPadding) => {
-            "⚠️ Профиль Fastfetch содержит неверный отступ логотипа в {path}. См. {prefix}help fastfetch"
         }
     }
 }

@@ -173,11 +173,11 @@ const COMMAND_SPECS: [CommandDefinition; 13] = [
     CommandDefinition {
         kind: CommandKind::Fastfetch,
         name: "fastfetch",
-        usage: "fastfetch [--no-profile] [--logo <...>] [--structure <...>] [--separator <text>] [--logo-padding-left <n>] [--logo-padding-right <n>] [--logo-padding-top <n>]",
+        usage: "fastfetch [arguments...]",
         examples: &[
             "fastfetch",
             "fastfetch --logo arch",
-            "fastfetch --no-profile",
+            "fastfetch --structure OS:Kernel:CPU",
         ],
         risk: CommandRisk::RestrictedProcess,
         icon: "🖥",
@@ -294,10 +294,10 @@ pub fn command_description(kind: CommandKind, locale: Locale) -> &'static str {
             "Показывает владельца, версию, текущий коммит, статус основной ветки, активный префикс, количество модулей, хост и ОС."
         }
         (CommandKind::Fastfetch, Locale::English) => {
-            "Runs Fastfetch only with restricted safe display options."
+            "Runs the system Fastfetch binary with the given arguments."
         }
         (CommandKind::Fastfetch, Locale::Russian) => {
-            "Запускает Fastfetch только с ограниченными безопасными параметрами отображения."
+            "Запускает системный Fastfetch с указанными аргументами."
         }
         (CommandKind::Alias, Locale::English) => {
             "Creates, shows, and deletes persistent aliases for canonical commands."

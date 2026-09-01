@@ -57,7 +57,7 @@ Lavis — персональный Telegram userbot, написанный на R
 | 🐧 **NixOS integration** | Flake, пакет, dev shell и готовый NixOS-модуль |
 | 🔧 **Префиксы и алиасы** | Сохраняемые алиасы и настраиваемый префикс |
 | 🤖 **Companion bot** | Опциональная настройка companion-бота и рабочего пространства через BotFather |
-| 🖥️ **Fastfetch** | Ограниченный и проверяемый вывод информации о системе |
+| 🖥️ **Fastfetch** | Прозрачный запуск системного fastfetch с аргументами пользователя |
 | 🌐 **Русский / English UI** | Сохраняемый язык интерфейса и onboarding |
 
 ---
@@ -115,7 +115,7 @@ nix run 'git+https://tangled.org/zumuvik.tngl.sh/lavis' -- auth
 | `stats` | Uptime, latency, процесс и информация о хосте |
 | `prefix` | Показать, установить или сбросить префикс |
 | `alias` | Управление сохраняемыми алиасами |
-| `fastfetch` | Проверяемый вывод Fastfetch |
+| `fastfetch` | Запуск системного fastfetch с переданными аргументами |
 | `setup` | Настройка и восстановление companion-бота/workspace |
 | `lm` | Установка и управление внешними `.lmod`-модулями |
 | `reboot` | Перезапуск процесса Lavis |
@@ -330,7 +330,7 @@ loginctl enable-linger "$USER"
 Lavis хранит изменяемые данные вне Nix store в XDG-каталогах:
 
 ```text
-$XDG_CONFIG_HOME/lavis/       # credentials, companion token, Fastfetch profile
+$XDG_CONFIG_HOME/lavis/       # credentials, companion token
 $XDG_STATE_HOME/lavis/        # MTProto session, settings, aliases и runtime state
 $XDG_DATA_HOME/lavis/         # установленные модули и staging data
 ```
