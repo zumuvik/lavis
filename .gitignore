@@ -21,8 +21,8 @@
 *.db-journal
 /modules/cleaner/bin/
 
-# Build artifacts of bundled modules (regenerated per release)
-modules/**/*.lmod
+# Intermediate build dirs of bundled modules
+# (packed .lmod artifacts are committed, like gaf's dist/)
 modules/**/.lmod-pkg/
 
 __pycache__/
