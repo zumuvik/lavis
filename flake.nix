@@ -133,7 +133,7 @@
           };
           zaiExtension = pkgs.stdenvNoCC.mkDerivation {
             pname = "lavis-extension-zai";
-            version = "0.1.0";
+            version = "0.2.0";
             src = ./modules/zai;
             nativeBuildInputs = [ pkgs.go ];
             buildPhase = ''

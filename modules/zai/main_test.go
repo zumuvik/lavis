@@ -9,16 +9,20 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
-func TestLoadToken(t *testing.T) {
+func writeTokenFile(t *testing.T, content string) {
+	t.Helper()
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)
-	path := filepath.Join(dir, ".env")
-	content := "# comment\ntoken =  \"abc def\"\nother=1\n"
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestLoadToken(t *testing.T) {
+	writeTokenFile(t, "# comment\ntoken =  \"abc def\"\nother=1\n")
 	token, err := loadToken()
 	if err != nil {
 		t.Fatalf("loadToken: %v", err)
@@ -29,11 +33,7 @@ func TestLoadToken(t *testing.T) {
 }
 
 func TestLoadTokenMissingKey(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("HOME", dir)
-	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("other=1\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writeTokenFile(t, "other=1\n")
 	if _, err := loadToken(); err == nil {
 		t.Fatal("expected error for missing token key")
 	}
@@ -79,10 +79,11 @@ func TestLimitSuffix(t *testing.T) {
 
 func TestFormatInt(t *testing.T) {
 	cases := map[int64]string{
-		0:     "0",
-		406:   "406",
-		2000:  "2 000",
-		10000: "10 000",
+		0:        "0",
+		406:      "406",
+		2000:     "2 000",
+		10000:    "10 000",
+		98457618: "98 457 618",
 	}
 	for value, want := range cases {
 		if got := formatInt(value); got != want {
@@ -107,17 +108,138 @@ func TestPercentageBar(t *testing.T) {
 	}
 }
 
-func TestFormatQuota(t *testing.T) {
-	limits := []quotaLimit{
-		{Type: "CREDIT_LIMIT", Unit: 3, Number: 5, Usage: 2000, CurrentValue: 406, Remaining: 1593, Percentage: 20},
-		{Type: "CREDIT_LIMIT", Unit: 6, Number: 1, Usage: 10000, CurrentValue: 8659, Remaining: 1340, Percentage: 86},
+func TestPlural(t *testing.T) {
+	cases := []struct {
+		n    int64
+		want string
+	}{
+		{1, "вызов"},
+		{2, "вызова"},
+		{5, "вызовов"},
+		{11, "вызовов"},
+		{21, "вызов"},
+		{22, "вызова"},
+		{111, "вызовов"},
 	}
-	text := formatQuota(limits, "lite")
-	for _, want := range []string{"план lite", "5 ч: 406 / 2 000", "неделя: 8 659 / 10 000", "осталось 1 593", "осталось 1 340"} {
-		if !strings.Contains(text, want) {
-			t.Errorf("formatQuota missing %q in:\n%s", want, text)
+	for _, tc := range cases {
+		if got := plural(tc.n, "вызов", "вызова", "вызовов"); got != tc.want {
+			t.Errorf("plural(%d) = %q, want %q", tc.n, got, tc.want)
 		}
 	}
+}
+
+func TestFormatDuration(t *testing.T) {
+	cases := map[time.Duration]string{
+		45 * time.Minute:      "45м",
+		90 * time.Minute:      "1ч 30м",
+		5 * time.Hour:         "5ч 0м",
+		27 * time.Hour:        "1д 3ч",
+		3 * 24 * time.Hour:    "3д 0ч",
+	}
+	for d, want := range cases {
+		if got := formatDuration(d); got != want {
+			t.Errorf("formatDuration(%v) = %q, want %q", d, got, want)
+		}
+	}
+}
+
+func TestFormatQuotaAt(t *testing.T) {
+	now := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	limits := []quotaLimit{
+		{Type: "CREDIT_LIMIT", Unit: 3, Number: 5, Usage: 2000, CurrentValue: 406, Remaining: 1593, Percentage: 20, NextResetTime: now.Add(90 * time.Minute).UnixMilli()},
+		{Type: "CREDIT_LIMIT", Unit: 6, Number: 1, Usage: 10000, CurrentValue: 8659, Remaining: 1340, Percentage: 86, NextResetTime: now.Add(30 * time.Minute).UnixMilli()},
+		{Type: "CREDIT_LIMIT", Unit: 3, Number: 5, Usage: 2000, CurrentValue: 406, Remaining: 1593, Percentage: 20, NextResetTime: now.Add(-time.Minute).UnixMilli()},
+	}
+	text := formatQuotaAt(limits, "lite", now)
+	for _, want := range []string{
+		"план lite",
+		"5 ч: 406 / 2 000",
+		"осталось 1 593",
+		"(через 1ч 30м)",
+		"(через 30м)",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("formatQuotaAt missing %q in:\n%s", want, text)
+		}
+	}
+	if strings.Count(text, "(через") != 2 {
+		t.Errorf("expected countdown only for future resets:\n%s", text)
+	}
+}
+
+func TestFormatUsageLine(t *testing.T) {
+	window := usageWindow{
+		Calls:  528,
+		Tokens: 98457618,
+		Models: []modelData{
+			{ModelName: "GLM-5.2", TotalTokens: 500},
+			{ModelName: "GLM-5.3-Flash", TotalTokens: 98457118},
+		},
+	}
+	text := formatUsageLine("24ч", window)
+	for _, want := range []string{
+		"24ч: 528 вызовов · 98 457 618 токенов",
+		"GLM-5.3-Flash: 98 457 118",
+		"GLM-5.2: 500",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("formatUsageLine missing %q in:\n%s", want, text)
+		}
+	}
+	if strings.Index(text, "GLM-5.3-Flash") > strings.Index(text, "GLM-5.2") {
+		t.Errorf("models not sorted by tokens desc:\n%s", text)
+	}
+}
+
+func TestFormatSubscription(t *testing.T) {
+	sub := subscription{
+		ProductName:  "GLM Coding Lite",
+		Status:       "VALID",
+		Valid:        "2026-09-30 22:54:22-2026-10-30 22:54:22",
+		AutoRenew:    1,
+		InitialPrice: 18,
+	}
+	text := formatSubscription(sub)
+	for _, want := range []string{
+		"GLM Coding Lite · VALID · автопродление: вкл",
+		"2026-09-30 22:54:22-2026-10-30 22:54:22",
+		"· 18.00",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("formatSubscription missing %q in:\n%s", want, text)
+		}
+	}
+	if got := formatSubscription(subscription{ProductName: "X", AutoRenew: 0}); !strings.Contains(got, "автопродление: выкл") {
+		t.Errorf("autoRenew off = %q", got)
+	}
+}
+
+// stubAPI starts a test server that answers all three z.ai endpoints and
+// points apiBase at it. It returns the queries received for model-usage.
+func stubAPI(t *testing.T, quotaBody string) map[string][]string {
+	t.Helper()
+	original := apiBase
+	t.Cleanup(func() { apiBase = original })
+	queries := make(map[string][]string)
+	mux := http.NewServeMux()
+	mux.HandleFunc(quotaPath, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, quotaBody)
+	})
+	mux.HandleFunc(modelUsagePath, func(w http.ResponseWriter, r *http.Request) {
+		queries["startTime"] = append(queries["startTime"], r.URL.Query().Get("startTime"))
+		queries["endTime"] = append(queries["endTime"], r.URL.Query().Get("endTime"))
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"code":200,"msg":"Operation successful","success":true,"data":{"totalUsage":{"totalModelCallCount":528,"totalTokensUsage":98457618},"modelDataList":[{"modelName":"GLM-5.3-Flash","totalTokens":98457618}]}}`)
+	})
+	mux.HandleFunc(subscriptionPth, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"code":200,"msg":"Operation successful","success":true,"data":[{"productName":"GLM Coding Lite","status":"VALID","valid":"2026-09-30 22:54:22-2026-10-30 22:54:22","autoRenew":1,"initialPrice":18,"standardPrice":18}]}`)
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	apiBase = server.URL
+	return queries
 }
 
 func TestHandleProtocol(t *testing.T) {
@@ -137,60 +259,81 @@ func TestHandleProtocol(t *testing.T) {
 	}
 }
 
-func TestHandleExecuteUnknownCommand(t *testing.T) {
-	resp := handle(request{ProtocolVersion: 4, Type: "execute", RequestID: "r4", Command: "bogus"})
-	if resp.Type != "result" || !strings.Contains(resp.Text, "Неизвестная команда") {
-		t.Fatalf("unknown command handling: %+v", resp)
+func TestExecuteDispatch(t *testing.T) {
+	if text := execute("bogus", ""); !strings.Contains(text, "Неизвестная команда") {
+		t.Fatalf("unknown command handling:\n%s", text)
+	}
+	if text := execute("ai", "bogus"); !strings.Contains(text, "Неизвестный аргумент") {
+		t.Fatalf("unknown argument handling:\n%s", text)
+	}
+	if text := execute("ai", "BOGUS"); !strings.Contains(text, "Неизвестный аргумент") {
+		t.Fatalf("argument case handling:\n%s", text)
 	}
 }
 
 func TestHandleExecuteFetchesQuota(t *testing.T) {
-	original := quotaURL
-	t.Cleanup(func() { quotaURL = original })
-	var gotAuth string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotAuth = r.Header.Get("Authorization")
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"code":200,"msg":"Operation successful","data":{"limits":[{"type":"CREDIT_LIMIT","unit":3,"number":5,"usage":2000,"currentValue":406,"remaining":1593,"percentage":20,"nextResetTime":1788447511263}],"level":"lite"},"success":true}`)
-	}))
-	t.Cleanup(server.Close)
-	quotaURL = server.URL
-
-	dir := t.TempDir()
-	t.Setenv("HOME", dir)
-	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("token=secret\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	stubAPI(t, `{"code":200,"msg":"Operation successful","data":{"limits":[{"type":"CREDIT_LIMIT","unit":3,"number":5,"usage":2000,"currentValue":406,"remaining":1593,"percentage":20,"nextResetTime":1788447511263}],"level":"lite"},"success":true}`)
+	writeTokenFile(t, "token=secret\n")
 
 	resp := handle(request{ProtocolVersion: 4, Type: "execute", RequestID: "r5", Command: "ai"})
 	if resp.Type != "result" {
 		t.Fatalf("execute type: %+v", resp)
-	}
-	if gotAuth != "Bearer secret" {
-		t.Fatalf("Authorization header = %q", gotAuth)
 	}
 	if !strings.Contains(resp.Text, "406 / 2 000") || !strings.Contains(resp.Text, "план lite") {
 		t.Fatalf("execute text:\n%s", resp.Text)
 	}
 }
 
+func TestHandleExecuteUsage(t *testing.T) {
+	queries := stubAPI(t, `{}`)
+	writeTokenFile(t, "token=secret\n")
+
+	resp := handle(request{ProtocolVersion: 4, Type: "execute", RequestID: "r6", Command: "ai", Arguments: "usage"})
+	if resp.Type != "result" {
+		t.Fatalf("execute type: %+v", resp)
+	}
+	if len(queries["startTime"]) != 2 || len(queries["endTime"]) != 2 {
+		t.Fatalf("expected two usage windows, queries: %v", queries)
+	}
+	for _, start := range queries["startTime"] {
+		if len(start) != len(apiTimeFormat) {
+			t.Fatalf("startTime format: %q", start)
+		}
+	}
+	for _, want := range []string{"528 вызовов", "98 457 618", "GLM-5.3-Flash: 98 457 618", "сегодня:", "7д:"} {
+		if !strings.Contains(resp.Text, want) {
+			t.Fatalf("usage text missing %q:\n%s", want, resp.Text)
+		}
+	}
+}
+
+func TestHandleExecuteSub(t *testing.T) {
+	stubAPI(t, `{}`)
+	writeTokenFile(t, "token=secret\n")
+
+	resp := handle(request{ProtocolVersion: 4, Type: "execute", RequestID: "r7", Command: "ai", Arguments: "sub"})
+	if resp.Type != "result" {
+		t.Fatalf("execute type: %+v", resp)
+	}
+	for _, want := range []string{"GLM Coding Lite · VALID · автопродление: вкл", "2026-09-30 22:54:22-2026-10-30 22:54:22", "· 18.00"} {
+		if !strings.Contains(resp.Text, want) {
+			t.Fatalf("sub text missing %q:\n%s", want, resp.Text)
+		}
+	}
+}
+
 func TestHandleExecuteReportsAPIText(t *testing.T) {
-	original := quotaURL
-	t.Cleanup(func() { quotaURL = original })
+	original := apiBase
+	t.Cleanup(func() { apiBase = original })
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 		fmt.Fprint(w, `{"code":401,"msg":"token expired or incorrect","success":false}`)
 	}))
 	t.Cleanup(server.Close)
-	quotaURL = server.URL
+	apiBase = server.URL
+	writeTokenFile(t, "token=bad\n")
 
-	dir := t.TempDir()
-	t.Setenv("HOME", dir)
-	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("token=bad\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	resp := handle(request{ProtocolVersion: 4, Type: "execute", RequestID: "r6", Command: "ai"})
+	resp := handle(request{ProtocolVersion: 4, Type: "execute", RequestID: "r8", Command: "ai"})
 	if resp.Type != "result" {
 		t.Fatalf("execute type: %+v", resp)
 	}

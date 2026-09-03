@@ -7,11 +7,13 @@ z.ai coding-plan quota. It is not compiled into Lavis and is distributed as
 ## Telegram commands
 
 - `,z.ai` — quota report (module `z`, command `ai`);
-- `,z` — the same report via the module default command.
+- `,z` — the same report via the module default command;
+- `,z.ai usage` — model call and token statistics for the last 24 hours and 7 days;
+- `,z.ai sub` — subscription list with status, renewal and validity.
 
-The report shows every returned usage window (typically the 5-hour window and
-the weekly window): used amount, total limit, percentage with a bar, remaining
-amount, and the next reset time in local time.
+The quota report shows every returned usage window (typically the 5-hour
+window and the weekly window): used amount, total limit, percentage with a
+bar, remaining amount, and the next reset time in local time with a countdown.
 
 ## Token
 
