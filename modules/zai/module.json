@@ -1,0 +1,21 @@
+{
+  "schema_version": 4,
+  "id": "z",
+  "name": "Z.AI Quota",
+  "version": "0.1.0",
+  "author": "zumuvik",
+  "entrypoint": "zai",
+  "capabilities": [],
+  "default_command": "ai",
+  "subscriptions": [],
+  "actions": [],
+  "commands": [
+    {
+      "name": "ai",
+      "summary_ru": "Остаток квоты подписки Z.AI",
+      "description_ru": "Показывает использование и остаток квоты подписки Z.AI Coding Plan: лимиты окон (5-часовое и недельное), проценты и время следующего сброса.",
+      "usage": "[без аргументов]",
+      "examples": []
+    }
+  ]
+}

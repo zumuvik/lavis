@@ -131,6 +131,32 @@
               platforms = pkgs.lib.platforms.linux;
             };
           };
+          zaiExtension = pkgs.stdenvNoCC.mkDerivation {
+            pname = "lavis-extension-zai";
+            version = "0.1.0";
+            src = ./modules/zai;
+            nativeBuildInputs = [ pkgs.go ];
+            buildPhase = ''
+              runHook preBuild
+              export GOCACHE="$TMPDIR/go-cache"
+              export CGO_ENABLED=0
+              export GOOS=linux
+              export GOARCH=${goArch}
+              go build -trimpath -buildvcs=false -ldflags='-s -w -buildid=' -o zai .
+              runHook postBuild
+            '';
+            installPhase = ''
+              runHook preInstall
+              install -Dm700 zai "$out/zai"
+              install -Dm600 module.json "$out/module.json"
+              runHook postInstall
+            '';
+            meta = {
+              description = "Z.AI quota external module for Lavis";
+              license = pkgs.lib.licenses.gpl3Only;
+              platforms = pkgs.lib.platforms.linux;
+            };
+          };
           moduleEvalCheck =
             let
               fixtureExtension = pkgs.runCommand "lavis-extension-fixture" { } ''
@@ -415,6 +441,7 @@ PY
           packages = {
             default = package;
             lavis-extension-gaf = gafExtension;
+            lavis-extension-zai = zaiExtension;
           };
           # Separate wrapper for `nix run` so it reports "Host: nix run" without
           # affecting the base package used by NixOS module or systemPackages.
