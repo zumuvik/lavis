@@ -2407,7 +2407,7 @@ mod tests {
             "protocol"
         );
         assert_eq!(
-            external_event_error_category(&crate::error::ExternalError::ModuleError),
+            external_event_error_category(&crate::error::ExternalError::ModuleError(String::new())),
             "module_error"
         );
         assert_eq!(

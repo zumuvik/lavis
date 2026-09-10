@@ -876,10 +876,10 @@ pub fn external_command_text(
             "⚠️ Модуль «{id}» прислал ответ с неверным идентификатором запроса."
         }
         (Locale::English, ExternalCommandText::ModuleError) => {
-            "⚠️ Module «{id}» reported an execution error."
+            "⚠️ Module «{id}» reported an execution error: {detail}"
         }
         (Locale::Russian, ExternalCommandText::ModuleError) => {
-            "⚠️ Модуль «{id}» сообщил об ошибке выполнения."
+            "⚠️ Модуль «{id}» сообщил об ошибке выполнения: {detail}"
         }
         (Locale::English, ExternalCommandText::ResultTooLarge) => {
             "⚠️ Module «{id}» returned a result that is too large."
@@ -1557,8 +1557,8 @@ mod tests {
             ),
             (
                 ExternalCommandText::ModuleError,
-                "⚠️ Module «fixture» reported an execution error.",
-                "⚠️ Модуль «fixture» сообщил об ошибке выполнения.",
+                "⚠️ Module «fixture» reported an execution error: third-party output",
+                "⚠️ Модуль «fixture» сообщил об ошибке выполнения: third-party output",
             ),
             (
                 ExternalCommandText::ResultTooLarge,

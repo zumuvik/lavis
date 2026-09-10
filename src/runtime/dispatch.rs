@@ -148,7 +148,7 @@ pub(crate) fn external_event_error_category(error: &ExternalError) -> &'static s
         | ExternalError::WrongRequestId
         | ExternalError::WrongModuleId => "protocol",
         ExternalError::ResultTooLarge => "result_too_large",
-        ExternalError::ModuleError => "module_error",
+        ExternalError::ModuleError(_) => "module_error",
         _ => "other",
     }
 }

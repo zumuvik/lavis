@@ -412,8 +412,8 @@ pub enum ExternalError {
     ShutdownTimeout,
     #[error("module result is too large")]
     ResultTooLarge,
-    #[error("module reported an error")]
-    ModuleError,
+    #[error("module reported an error: {0}")]
+    ModuleError(String),
     #[error("module is unavailable or crashed")]
     Unavailable,
     #[error("module IPC queue is full")]

@@ -762,7 +762,10 @@ impl ExternalManagerHandle {
                     .await
                 {
                     Ok(super::protocol::V6InboundFrame::Result { text, .. }) => Ok(text),
-                    Ok(_) => Err(ExternalError::ModuleError),
+                    Ok(super::protocol::V6InboundFrame::Error { message, .. }) => {
+                        Err(ExternalError::ModuleError(message))
+                    }
+                    Ok(_) => Err(ExternalError::ModuleError(String::new())),
                     Err(error) => Err(error),
                 };
                 process.release_handle(&message_handle);

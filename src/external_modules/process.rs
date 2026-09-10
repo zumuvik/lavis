@@ -321,11 +321,17 @@ impl ModuleProcess {
                     self.clear_request_state();
                     return Ok(());
                 }
-                ModuleMessage::Error { request_id, .. } => {
+                ModuleMessage::Error {
+                    request_id,
+                    message,
+                    ..
+                } => {
                     if request_id != req_id {
                         return Err(self.fail_and_terminate(ExternalError::WrongRequestId).await);
                     }
-                    return Err(self.fail_and_terminate(ExternalError::ModuleError).await);
+                    return Err(self
+                        .fail_and_terminate(ExternalError::ModuleError(message))
+                        .await);
                 }
                 _ => return Err(self.fail_and_terminate(ExternalError::ProtocolDecode).await),
             }
@@ -377,8 +383,8 @@ impl ModuleProcess {
             }
             ModuleMessage::Error {
                 request_id,
-                code: _,
-                message: _,
+                message,
+                ..
             } => {
                 if request_id != req_id {
                     return Err(self.fail_and_terminate(ExternalError::WrongRequestId).await);
@@ -388,7 +394,7 @@ impl ModuleProcess {
                 // state and leave the process Running so it can serve the next
                 // request. No `external_module_crashed` is emitted.
                 self.clear_request_state();
-                Err(ExternalError::ModuleError)
+                Err(ExternalError::ModuleError(message))
             }
             _ => Err(self.fail_and_terminate(ExternalError::ProtocolDecode).await),
         }
@@ -2079,7 +2085,7 @@ for line in sys.stdin:
         let (desc, dir) = create_fixture_module(V2_EXECUTE_ERROR_MODULE_PY, "v2-exec-error");
         let mut proc = ModuleProcess::start(desc).await.unwrap();
         let result = proc.execute("run", "").await;
-        assert!(matches!(result, Err(ExternalError::ModuleError)));
+        assert!(matches!(result, Err(ExternalError::ModuleError(_))));
         assert_eq!(proc.status(), ProcessStatus::Running);
         assert_eq!(proc.crash_events.load(Ordering::Relaxed), 0);
         assert!(proc.last_crash_diagnostics.lock().unwrap().is_none());
@@ -2126,7 +2132,7 @@ for line in sys.stdin:
         let mut proc = ModuleProcess::start(desc).await.unwrap();
 
         let first = proc.execute("run", "").await;
-        assert!(matches!(first, Err(ExternalError::ModuleError)));
+        assert!(matches!(first, Err(ExternalError::ModuleError(_))));
         assert_eq!(proc.status(), ProcessStatus::Running);
         assert_eq!(proc.crash_events.load(Ordering::Relaxed), 0);
         assert!(proc.last_crash_diagnostics.lock().unwrap().is_none());
@@ -2381,7 +2387,7 @@ for line in sys.stdin:
         let (desc, dir) = create_fixture_module(LIFECYCLE_FAILURE_MODULE_PY, "lifecycle");
         let mut proc = ModuleProcess::start(desc).await.unwrap();
         let result = proc.handshake().await;
-        assert!(matches!(result, Err(ExternalError::ModuleError)));
+        assert!(matches!(result, Err(ExternalError::ModuleError(_))));
         let (diagnostics, echoed) =
             lifecycle_failure_diagnostics(&mut proc, "lifecycle handshake ");
         assert_eq!(diagnostics.request_id, echoed);

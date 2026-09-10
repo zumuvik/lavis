@@ -1,6 +1,22 @@
 use super::info::fastfetch_response;
 use super::*;
 
+/// Collapse a module-provided error message to a bounded single display line.
+/// The protocol already caps the wire message at MAX_ERROR_MESSAGE_CHARS; this
+/// additionally strips line breaks and control characters before it reaches a
+/// Telegram reply.
+fn module_error_detail(message: &str) -> String {
+    let collapsed = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    const DISPLAY_BUDGET: usize = 200;
+    if collapsed.chars().count() <= DISPLAY_BUDGET {
+        collapsed
+    } else {
+        let mut cut: String = collapsed.chars().take(DISPLAY_BUDGET).collect();
+        cut.push('…');
+        cut
+    }
+}
+
 impl RuntimeState {
     pub fn external_command_refs(&self) -> &[crate::external_modules::manager::ExternalCommandRef] {
         &self.external_snapshot.command_refs
@@ -155,15 +171,25 @@ impl RuntimeState {
                     None,
                 ),
             ),
-            Err(ExternalError::ModuleError) => Response::plain_with_locale(
-                self.locale(),
-                external_command_text(
-                    locale,
-                    ExternalCommandText::ModuleError,
-                    &invocation.module_id,
-                    None,
-                ),
-            ),
+            Err(ExternalError::ModuleError(message)) => {
+                let detail = module_error_detail(message);
+                tracing::warn!(
+                    event = "external_module_command_error",
+                    module_id = %invocation.module_id,
+                    command = %invocation.command_name,
+                    detail = %detail,
+                    "Module reported an execution error"
+                );
+                Response::plain_with_locale(
+                    self.locale(),
+                    external_command_text(
+                        locale,
+                        ExternalCommandText::ModuleError,
+                        &invocation.module_id,
+                        Some(&detail),
+                    ),
+                )
+            }
             Err(ExternalError::ResultTooLarge) => Response::plain_with_locale(
                 self.locale(),
                 external_command_text(

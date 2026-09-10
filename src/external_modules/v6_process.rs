@@ -297,7 +297,7 @@ impl V6Process {
             .await?;
         match frame {
             V6InboundFrame::Result { text, .. } => Ok(text),
-            V6InboundFrame::Error { .. } => Err(ExternalError::ModuleError),
+            V6InboundFrame::Error { message, .. } => Err(ExternalError::ModuleError(message)),
             _ => Err(ExternalError::ProtocolDecode),
         }
     }
@@ -311,7 +311,7 @@ impl V6Process {
         let frame = self.event(request_id.clone(), event, payload).await?;
         match frame {
             V6InboundFrame::EventResult { actions, .. } => Ok((request_id, actions)),
-            V6InboundFrame::Error { .. } => Err(ExternalError::ModuleError),
+            V6InboundFrame::Error { message, .. } => Err(ExternalError::ModuleError(message)),
             _ => Err(ExternalError::ProtocolDecode),
         }
     }
