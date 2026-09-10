@@ -2,7 +2,7 @@
   "schema_version": 6,
   "id": "cleaner",
   "name": "Cleaner",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "author": "zumuvik",
   "entrypoint": "bin/cleaner",
   "capabilities": [
@@ -21,9 +21,10 @@
       "name": "cleaner",
       "summary_ru": "Удаление своих сообщений старше 12 часов",
       "description_ru": "Показывает список доступных групп, позволяет выбрать, в каких группах автоматически удалять собственные сообщения старше 12 часов, и ведёт журнал в теме Cleaner группы Lavis. Плюс режим opsec: fsociety-скан чатов, где у тебя остались сообщения (включая покинутые), и зачистка по номеру.",
-      "usage": "[list|add <номер>|remove <номер>|status|log|run|opsec [add <номер>]]",
+      "usage": "[list|add <номер>|remove <номер>|status|log|run|opsec [add <номер>]|help]",
       "examples": [
         "cleaner",
+        "help",
         "list",
         "add 0",
         "status",

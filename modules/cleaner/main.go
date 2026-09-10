@@ -191,6 +191,8 @@ func (m *module) execute(ctx context.Context, command, arguments string) (string
 			return m.statusText()
 		case "log":
 			return m.logText(ctx)
+		case "help", "помощь":
+			return m.helpText()
 		default:
 			return m.statusText()
 		}
@@ -349,6 +351,26 @@ func (m *module) statusText() (string, error) {
 			fmt.Fprintf(&b, "  %d. %s\n", i+1, group.Title)
 		}
 	})
+	return strings.TrimSuffix(b.String(), "\n"), nil
+}
+
+// helpText renders the full usage guide for `,cleaner help`. It documents the
+// real semantics of every subcommand so `help` never falls back to the silent
+// status card.
+func (m *module) helpText() (string, error) {
+	var b strings.Builder
+	b.WriteString("🧹 Cleaner — гайд\n\n")
+	b.WriteString("Автоматика: каждые 30 минут удаляет твои сообщения старше 12 часов в выбранных группах. Кэш диалогов обновляется раз в час. Итоги прогонов и зачисток — в лог-теме Cleaner.\n\n")
+	b.WriteString("Подкоманды (после твоего префикса, например: ,cleaner help):\n")
+	b.WriteString("• help — этот гайд\n")
+	b.WriteString("• status или без аргументов — состояние и выбранные группы\n")
+	b.WriteString("• list — найденные группы с твоими сообщениями и ссылками\n")
+	b.WriteString("• add <номер> — добавить группу в чистку (0 — все найденные)\n")
+	b.WriteString("• remove <номер> — убрать группу (номер из status)\n")
+	b.WriteString("• run — прогон чистки прямо сейчас\n")
+	b.WriteString("• log — где лежит лог-тема\n")
+	b.WriteString("• opsec — скан, где у тебя остались свои сообщения (включая покинутые чаты); первый вызов запускает скан\n")
+	b.WriteString("• opsec add <номер> — зачистка чата по номеру из отчёта opsec\n")
 	return strings.TrimSuffix(b.String(), "\n"), nil
 }
 
