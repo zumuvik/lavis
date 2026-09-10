@@ -15,6 +15,27 @@ pub trait BotApi: Send + Sync {
     fn get_me<'a>(&'a self, token: &'a CompanionToken) -> BotApiFuture<'a>;
 }
 
+/// A plain-text message posted by the companion bot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BotMessage {
+    pub chat_id: i64,
+    pub message_thread_id: Option<i32>,
+    pub text: String,
+}
+
+pub type BotSendFuture<'a> = Pin<Box<dyn Future<Output = Result<(), BotApiError>> + Send + 'a>>;
+
+/// The deliberately narrow HTTP boundary used to post messages as the
+/// companion bot. Separate from [`BotApi`] so setup validation cannot grow
+/// send authority by accident.
+pub trait BotSendApi: Send + Sync {
+    fn send_message<'a>(
+        &'a self,
+        token: &'a CompanionToken,
+        message: &'a BotMessage,
+    ) -> BotSendFuture<'a>;
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BotIdentity {
     pub id: i64,
@@ -125,6 +146,52 @@ impl BotApi for HttpBotApi {
             }
             let body = read_bounded_body(response).await?;
             parse_get_me_body(&body)
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct BotSendResponse {
+    ok: bool,
+}
+
+fn parse_send_body(body: &[u8]) -> Result<(), BotApiError> {
+    let parsed: BotSendResponse =
+        serde_json::from_slice(body).map_err(|_| BotApiError::Malformed)?;
+    if parsed.ok {
+        Ok(())
+    } else {
+        Err(BotApiError::Rejected)
+    }
+}
+
+impl BotSendApi for HttpBotApi {
+    fn send_message<'a>(
+        &'a self,
+        token: &'a CompanionToken,
+        message: &'a BotMessage,
+    ) -> BotSendFuture<'a> {
+        Box::pin(async move {
+            let url = format!("https://api.telegram.org/bot{}/sendMessage", token.as_str());
+            let mut payload = serde_json::json!({
+                "chat_id": message.chat_id,
+                "text": message.text,
+            });
+            if let Some(thread) = message.message_thread_id {
+                payload["message_thread_id"] = serde_json::json!(thread);
+            }
+            let response = self
+                .client
+                .post(url)
+                .json(&payload)
+                .send()
+                .await
+                .map_err(request_error)?;
+            if !response.status().is_success() {
+                return Err(BotApiError::Rejected);
+            }
+            let body = read_bounded_body(response).await?;
+            parse_send_body(&body)
         })
     }
 }

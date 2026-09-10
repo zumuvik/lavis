@@ -54,6 +54,7 @@ pub struct ExternalManager {
     /// attempt. Flows into crash diagnostics so restarts are distinguishable.
     restart_generations: BTreeMap<String, u64>,
     self_edit_ledger: crate::message_provenance::SharedSelfEditLedger,
+    bot_send: Option<Arc<dyn super::v6_host::HostBotSend>>,
 }
 
 #[derive(Clone)]
@@ -159,6 +160,7 @@ impl ExternalManager {
             latest_diagnostics: BTreeMap::new(),
             restart_generations: BTreeMap::new(),
             self_edit_ledger: crate::message_provenance::SharedSelfEditLedger::default(),
+            bot_send: None,
         }
     }
 
@@ -178,6 +180,10 @@ impl ExternalManager {
         ledger: crate::message_provenance::SharedSelfEditLedger,
     ) {
         self.self_edit_ledger = ledger;
+    }
+
+    pub fn set_bot_sender(&mut self, sender: Arc<dyn super::v6_host::HostBotSend>) {
+        self.bot_send = Some(sender);
     }
 
     pub fn descriptors(&self) -> &[ExternalModuleDescriptor] {
@@ -494,7 +500,7 @@ impl ExternalManagerHandle {
     /// Starts children without retaining the manager mutex. Process I/O belongs
     /// to the individual process mutex; the manager only owns the index.
     pub async fn startup_enabled(&self, enabled_ids: &std::collections::BTreeSet<String>) {
-        let (descriptors, gateway, v6_executor, self_edit_ledger) = {
+        let (descriptors, gateway, v6_executor, self_edit_ledger, bot_send) = {
             let manager = self.inner.lock().await;
             (
                 manager
@@ -506,6 +512,7 @@ impl ExternalManagerHandle {
                 manager.gateway.clone(),
                 manager.v6_executor.clone(),
                 manager.self_edit_ledger.clone(),
+                manager.bot_send.clone(),
             )
         };
         for descriptor in descriptors {
@@ -526,6 +533,7 @@ impl ExternalManagerHandle {
                                 executor,
                                 restart_generation,
                                 self_edit_ledger.clone(),
+                                bot_send.clone(),
                             )
                             .await
                             {

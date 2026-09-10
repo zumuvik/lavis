@@ -3,13 +3,14 @@
   "contract_revision": 4,
   "id": "cleaner",
   "name": "Cleaner",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "author": "zumuvik",
   "entrypoint": "bin/cleaner",
   "capabilities": [
     "telegram.raw",
     "persistent_state_read",
-    "persistent_state_write"
+    "persistent_state_write",
+    "message.send_bot"
   ],
   "telegram_methods": [
     "raw.invoke"

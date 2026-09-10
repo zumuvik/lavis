@@ -291,8 +291,9 @@ Lavis must still enforce these boundaries:
   handles through the Module API v6 IPC protocol;
 - RPC failures returned to the module are sanitized.
 
-Per-module fairness/concurrency limits are separate follow-up work; the current
-v6 contract does not claim they already exist.
+Per-module fairness/concurrency limits (`V6_MAX_ACTIVE_RPCS` in-flight calls
+per module) are enforced by the runtime in addition to the global v6 RPC
+semaphore.
 
 ## Peer and message handles
 
@@ -308,11 +309,31 @@ Invocations receive scoped handles instead of raw chat identifiers.
   never editable.
 - A handle release requested while a host call is active is deferred until
   that host call completes, and the deferred releases are drained then.
-- Host calls are restricted to `message.edit`. A host frame carrying any
-  other method, or a host call beyond the active-call capacity, terminates
-  the process as a fatal protocol or backpressure violation (retained in
-  diagnostics). Over-capacity Telegram RPC calls, in contrast, still receive
-  a soft `capacity` error result.
+- Host calls are restricted to `message.edit` and `message.sendBot`. A host
+  frame carrying any other method, or a host call beyond the active-call
+  capacity, terminates the process as a fatal protocol or backpressure
+  violation (retained in diagnostics). Over-capacity Telegram RPC calls, in
+  contrast, still receive a soft `capacity` error result.
+
+### Companion-bot posts: `message.sendBot`
+
+A module whose manifest declares the `message.send_bot` capability may ask the
+host to post a plain-text message as the companion bot:
+
+```json
+{"type":"host.invoke","call_id":"rpc-9","method":"message.sendBot",
+ "params":{"chat_id":-1001234567890,"message_thread_id":7,"text":"…"}}
+```
+
+- `chat_id` is required and nonzero; `message_thread_id` is optional and must
+  be positive; `text` is required, must not contain NUL, and is capped at
+  4096 UTF-16 units like `message.edit`.
+- The host resolves the destination through the Bot API using its own
+  companion-bot credentials. Modules never receive or transmit tokens, and
+  delivery succeeds only in chats where the companion bot can post.
+- Results are `null` on success or a sanitized host error (`capability
+  denied`, `bot send rejected`, `bot send timeout`, `bot send unavailable`);
+  the host never forwards HTTP or token material into module-visible errors.
 
 ## Resource limits
 

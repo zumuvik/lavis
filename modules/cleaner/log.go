@@ -180,22 +180,18 @@ func decodeForumTopics(body []byte) (int, error) {
 	return 0, fmt.Errorf("topic %q not found", logTopicTitle)
 }
 
-// postToTopic sends one message into a previously resolved topic. It never
-// touches m.state, so it is safe to run while the state lock is held by a
-// command handler.
+// postToTopic sends one message into a previously resolved topic through the
+// host's companion-bot boundary (host.invoke message.sendBot), so log entries
+// are authored by the bot instead of the user account. It never touches
+// m.state, so it is safe to run while the state lock is held by a command
+// handler.
 func (m *module) postToTopic(ctx context.Context, ref topicRef, text string) error {
 	if !ref.valid() {
 		return fmt.Errorf("log topic is not configured")
 	}
-	peer := &tg.InputPeerChannel{
-		ChannelID:  ref.chatID,
-		AccessHash: ref.accessHash,
-	}
-	_, err := m.call.call(ctx, &tg.MessagesSendMessageRequest{
-		Peer:     peer,
-		ReplyTo:  &tg.InputReplyToMessage{ReplyToMsgID: ref.topicID},
-		Message:  text,
-		RandomID: rand.Int63(),
+	return m.call.hostCall(ctx, "message.sendBot", map[string]any{
+		"chat_id":           ref.chatID,
+		"message_thread_id": ref.topicID,
+		"text":              text,
 	})
-	return err
 }

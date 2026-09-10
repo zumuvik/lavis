@@ -114,8 +114,8 @@ type resultFrame struct {
 	Error  *rpcError       `json:"error,omitempty"`
 }
 
-// dispatchAsync routes a telegram.result frame to its waiting rpc.
-// Returns true when the line was a result frame, matched or not: an
+// dispatchAsync routes a telegram.result or host.result frame to its waiting
+// rpc. Returns true when the line was a result frame, matched or not: an
 // unmatched id means the waiter already timed out, and feeding such a frame
 // back as a request would emit an UNKNOWN_TYPE error the host cannot
 // correlate to any request.
@@ -124,7 +124,7 @@ func (t *rpcTransport) dispatchAsync(line []byte) bool {
 	if err := json.Unmarshal(line, &frame); err != nil {
 		return false
 	}
-	if frame.Type != "telegram.result" {
+	if frame.Type != "telegram.result" && frame.Type != "host.result" {
 		return false
 	}
 	t.mu.Lock()
@@ -142,6 +142,17 @@ func (t *rpcTransport) dispatchAsync(line []byte) bool {
 
 // invoke sends a raw.invoke frame and waits for its telegram.result.
 func (t *rpcTransport) invoke(ctx context.Context, body []byte) (*telegramResult, error) {
+	return t.invokeFrame(ctx, "telegram.invoke", "raw.invoke", map[string]any{
+		"body_base64_chunks": base64Chunks(body, 7168),
+	})
+}
+
+// invokeHost sends a host.invoke frame and waits for its host.result.
+func (t *rpcTransport) invokeHost(ctx context.Context, method string, params map[string]any) (*telegramResult, error) {
+	return t.invokeFrame(ctx, "host.invoke", method, params)
+}
+
+func (t *rpcTransport) invokeFrame(ctx context.Context, frameType, method string, params map[string]any) (*telegramResult, error) {
 	t.mu.Lock()
 	id := fmt.Sprintf("cln-%d-%d", os.Getpid(), t.nextID)
 	t.nextID++
@@ -151,12 +162,10 @@ func (t *rpcTransport) invoke(ctx context.Context, body []byte) (*telegramResult
 
 	frame := map[string]any{
 		"protocol_version": 6,
-		"type":             "telegram.invoke",
+		"type":             frameType,
 		"call_id":          id,
-		"method":           "raw.invoke",
-		"params": map[string]any{
-			"body_base64_chunks": base64Chunks(body, 7168),
-		},
+		"method":           method,
+		"params":           params,
 	}
 	line, err := encodeFrame(frame)
 	if err != nil {
@@ -257,6 +266,28 @@ type rawResultEnvelope struct {
 	Kind   string   `json:"kind"`
 	DcID   int      `json:"dc_id"`
 	Chunks []string `json:"body_base64_chunks"`
+}
+
+// hostCall sends a host.invoke request and requires an ok result. Host error
+// messages are static sanitized strings supplied by Lavis.
+func (c *rawCaller) hostCall(ctx context.Context, method string, params map[string]any) error {
+	result, err := c.rpc.invokeHost(ctx, method, params)
+	if err != nil {
+		return err
+	}
+	if !result.Ok {
+		failure := &TelegramRPCError{Kind: "host"}
+		if result.Error != nil {
+			failure.Kind = result.Error.Kind
+			failure.Message = result.Error.Message
+		}
+		if failure.Message != "" {
+			failure.Kind = "host"
+			return fmt.Errorf("host %s: %s", method, failure.Message)
+		}
+		return fmt.Errorf("host %s failed", method)
+	}
+	return nil
 }
 
 func rawBody(raw json.RawMessage) ([]byte, error) {

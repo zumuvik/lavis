@@ -99,6 +99,78 @@ func TestInvokeTimeout(t *testing.T) {
 	}
 }
 
+func TestHostInvokeRoundTrip(t *testing.T) {
+	var mu sync.Mutex
+	var written bytes.Buffer
+	var rpc *rpcTransport
+	rpc = newRPC(writerFunc(func(p []byte) (int, error) {
+		var line json.RawMessage = p
+		line = bytes.TrimSuffix(line, []byte("\n"))
+		var frame struct {
+			Type   string          `json:"type"`
+			CallID string          `json:"call_id"`
+			Method string          `json:"method"`
+			Params json.RawMessage `json:"params"`
+		}
+		if err := json.Unmarshal(line, &frame); err != nil {
+			t.Fatalf("unmarshal frame: %v", err)
+		}
+		if frame.Type != "host.invoke" || frame.Method != "message.sendBot" {
+			t.Fatalf("unexpected frame: %s %s", frame.Type, frame.Method)
+		}
+		if !bytes.Contains(frame.Params, []byte(`"chat_id":-100123`)) {
+			t.Fatalf("params missing chat_id: %s", frame.Params)
+		}
+		answer := `{"protocol_version":6,"type":"host.result","call_id":"` +
+			frame.CallID + `","ok":true,"result":null}`
+		rpc.dispatchAsync([]byte(answer))
+		mu.Lock()
+		defer mu.Unlock()
+		return written.Write(p)
+	}))
+
+	err := (&rawCaller{rpc: rpc}).hostCall(context.Background(), "message.sendBot", map[string]any{
+		"chat_id":           -100123,
+		"message_thread_id": 7,
+		"text":              "hello",
+	})
+	if err != nil {
+		t.Fatalf("hostCall: %v", err)
+	}
+	mu.Lock()
+	body := written.String()
+	mu.Unlock()
+	if !bytes.Contains([]byte(body), []byte(`"type":"host.invoke"`)) {
+		t.Fatalf("frame missing host.invoke type: %s", body)
+	}
+}
+
+func TestHostInvokeSurfacesHostError(t *testing.T) {
+	var rpc *rpcTransport
+	rpc = newRPC(writerFunc(func(p []byte) (int, error) {
+		var line json.RawMessage = p
+		line = bytes.TrimSuffix(line, []byte("\n"))
+		var frame struct {
+			CallID string `json:"call_id"`
+		}
+		if err := json.Unmarshal(line, &frame); err != nil {
+			t.Fatalf("unmarshal frame: %v", err)
+		}
+		answer := `{"protocol_version":6,"type":"host.result","call_id":"` +
+			frame.CallID + `","ok":false,"error":{"kind":"host","message":"capability denied"}}`
+		rpc.dispatchAsync([]byte(answer))
+		return len(p), nil
+	}))
+
+	err := (&rawCaller{rpc: rpc}).hostCall(context.Background(), "message.sendBot", map[string]any{
+		"chat_id": -100123,
+		"text":    "hello",
+	})
+	if err == nil || !bytes.Contains([]byte(err.Error()), []byte("capability denied")) {
+		t.Fatalf("expected host error surfaced, got: %v", err)
+	}
+}
+
 func TestRawBodyDecode(t *testing.T) {
 	raw := json.RawMessage(`{"kind":"raw_tl","dc_id":1,"body_base64_chunks":["eFY0Eg=="]}`)
 	body, err := rawBody(raw)

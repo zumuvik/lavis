@@ -427,6 +427,32 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
                 guard.inner().module_rpc_client(),
             ));
             mgr.set_self_edit_ledger(self_edit_ledger.clone());
+            match config::ConfigPaths::setup_state_path_with(&environment).context(
+                "failed to determine setup state path",
+            ) {
+                Ok(setup_state_path) => {
+                    let token_path = config::ConfigPaths::companion_token_path_with(&environment)
+                        .context("failed to determine companion token path")?;
+                    match external_modules::bot_send::CompanionBotSender::new(
+                        setup_state_path,
+                        token_path,
+                    ) {
+                        Ok(sender) => mgr.set_bot_sender(external_modules::bot_send::arc_sender(
+                            sender,
+                        )),
+                        Err(error) => tracing::warn!(
+                            event = "external_module_bot_sender_unavailable",
+                            error = ?error,
+                            "Companion bot sender could not be initialized"
+                        ),
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    event = "external_module_bot_sender_unavailable",
+                    error = %error,
+                    "Companion bot sender disabled without setup state path"
+                ),
+            }
         }
         handle.startup_enabled(external_state.enabled_ids()).await;
         let mut runtime = runtime::RuntimeState::new(started_at, aliases, settings);

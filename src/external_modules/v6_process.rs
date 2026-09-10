@@ -115,6 +115,7 @@ impl V6Process {
             executor,
             restart_generation,
             crate::message_provenance::SharedSelfEditLedger::default(),
+            None,
         )
         .await
     }
@@ -124,6 +125,7 @@ impl V6Process {
         executor: Arc<dyn V6TelegramExecutor>,
         restart_generation: u64,
         self_edit_ledger: crate::message_provenance::SharedSelfEditLedger,
+        bot_send: Option<Arc<dyn super::v6_host::HostBotSend>>,
     ) -> Result<Self, V6StartFailure> {
         if descriptor.protocol_version != 6
             || !descriptor.entrypoint.starts_with(&descriptor.module_dir)
@@ -228,13 +230,21 @@ impl V6Process {
         )));
         let host_active = Arc::new(AtomicUsize::new(0));
         let pending_handle_releases = Arc::new(Mutex::new(Vec::new()));
-        let host = Arc::new(V6HostExecutor::with_registry(
-            descriptor
-                .capabilities
-                .contains(&super::manifest::ExternalCapability::MessageEdit),
-            handles.clone(),
-            self_edit_ledger,
-        ));
+        let host = Arc::new(
+            V6HostExecutor::with_registry(
+                descriptor
+                    .capabilities
+                    .contains(&super::manifest::ExternalCapability::MessageEdit),
+                handles.clone(),
+                self_edit_ledger,
+            )
+            .with_bot_send(
+                descriptor
+                    .capabilities
+                    .contains(&super::manifest::ExternalCapability::MessageSendBot),
+                bot_send,
+            ),
+        );
         tokio::spawn(supervise(
             child,
             process_group,
@@ -804,7 +814,7 @@ async fn supervise(
                             fatal_stage = "host";
                             break;
                         }
-                        if method != "message.edit" {
+                        if method != "message.edit" && method != "message.sendBot" {
                             fatal_reason = Some(FatalReason::ProtocolDecode);
                             fatal_stage = "host";
                             break;
@@ -822,7 +832,7 @@ async fn supervise(
                         let host = host.clone();
                         let tx = actor_tx.clone();
                         workers.spawn(async move {
-                            let result = match timeout(V6_RPC_TIMEOUT, host.execute(params)).await {
+                            let result = match timeout(V6_RPC_TIMEOUT, host.execute(&method, params)).await {
                                 Ok(Ok(value)) => Ok(value),
                                 Ok(Err(message)) => Err(V6CallError { kind: "host".into(), message: message.into(), code: None, name: None, retry_after_seconds: None }),
                                 Err(_) => Err(V6CallError { kind: "timeout".into(), message: "host call timed out".into(), code: None, name: None, retry_after_seconds: None }),
