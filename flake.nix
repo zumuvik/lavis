@@ -56,7 +56,7 @@
           };
           corePackage = pkgs.rustPlatform.buildRustPackage {
             pname = "lavis";
-            version = "1.0.0";
+            version = "1.1.2";
             src = rustSource;
             cargoLock.lockFile = ./Cargo.lock;
             # rustc spawns helper threads in addition to Cargo's workers. Leaving
