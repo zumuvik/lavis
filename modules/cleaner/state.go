@@ -39,6 +39,12 @@ type state struct {
 	LogAccessHash  int64       `json:"log_access_hash,omitempty"`
 	LogTopicID     int         `json:"log_topic_id,omitempty"`
 	LogTopicMarker string      `json:"log_topic_marker,omitempty"`
+
+	// Companion identity delivered by the host execute context (contract
+	// revision 4). Persisted so the log topic survives restarts even when a
+	// later host omits the context.
+	CompanionChatID     int64 `json:"companion_chat_id,omitempty"`
+	CompanionAccessHash int64 `json:"companion_access_hash,omitempty"`
 }
 
 type moduleState struct {

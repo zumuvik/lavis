@@ -13,8 +13,12 @@ pub const V6_MAX_JSON_DEPTH: usize = 8;
 pub const V6_MAX_JSON_STRING_BYTES: usize = 8 * 1024;
 pub const V6_MAX_JSON_COLLECTION_ITEMS: usize = 64;
 pub const V6_ALPHA_CONTRACT_REVISION: u32 = 2;
-pub const V6_CURRENT_CONTRACT_REVISION: u32 = 3;
+pub const V6_CURRENT_CONTRACT_REVISION: u32 = 4;
+/// Minimum revision for the context-rich execute path and host.invoke frames.
 pub const V6_HOST_CONTRACT_REVISION: u32 = 3;
+/// Revision that introduced `context.companion`; older modules keep the
+/// exact contract-3 wire shape.
+pub const V6_COMPANION_SINCE: u32 = 4;
 pub const V6_TIMEOUT_START: &str = "after_write_flush";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,12 +64,22 @@ pub struct V6ReplyContext {
     pub text: String,
 }
 
+/// The setup-created companion group identity, delivered to modules whose
+/// manifest opts into contract revision 4. It removes the need to rediscover
+/// the group by title from a dialog cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct V6CompanionContext {
+    pub chat_id: i64,
+    pub access_hash: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct V6CommandContext {
     pub peer: String,
     pub message: String,
     pub text: String,
     pub replied: Option<V6ReplyContext>,
+    pub companion: Option<V6CompanionContext>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -224,6 +238,12 @@ impl V6OutboundCoreFrame {
                     if let Some(reply) = &context.replied {
                         wire_context["replied"] =
                             serde_json::json!({"message": reply.message, "text": reply.text});
+                    }
+                    if let Some(companion) = &context.companion {
+                        wire_context["companion"] = serde_json::json!({
+                            "chat_id": companion.chat_id,
+                            "access_hash": companion.access_hash,
+                        });
                     }
                 }
                 serialize_v6_lifecycle(
@@ -1284,12 +1304,10 @@ mod tests {
     }
 
     #[test]
-    fn revision_three_host_transcript_is_offline_and_revision_gated() {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../protocol/v6/revision-3-host-transcript.json"
-        ))
-        .unwrap();
-        assert_eq!(fixture["contract_revision"], V6_HOST_CONTRACT_REVISION);
+    fn host_transcript_is_offline_and_revision_gated() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../protocol/v6/host-transcript.json")).unwrap();
+        assert_eq!(fixture["contract_revision"], V6_CURRENT_CONTRACT_REVISION);
         for case in fixture["frames"].as_array().unwrap() {
             let line = serde_json::to_string(&case["frame"]).unwrap();
             let accepted = case["accepted_revision_3"].as_bool().unwrap();
@@ -1692,6 +1710,7 @@ mod tests {
                     message: "c".repeat(64),
                     text: "reply".to_owned(),
                 }),
+                companion: None,
             }),
         };
         let value: serde_json::Value = serde_json::from_str(&frame.serialize().unwrap()).unwrap();
@@ -1707,6 +1726,53 @@ mod tests {
                 .len(),
             64
         );
+    }
+
+    #[test]
+    fn revision_four_context_serializes_companion_identity() {
+        let frame = V6OutboundCoreFrame::Execute {
+            request_id: "15".to_owned(),
+            command: "log".to_owned(),
+            arguments: String::new(),
+            argument_entities: vec![],
+            context: Some(V6CommandContext {
+                peer: "p".to_owned(),
+                message: "m".to_owned(),
+                text: "t".to_owned(),
+                replied: None,
+                companion: Some(V6CompanionContext {
+                    chat_id: -1002871795336,
+                    access_hash: 123456789012345,
+                }),
+            }),
+        };
+        let value: serde_json::Value = serde_json::from_str(&frame.serialize().unwrap()).unwrap();
+        assert_eq!(
+            value["context"]["companion"]["chat_id"],
+            serde_json::Value::from(-1002871795336_i64)
+        );
+        assert_eq!(
+            value["context"]["companion"]["access_hash"],
+            serde_json::Value::from(123456789012345_i64)
+        );
+
+        // Without a companion the field is omitted entirely, keeping the
+        // wire shape unchanged for older modules.
+        let frame = V6OutboundCoreFrame::Execute {
+            request_id: "16".to_owned(),
+            command: "log".to_owned(),
+            arguments: String::new(),
+            argument_entities: vec![],
+            context: Some(V6CommandContext {
+                peer: "p".to_owned(),
+                message: "m".to_owned(),
+                text: "t".to_owned(),
+                replied: None,
+                companion: None,
+            }),
+        };
+        let value: serde_json::Value = serde_json::from_str(&frame.serialize().unwrap()).unwrap();
+        assert!(value["context"].get("companion").is_none());
     }
 
     #[test]

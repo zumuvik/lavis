@@ -41,6 +41,20 @@ both to five seconds: lifecycle timeout begins after its frame is written and
 flushed, while RPC timeout applies to executor work. V2-v5 peers must never be
 sent v6 frames; compatible clarifications require a `contract_revision` bump.
 
+### Contract revision 4: companion identity
+
+A module whose manifest declares `contract_revision: 4` receives an additional
+optional object in the `execute` context:
+
+```json
+{"context": {"companion": {"chat_id": -1001234567890, "access_hash": 123456789012345}}}
+```
+
+The object carries the setup-created companion group identity and is present
+only when the host has a configured companion. Modules must not require it and
+must ignore unknown context fields. Contract revision 3 modules keep the exact
+revision-3 wire shape: the field is omitted for them.
+
 ## Conformance runner
 
 `lavis-v6-conformance [--profile base|full] <executable> [arguments...]` embeds
@@ -81,7 +95,7 @@ lifecycle response is pending.
 | Direction | Frame | Response |
 | --- | --- | --- |
 | Lavis → module | `{"type":"initialize","request_id":"1","module_id":"<id>"}` | `{"type":"initialized","request_id":"1","module_id":"<id>"}` |
-| Lavis → module | `{"type":"execute","request_id":"2","command":"name","arguments":"...","context":{"argument_entities":[]}}` | `{"type":"result","request_id":"2","text":"..."}` |
+| Lavis → module | `{"type":"execute","request_id":"2","command":"name","arguments":"...","context":{"argument_entities":[],"companion":{"chat_id":-1001234567890,"access_hash":123456789012345}}}` | `{"type":"result","request_id":"2","text":"..."}` |
 | Lavis → module | `{"type":"event","request_id":"3","event":"message.created","payload":{"event_id":"...","message_ref":"...","message_key":"...","text":"...","outgoing":false,"entities":[],"peer_id":123}}` | `{"type":"event_result","request_id":"3","actions":[]}` |
 | Lavis → module | `{"type":"health","request_id":"4"}` | `{"type":"health","request_id":"4"}` |
 | Lavis → module | `{"type":"shutdown","request_id":"5"}` | no response; the module exits |

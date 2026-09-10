@@ -33,19 +33,56 @@ func (r topicRef) location() string {
 	return fmt.Sprintf("группа Lavis (%d)", r.chatID)
 }
 
+// noteCompanion persists the host-provided companion identity when it
+// changed. The write path is the same atomic state commit used elsewhere.
+func (m *module) noteCompanion(companion companionContext) {
+	_ = m.withState(func(s *state) error {
+		if s.CompanionChatID == companion.ChatID && s.CompanionAccessHash == companion.AccessHash {
+			return nil
+		}
+		s.CompanionChatID = companion.ChatID
+		s.CompanionAccessHash = companion.AccessHash
+		// The cached log topic may point at a previous companion group.
+		s.LogChatID = 0
+		s.LogAccessHash = 0
+		s.LogTopicID = 0
+		s.LogTopicMarker = ""
+		return nil
+	})
+}
+
 // ensureLogTopic resolves the Lavis companion group from the dialog cache,
 // then finds or creates the Cleaner topic in it. RPCs run outside the state
 // lock; only the final assignment is persisted atomically.
 func (m *module) ensureLogTopic(ctx context.Context) error {
-	var cached, forumFound bool
-	var entry groupEntry
+	var cached, forumFound, haveCompanion bool
+	var entry, companion groupEntry
 	var cache []groupEntry
 	m.peekState(func(s *state) {
 		cached = s.LogChatID != 0 && s.LogAccessHash != 0 && s.LogTopicID != 0
 		cache = append([]groupEntry(nil), s.Discovered...)
+		if s.CompanionChatID != 0 && s.CompanionAccessHash != 0 {
+			companion = groupEntry{ID: s.CompanionChatID, AccessHash: s.CompanionAccessHash}
+			haveCompanion = true
+		}
 	})
 	if cached {
 		return nil
+	}
+	// The host-delivered companion identity wins over any title heuristic:
+	// it is stable across renames, archives, and dialog-cache gaps.
+	if haveCompanion {
+		topicID, err := m.findOrCreateTopic(ctx, &companion)
+		if err != nil {
+			return err
+		}
+		return m.withState(func(s *state) error {
+			s.LogChatID = companion.ID
+			s.LogAccessHash = companion.AccessHash
+			s.LogTopicID = topicID
+			s.LogTopicMarker = companionGroupTitle
+			return nil
+		})
 	}
 	if len(cache) == 0 {
 		// The command budget is shorter than a cold getDialogs round trip;

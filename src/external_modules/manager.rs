@@ -699,6 +699,7 @@ impl ExternalManagerHandle {
         replied: Option<grammers_client::message::Message>,
         peer_id: grammers_session::types::PeerId,
         authored_by_self: bool,
+        companion: Option<super::protocol::V6CompanionContext>,
     ) -> Result<String, ExternalError> {
         let process = {
             let manager = self.inner.lock().await;
@@ -725,6 +726,13 @@ impl ExternalManagerHandle {
                     .contains(&super::manifest::ExternalCapability::MessageRead)
                 {
                     replied
+                } else {
+                    None
+                };
+                let companion = if process.descriptor().contract_revision.unwrap_or(2)
+                    >= super::protocol::V6_COMPANION_SINCE
+                {
+                    companion
                 } else {
                     None
                 };
@@ -757,6 +765,7 @@ impl ExternalManagerHandle {
                             message: message_handle.clone(),
                             text: message_text,
                             replied: reply_context.clone(),
+                            companion,
                         }),
                     )
                     .await

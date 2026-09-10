@@ -372,6 +372,46 @@ func TestRemoveGroupsDropsEntry(t *testing.T) {
 	}
 }
 
+func TestNoteCompanionPersistsAndInvalidatesStaleLogTopic(t *testing.T) {
+	m := &module{
+		state: &state{
+			Enabled:    true,
+			LogChatID:  100,
+			LogTopicID: 7,
+			// A stale marker without a topic id must not survive either.
+			LogTopicMarker: "old",
+		},
+		path: filepath.Join(t.TempDir(), "state.json"),
+	}
+	m.noteCompanion(companionContext{ChatID: 555, AccessHash: 42})
+	if m.state.CompanionChatID != 555 || m.state.CompanionAccessHash != 42 {
+		t.Fatalf("companion identity not stored: %+v", m.state)
+	}
+	if m.state.LogChatID != 0 || m.state.LogTopicID != 0 || m.state.LogTopicMarker != "" {
+		t.Fatalf("stale log topic survived companion change: %+v", m.state)
+	}
+	data, err := os.ReadFile(m.path)
+	if err != nil {
+		t.Fatalf("state not persisted: %v", err)
+	}
+	var persisted state
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.CompanionChatID != 555 || persisted.CompanionAccessHash != 42 {
+		t.Fatalf("persisted companion mismatch: %+v", persisted)
+	}
+	// The same identity must be idempotent and keep a resolved topic.
+	m.state.LogChatID = 555
+	m.state.LogAccessHash = 42
+	m.state.LogTopicID = 9
+	m.state.LogTopicMarker = companionGroupTitle
+	m.noteCompanion(companionContext{ChatID: 555, AccessHash: 42})
+	if m.state.LogTopicID != 9 {
+		t.Fatalf("unchanged companion must not reset the log topic: %+v", m.state)
+	}
+}
+
 func TestLineWriterSerializesFrames(t *testing.T) {
 	var buf bytes.Buffer
 	out := &lineWriter{w: writerFunc(func(p []byte) (int, error) { return buf.Write(p) })}

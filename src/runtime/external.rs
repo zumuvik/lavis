@@ -100,6 +100,10 @@ impl RuntimeState {
                 );
             }
         };
+        let companion = match &self.setup {
+            Some(coordinator) => coordinator.companion_context().await,
+            None => None,
+        };
         let result = handle
             .execute_with_message_context(
                 &invocation.module_id,
@@ -111,6 +115,7 @@ impl RuntimeState {
                 message_context.replied.clone(),
                 message_context.message.peer_id(),
                 message_context.authored_by_self,
+                companion,
             )
             .await;
         let response = match &result {

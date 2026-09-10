@@ -464,7 +464,7 @@ impl V6Process {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.control
             .send(Control::Request {
-                frame,
+                frame: Box::new(frame),
                 expected,
                 reply: reply_tx,
             })
@@ -476,7 +476,7 @@ impl V6Process {
 
 enum Control {
     Request {
-        frame: V6OutboundCoreFrame,
+        frame: Box<V6OutboundCoreFrame>,
         expected: Expected,
         reply: oneshot::Sender<Result<V6InboundFrame, ExternalError>>,
     },
@@ -711,10 +711,10 @@ async fn supervise(
                         if waiting.len() == V6_MAX_PENDING {
                             let _ = reply.send(Err(ExternalError::Backpressure)); continue;
                         }
-                        waiting.push_back(QueuedRequest { frame, expected, reply });
+                        waiting.push_back(QueuedRequest { frame: *frame, expected, reply });
                         continue;
                     }
-                    if let Err(reason) = dispatch_lifecycle(&mut in_flight, &mut awaiting_lifecycle_flush, &writer_tx, frame, expected, reply) {
+                    if let Err(reason) = dispatch_lifecycle(&mut in_flight, &mut awaiting_lifecycle_flush, &writer_tx, *frame, expected, reply) {
                         fatal_reason = Some(reason);
                         fatal_request_id = Some(request_id);
                         fatal_stage = request_stage;

@@ -103,13 +103,25 @@ func (m *module) serveRequests(requests <-chan []byte, done chan<- struct{}) {
 }
 
 type request struct {
-	ProtocolVersion int    `json:"protocol_version"`
-	Type            string `json:"type"`
-	RequestID       string `json:"request_id"`
-	ModuleID        string `json:"module_id"`
-	Command         string `json:"command"`
-	Arguments       string `json:"arguments"`
-	Event           string `json:"event"`
+	ProtocolVersion int             `json:"protocol_version"`
+	Type            string          `json:"type"`
+	RequestID       string          `json:"request_id"`
+	ModuleID        string          `json:"module_id"`
+	Command         string          `json:"command"`
+	Arguments       string          `json:"arguments"`
+	Event           string          `json:"event"`
+	Context         *executeContext `json:"context,omitempty"`
+}
+
+// executeContext carries the host-provided companion group identity
+// (contract revision 4). All other fields are ignored.
+type executeContext struct {
+	Companion *companionContext `json:"companion,omitempty"`
+}
+
+type companionContext struct {
+	ChatID     int64 `json:"chat_id"`
+	AccessHash int64 `json:"access_hash"`
 }
 
 type response struct {
@@ -142,6 +154,9 @@ func (m *module) handle(req request) response {
 		os.Exit(0)
 	case "execute":
 		base.Type = "result"
+		if req.Context != nil && req.Context.Companion != nil {
+			m.noteCompanion(*req.Context.Companion)
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), commandBudget)
 		defer cancel()
 		text, err := m.execute(ctx, req.Command, req.Arguments)

@@ -395,6 +395,25 @@ impl SetupCoordinator {
         )
     }
 
+    /// Resolve the configured companion group for modules. Returns `None`
+    /// while setup is incomplete or the store is unavailable.
+    pub(super) async fn companion_context(
+        &self,
+    ) -> Option<crate::external_modules::protocol::V6CompanionContext> {
+        let state_path = self.state_path.clone();
+        let token_path = self.token_path.clone();
+        let state = tokio::task::spawn_blocking(move || {
+            SetupStore::new(state_path, token_path).load_state()
+        })
+        .await
+        .ok()?
+        .ok()?;
+        Some(crate::external_modules::protocol::V6CompanionContext {
+            chat_id: state.identities.companion_chat_id?,
+            access_hash: state.identities.companion_chat_access_hash?,
+        })
+    }
+
     pub(super) async fn repair(&self, client: &Client, locale: Locale) -> RuntimeExecution {
         let api = match HttpBotApi::new() {
             Ok(api) => api,
