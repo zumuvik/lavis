@@ -174,7 +174,10 @@ impl Default for InspectionLimits {
         Self {
             max_archive_bytes: 16 * 1024 * 1024,
             max_files: 256,
-            max_file_bytes: 4 * 1024 * 1024,
+            // Go binaries routinely exceed 4 MiB even with -s -w; keep the
+            // per-file cap aligned with the whole-archive cap, which stored-only
+            // entries already bound to max_archive_bytes.
+            max_file_bytes: 16 * 1024 * 1024,
             max_expanded_bytes: 32 * 1024 * 1024,
             max_path_depth: 16,
             max_path_bytes: 1024,

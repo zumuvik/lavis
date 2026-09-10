@@ -39,7 +39,12 @@ impl RuntimeState {
             now + DEFAULT_APPROVAL_TTL,
         ) {
             Ok(pending) => pending,
-            Err(_) => {
+            Err(error) => {
+                tracing::warn!(
+                    event = "external_module_inspection_rejected",
+                    error = %error,
+                    "External module package failed safe inspection"
+                );
                 return Response::plain_with_locale(
                     self.locale(),
                     lm_text(self.locale(), LmText::UnsafePackage),

@@ -82,7 +82,7 @@ Verify that:
 | --- | ---: |
 | Archive bytes | 16 MiB |
 | Archive entries | 256 |
-| Expanded bytes per file | 4 MiB |
+| Expanded bytes per file | 16 MiB |
 | Total expanded bytes | 32 MiB |
 | Path depth | 16 components |
 | Path length | 1024 bytes |
