@@ -1,13 +1,18 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -130,11 +135,11 @@ func TestPlural(t *testing.T) {
 
 func TestFormatDuration(t *testing.T) {
 	cases := map[time.Duration]string{
-		45 * time.Minute:      "45м",
-		90 * time.Minute:      "1ч 30м",
-		5 * time.Hour:         "5ч 0м",
-		27 * time.Hour:        "1д 3ч",
-		3 * 24 * time.Hour:    "3д 0ч",
+		45 * time.Minute:   "45м",
+		90 * time.Minute:   "1ч 30м",
+		5 * time.Hour:      "5ч 0м",
+		27 * time.Hour:     "1д 3ч",
+		3 * 24 * time.Hour: "3д 0ч",
 	}
 	for d, want := range cases {
 		if got := formatDuration(d); got != want {
@@ -243,44 +248,117 @@ func stubAPI(t *testing.T, quotaBody string) map[string][]string {
 }
 
 func TestHandleProtocol(t *testing.T) {
-	resp := handle(request{ProtocolVersion: 3, Type: "initialize", RequestID: "r1"})
+	m := newModule()
+	resp := m.handle(request{ProtocolVersion: 3, Type: "initialize", RequestID: "r1"})
 	if resp.Type != "error" || resp.Code != "PROTOCOL_VERSION" {
 		t.Fatalf("version mismatch handling: %+v", resp)
 	}
 
-	resp = handle(request{ProtocolVersion: 4, Type: "initialize", RequestID: "r2", ModuleID: "z"})
+	resp = m.handle(request{ProtocolVersion: protocolVersion, Type: "initialize", RequestID: "r2", ModuleID: "z"})
 	if resp.Type != "initialized" || resp.RequestID != "r2" || resp.ModuleID != "z" {
 		t.Fatalf("initialize handling: %+v", resp)
 	}
 
-	resp = handle(request{ProtocolVersion: 4, Type: "health", RequestID: "r3"})
+	resp = m.handle(request{ProtocolVersion: protocolVersion, Type: "health", RequestID: "r3"})
 	if resp.Type != "health" {
 		t.Fatalf("health handling: %+v", resp)
 	}
 }
 
 func TestExecuteDispatch(t *testing.T) {
-	if text := execute("bogus", ""); !strings.Contains(text, "Неизвестная команда") {
+	m := newModule()
+	if text, err := m.execute(context.Background(), "bogus", ""); err != nil || !strings.Contains(text, "Неизвестная команда") {
 		t.Fatalf("unknown command handling:\n%s", text)
 	}
-	if text := execute("ai", "bogus"); !strings.Contains(text, "Неизвестный аргумент") {
+	if text, err := m.execute(context.Background(), "ai", "bogus"); err != nil || !strings.Contains(text, "Неизвестный аргумент") {
 		t.Fatalf("unknown argument handling:\n%s", text)
 	}
-	if text := execute("ai", "BOGUS"); !strings.Contains(text, "Неизвестный аргумент") {
+	if text, err := m.execute(context.Background(), "ai", "BOGUS"); err != nil || !strings.Contains(text, "Неизвестный аргумент") {
 		t.Fatalf("argument case handling:\n%s", text)
 	}
 }
 
-func TestHandleExecuteFetchesQuota(t *testing.T) {
+// hostTestRPC builds a module whose transport answers host.invoke frames
+// with ok=true, recording every written frame. frameOf parses a frame.
+func hostTestRPC(t *testing.T, ok bool, errPayload string) (*module, *bytes.Buffer) {
+	t.Helper()
+	var mu sync.Mutex
+	buf := &bytes.Buffer{}
+	var rpc *rpcTransport
+	out := writerFunc(func(p []byte) (int, error) {
+		line := bytes.TrimSuffix(append([]byte(nil), p...), []byte("\n"))
+		var frame struct {
+			Type   string `json:"type"`
+			CallID string `json:"call_id"`
+		}
+		if err := json.Unmarshal(line, &frame); err != nil {
+			t.Fatalf("unmarshal frame: %v", err)
+		}
+		if frame.Type == "host.invoke" {
+			answer := `{"protocol_version":6,"type":"host.result","call_id":"` + frame.CallID + `","ok":` + strconv.FormatBool(ok)
+			if !ok {
+				answer += `,"error":{"kind":"host","message":"` + errPayload + `","code":null,"name":null,"retry_after_seconds":null}`
+			}
+			answer += `,"result":null}`
+			rpc.dispatchAsync([]byte(answer))
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		return buf.Write(p)
+	})
+	rpc = newRPC(out)
+	return &module{out: &lineWriter{w: out}, rpc: rpc, hc: &hostCaller{rpc: rpc}}, buf
+}
+
+func writerFunc(f func(p []byte) (int, error)) io.Writer { return writerFuncT(f) }
+
+type writerFuncT func(p []byte) (int, error)
+
+func (f writerFuncT) Write(p []byte) (int, error) { return f(p) }
+
+func TestHandleExecuteMenuSendsInlineForm(t *testing.T) {
 	stubAPI(t, `{"code":200,"msg":"Operation successful","data":{"limits":[{"type":"CREDIT_LIMIT","unit":3,"number":5,"usage":2000,"currentValue":406,"remaining":1593,"percentage":20,"nextResetTime":1788447511263}],"level":"lite"},"success":true}`)
 	writeTokenFile(t, "token=secret\n")
+	m, buf := hostTestRPC(t, true, "")
 
-	resp := handle(request{ProtocolVersion: 4, Type: "execute", RequestID: "r5", Command: "ai"})
-	if resp.Type != "result" {
-		t.Fatalf("execute type: %+v", resp)
+	resp := m.handle(request{
+		ProtocolVersion: protocolVersion,
+		Type:            "execute",
+		RequestID:       "r5",
+		Command:         "ai",
+		Context:         &executeContext{Peer: "peer-abc"},
+	})
+	if resp.Type != "result" || resp.Text != menuReplyText {
+		t.Fatalf("menu execute: %+v", resp)
 	}
-	if !strings.Contains(resp.Text, "406 / 2 000") || !strings.Contains(resp.Text, "план lite") {
-		t.Fatalf("execute text:\n%s", resp.Text)
+	frames := buf.String()
+	for _, want := range []string{
+		`"method":"inline.form"`,
+		`"peer":"peer-abc"`,
+		"406 / 2 000",
+		"план lite",
+		`"data":"usage"`,
+		`"data":"sub"`,
+		`"data":"quota"`,
+	} {
+		if !strings.Contains(frames, want) {
+			t.Fatalf("inline.form frames missing %q:\n%s", want, frames)
+		}
+	}
+	for _, data := range []string{"usage", "sub", "quota"} {
+		if len(data) > 32 {
+			t.Fatalf("callback data too long: %s", data)
+		}
+	}
+}
+
+func TestHandleExecuteMenuWithoutPeerErrors(t *testing.T) {
+	writeTokenFile(t, "token=secret\n")
+	m, _ := hostTestRPC(t, true, "")
+
+	resp := m.handle(request{ProtocolVersion: protocolVersion, Type: "execute", RequestID: "r5b", Command: "ai"})
+	if resp.Type != "error" || !strings.Contains(resp.Message, "peer") {
+		t.Fatalf("expected peer error, got: %+v", resp)
 	}
 }
 
@@ -288,7 +366,7 @@ func TestHandleExecuteUsage(t *testing.T) {
 	queries := stubAPI(t, `{}`)
 	writeTokenFile(t, "token=secret\n")
 
-	resp := handle(request{ProtocolVersion: 4, Type: "execute", RequestID: "r6", Command: "ai", Arguments: "usage"})
+	resp := newModule().handle(request{ProtocolVersion: protocolVersion, Type: "execute", RequestID: "r6", Command: "ai", Arguments: "usage"})
 	if resp.Type != "result" {
 		t.Fatalf("execute type: %+v", resp)
 	}
@@ -311,7 +389,7 @@ func TestHandleExecuteSub(t *testing.T) {
 	stubAPI(t, `{}`)
 	writeTokenFile(t, "token=secret\n")
 
-	resp := handle(request{ProtocolVersion: 4, Type: "execute", RequestID: "r7", Command: "ai", Arguments: "sub"})
+	resp := newModule().handle(request{ProtocolVersion: protocolVersion, Type: "execute", RequestID: "r7", Command: "ai", Arguments: "sub"})
 	if resp.Type != "result" {
 		t.Fatalf("execute type: %+v", resp)
 	}
@@ -332,18 +410,30 @@ func TestHandleExecuteReportsAPIText(t *testing.T) {
 	t.Cleanup(server.Close)
 	apiBase = server.URL
 	writeTokenFile(t, "token=bad\n")
+	m, _ := hostTestRPC(t, true, "")
 
-	resp := handle(request{ProtocolVersion: 4, Type: "execute", RequestID: "r8", Command: "ai"})
-	if resp.Type != "result" {
-		t.Fatalf("execute type: %+v", resp)
+	// Without a peer the menu is impossible and the failure must be explicit.
+	resp := m.handle(request{ProtocolVersion: protocolVersion, Type: "execute", RequestID: "r8", Command: "ai"})
+	if resp.Type != "error" {
+		t.Fatalf("expected error without peer, got: %+v", resp)
 	}
-	if !strings.Contains(resp.Text, "token expired or incorrect") {
-		t.Fatalf("execute text:\n%s", resp.Text)
+
+	// With a peer the API failure text travels inside the inline.form payload.
+	m2, buf2 := hostTestRPC(t, true, "")
+	resp = m2.handle(request{ProtocolVersion: protocolVersion, Type: "execute", RequestID: "r9", Command: "ai", Context: &executeContext{Peer: "peer-xyz"}})
+	if resp.Type != "result" || resp.Text != menuReplyText {
+		t.Fatalf("menu execute: %+v", resp)
+	}
+	if !strings.Contains(buf2.String(), "token expired or incorrect") {
+		t.Fatalf("inline.form missing API error text:\n%s", buf2.String())
+	}
+	if !strings.Contains(buf2.String(), `"peer":"peer-xyz"`) {
+		t.Fatalf("inline.form missing peer:\n%s", buf2.String())
 	}
 }
 
 func TestResponseEncodesCleanText(t *testing.T) {
-	data, err := json.Marshal(response{ProtocolVersion: 4, Type: "result", RequestID: "r", Text: "a · b — c"})
+	data, err := json.Marshal(response{ProtocolVersion: protocolVersion, Type: "result", RequestID: "r", Text: "a · b — c"})
 	if err != nil {
 		t.Fatal(err)
 	}

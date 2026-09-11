@@ -55,6 +55,7 @@ pub struct ExternalManager {
     restart_generations: BTreeMap<String, u64>,
     self_edit_ledger: crate::message_provenance::SharedSelfEditLedger,
     bot_send: Option<Arc<dyn super::v6_host::HostBotSend>>,
+    bot_inline: Option<Arc<dyn super::v6_host::HostInlineSurface>>,
 }
 
 #[derive(Clone)]
@@ -161,6 +162,7 @@ impl ExternalManager {
             restart_generations: BTreeMap::new(),
             self_edit_ledger: crate::message_provenance::SharedSelfEditLedger::default(),
             bot_send: None,
+            bot_inline: None,
         }
     }
 
@@ -184,6 +186,10 @@ impl ExternalManager {
 
     pub fn set_bot_sender(&mut self, sender: Arc<dyn super::v6_host::HostBotSend>) {
         self.bot_send = Some(sender);
+    }
+
+    pub fn set_inline_surface(&mut self, surface: Arc<dyn super::v6_host::HostInlineSurface>) {
+        self.bot_inline = Some(surface);
     }
 
     pub fn descriptors(&self) -> &[ExternalModuleDescriptor] {
@@ -497,10 +503,54 @@ impl ExternalManagerHandle {
             .map(|diagnostic| diagnostic.summary())
     }
 
+    /// Deliver a companion-bot callback press to the owning module. The
+    /// poller gates presses to the signed-in user; this method gates routing
+    /// to running modules that opted into `bot.callback` with the send-bot
+    /// capability. Actions are ignored: modules respond via host.invoke.
+    pub async fn bot_callback(
+        &self,
+        module_id: &str,
+        payload: super::protocol::BotCallbackEvent,
+    ) -> Result<(), ExternalError> {
+        let process = {
+            let manager = self.inner.lock().await;
+            match manager.processes.get(module_id) {
+                Some(process @ ManagedProcess::V6(_)) => {
+                    let view = process.metadata_view();
+                    if view.status != ProcessStatus::Running
+                        || !view
+                            .descriptor
+                            .capabilities
+                            .contains(&super::manifest::ExternalCapability::MessageSendBot)
+                        || !view
+                            .descriptor
+                            .subscriptions
+                            .contains(&super::manifest::ExternalSubscription::BotCallback)
+                    {
+                        return Err(ExternalError::Unavailable);
+                    }
+                    match process {
+                        ManagedProcess::V6(process) => process.clone(),
+                        ManagedProcess::Legacy { .. } => return Err(ExternalError::Unavailable),
+                    }
+                }
+                _ => return Err(ExternalError::Unavailable),
+            }
+        };
+        tokio::time::timeout(
+            // One second above the module's own lifecycle budget: the outer
+            // timeout includes queue wait, so it must not fire first.
+            std::time::Duration::from_secs(6),
+            process.dispatch_bot_callback(payload),
+        )
+        .await
+        .map_err(|_| ExternalError::ExecutionTimeout)?
+    }
+
     /// Starts children without retaining the manager mutex. Process I/O belongs
     /// to the individual process mutex; the manager only owns the index.
     pub async fn startup_enabled(&self, enabled_ids: &std::collections::BTreeSet<String>) {
-        let (descriptors, gateway, v6_executor, self_edit_ledger, bot_send) = {
+        let (descriptors, gateway, v6_executor, self_edit_ledger, bot_send, bot_inline) = {
             let manager = self.inner.lock().await;
             (
                 manager
@@ -513,6 +563,7 @@ impl ExternalManagerHandle {
                 manager.v6_executor.clone(),
                 manager.self_edit_ledger.clone(),
                 manager.bot_send.clone(),
+                manager.bot_inline.clone(),
             )
         };
         for descriptor in descriptors {
@@ -534,6 +585,7 @@ impl ExternalManagerHandle {
                                 restart_generation,
                                 self_edit_ledger.clone(),
                                 bot_send.clone(),
+                                bot_inline.clone(),
                             )
                             .await
                             {

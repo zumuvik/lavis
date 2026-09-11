@@ -187,6 +187,22 @@ impl V6HandleRegistry {
         let now = Instant::now();
         self.entries.retain(|_, e| e.expires > now);
     }
+    pub(crate) fn resolve_peer(&mut self, handle: &str) -> Result<PeerId, V6HandleError> {
+        self.purge_expired();
+        match self.entries.get(handle) {
+            Some(entry)
+                if entry.kind == V6HandleKind::Peer
+                    && entry.generation == self.generation
+                    && valid_handle(handle) =>
+            {
+                match &entry._target {
+                    V6HandleTarget::Peer(peer) => Ok(*peer),
+                    _ => Err(V6HandleError),
+                }
+            }
+            _ => Err(V6HandleError),
+        }
+    }
     pub(crate) fn resolve_message(&mut self, handle: &str) -> Result<Message, V6HandleError> {
         self.purge_expired();
         match self.entries.get(handle) {

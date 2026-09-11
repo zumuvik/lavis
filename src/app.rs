@@ -5,6 +5,7 @@ use std::{
     fs,
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -415,8 +416,12 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
 
         let external_manager = external_modules::manager::ExternalManager::new();
         let self_edit_ledger = message_provenance::SharedSelfEditLedger::default();
+        let bot_form_ledger = message_provenance::SharedBotFormLedger::default();
         let handle = external_modules::manager::ExternalManagerHandle::new(external_manager);
         external_handle = Some(handle.clone());
+        let mut inline_registry: Option<
+            Arc<external_modules::bot_send::InlineMenuRegistry>,
+        > = None;
         {
             let mut mgr = handle.lock().await;
             mgr.set_descriptors(descriptors);
@@ -434,12 +439,19 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
                     let token_path = config::ConfigPaths::companion_token_path_with(&environment)
                         .context("failed to determine companion token path")?;
                     match external_modules::bot_send::CompanionBotSender::new(
-                        setup_state_path,
+                        setup_state_path.clone(),
                         token_path,
+                        guard.inner().client().clone(),
+                        bot_form_ledger.clone(),
                     ) {
-                        Ok(sender) => mgr.set_bot_sender(external_modules::bot_send::arc_sender(
-                            sender,
-                        )),
+                        Ok(sender) => {
+                            let sender = Arc::new(sender);
+                            mgr.set_bot_sender(external_modules::bot_send::arc_sender(&sender));
+                            mgr.set_inline_surface(external_modules::bot_send::arc_inline(
+                                &sender,
+                            ));
+                            inline_registry = Some(sender.registry());
+                        }
                         Err(error) => tracing::warn!(
                             event = "external_module_bot_sender_unavailable",
                             error = ?error,
@@ -454,9 +466,25 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
                 ),
             }
         }
+        if let Some(inline_registry) = inline_registry {
+            let setup_state_path =
+                config::ConfigPaths::setup_state_path_with(&environment).context(
+                    "failed to determine setup state path",
+                )?;
+            let token_path = config::ConfigPaths::companion_token_path_with(&environment)
+                .context("failed to determine companion token path")?;
+            external_modules::bot_updates::spawn(external_modules::bot_updates::BotUpdatesConfig {
+                state_path: setup_state_path,
+                token_path,
+                registry: inline_registry,
+                self_user_id: self_user_id.bare_id_unchecked(),
+                manager: handle.clone(),
+            });
+        }
         handle.startup_enabled(external_state.enabled_ids()).await;
         let mut runtime = runtime::RuntimeState::new(started_at, aliases, settings);
         runtime.set_self_edit_ledger(self_edit_ledger);
+        runtime.set_bot_form_ledger(bot_form_ledger);
         runtime.set_http_upstream();
         runtime.set_self_identity(self_identity);
         runtime.configure_setup(

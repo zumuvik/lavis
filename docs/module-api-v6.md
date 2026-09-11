@@ -55,6 +55,17 @@ only when the host has a configured companion. Modules must not require it and
 must ignore unknown context fields. Contract revision 3 modules keep the exact
 revision-3 wire shape: the field is omitted for them.
 
+### Contract revision 5: companion-bot inline surface
+
+`V6_INLINE_SINCE = 5`; `V6_CURRENT_CONTRACT_REVISION` is bumped 4 → 5. A
+manifest declaring `contract_revision: 5` (or higher) may use the
+companion-bot interactive surface: the `inline.form`, `inline.answer`, and
+`message.editBot` host methods and the `bot.callback` event, all gated by the
+`message.send_bot` capability. See
+[Companion-bot interactive surface](#companion-bot-interactive-surface).
+Revision 4 modules keep the revision-4 wire shape; the host rejects surface
+host calls and suppresses `bot.callback` delivery for them.
+
 ## Conformance runner
 
 `lavis-v6-conformance [--profile base|full] <executable> [arguments...]` embeds
@@ -309,16 +320,36 @@ Invocations receive scoped handles instead of raw chat identifiers.
   never editable.
 - A handle release requested while a host call is active is deferred until
   that host call completes, and the deferred releases are drained then.
-- Host calls are restricted to `message.edit` and `message.sendBot`. A host
-  frame carrying any other method, or a host call beyond the active-call
-  capacity, terminates the process as a fatal protocol or backpressure
-  violation (retained in diagnostics). Over-capacity Telegram RPC calls, in
-  contrast, still receive a soft `capacity` error result.
+- Host calls are restricted to `message.edit` and the companion-bot methods
+  (`message.sendBot`, plus `inline.form`, `inline.answer`, and
+  `message.editBot` for contract revision ≥ 5 modules with the
+  `message.send_bot` capability). A host frame carrying any other method, or a
+  host call beyond the active-call capacity, terminates the process as a fatal
+  protocol or backpressure violation (retained in diagnostics). Over-capacity
+  Telegram RPC calls, in contrast, still receive a soft `capacity` error
+  result.
 
-### Companion-bot posts: `message.sendBot`
+### Companion-bot interactive surface
 
-A module whose manifest declares the `message.send_bot` capability may ask the
-host to post a plain-text message as the companion bot:
+All methods in this section are host calls gated by the manifest capability
+`message.send_bot` and require `contract_revision >= 5`
+(`V6_INLINE_SINCE = 5`). Receiving `bot.callback` additionally requires a v6
+manifest (`schema_version: 6`) that lists `bot.callback` in `subscriptions`
+and declares the `message.send_bot` capability with `contract_revision >= 5`.
+Modules never receive or transmit bot tokens; the host owns the
+companion-bot credentials exclusively.
+
+The host runs a Bot API `getUpdates` long-poll loop for the companion bot with
+`allowed_updates: ["inline_query", "callback_query"]`. Callback presses
+authored by users other than the signed-in user are rejected host-side and
+never reach any module. Operator requirement: inline mode must be enabled for
+the companion bot via BotFather, otherwise `inline_query` updates are never
+delivered.
+
+#### `message.sendBot`
+
+Existing behavior is unchanged: a module may ask the host to post a
+plain-text message as the companion bot:
 
 ```json
 {"type":"host.invoke","call_id":"rpc-9","method":"message.sendBot",
@@ -329,11 +360,81 @@ host to post a plain-text message as the companion bot:
   be positive; `text` is required, must not contain NUL, and is capped at
   4096 UTF-16 units like `message.edit`.
 - The host resolves the destination through the Bot API using its own
-  companion-bot credentials. Modules never receive or transmit tokens, and
-  delivery succeeds only in chats where the companion bot can post.
+  companion-bot credentials, and delivery succeeds only in chats where the
+  companion bot can post.
 - Results are `null` on success or a sanitized host error (`capability
   denied`, `bot send rejected`, `bot send timeout`, `bot send unavailable`);
   the host never forwards HTTP or token material into module-visible errors.
+
+#### `inline.form`
+
+Publishes an inline menu as a message authored by the companion bot, sent
+into the invoking chat with "via @bot" semantics:
+
+```json
+{"type":"host.invoke","call_id":"rpc-10","method":"inline.form",
+ "params":{"peer":"<opaque peer handle>","text":"Pick one:",
+           "buttons":[[{"text":"Yes","data":"confirm"},
+                       {"text":"No","data":"cancel"}]]}}
+```
+
+- `peer` is the opaque peer handle from the execute context; `text` follows
+  the `message.edit` limits (4096 UTF-16 units, no NUL).
+- `buttons` is a row-major grid: at most 16 rows, at most 8 buttons per row.
+  Button `text` is capped at 64 UTF-16 units; the host callback namespace
+  (`"<module_id>|"` plus separator) and button `data` together must fit the
+  64-byte Bot API `callback_data` limit.
+- Result is `null` on success or a sanitized host error as above.
+
+#### `inline.answer`
+
+Acknowledges a callback press delivered via `bot.callback`:
+
+```json
+{"type":"host.invoke","call_id":"rpc-11","method":"inline.answer",
+ "params":{"callback_id":"…","text":"Done","show_alert":false}}
+```
+
+- `text` is capped at 200 UTF-16 units; `show_alert` defaults to `false`.
+- Result is `null` on success or a sanitized host error.
+
+#### `message.editBot`
+
+Edits a bot-sent inline form message in place:
+
+```json
+{"type":"host.invoke","call_id":"rpc-12","method":"message.editBot",
+ "params":{"chat_id":-100123,"message_id":456,"text":"Updated",
+           "buttons":[[{"text":"Again","data":"retry"}]]}}
+```
+
+- `chat_id` and `message_id` identify the bot-authored message; `text`
+  follows the `message.edit` limits; `buttons` follows the `inline.form`
+  grid constraints.
+- Result is `null` on success or a sanitized host error.
+
+#### The `bot.callback` event
+
+When the owner presses a callback button on a bot-sent inline form, the host
+pushes:
+
+```json
+{"type":"event","request_id":"…","event":"bot.callback",
+ "payload":{"callback_id":"…","data":"confirm",
+            "chat_id":-100123,"message_id":456,"from_user_id":789}}
+```
+
+- `data` is the module-defined button data with the host's
+  `"<module_id>|"` namespace prefix stripped.
+- Delivery is scoped to the module that owns the pressed form; presses by
+  users other than the signed-in user are rejected host-side and never
+  delivered; delivery happens only while the module process is running.
+- The module replies with an `event_result` carrying empty actions; its
+  response to the user goes through `inline.answer` and/or
+  `message.editBot`.
+
+Menus are not durable: they exist only while the host runs and are not
+restored after a Lavis restart.
 
 ## Resource limits
 

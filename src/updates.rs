@@ -881,6 +881,12 @@ async fn process_update(
     if runtime.consume_setup_notification(peer_id, message_id) {
         return None;
     }
+    // Via-bot inline menus are self-authored with module-controlled text:
+    // consume them before routing, or a menu could execute as an owner
+    // command (and pollute module event projections).
+    if runtime.consume_bot_form_message(peer_id, message_id) {
+        return None;
+    }
     if edited && runtime.consume_expected_self_edit(peer_id, message_id, message.text()) {
         tracing::debug!(
             event = "command_self_edit_suppressed",

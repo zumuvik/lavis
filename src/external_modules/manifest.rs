@@ -118,12 +118,14 @@ impl ExternalCapability {
 pub enum ExternalSubscription {
     MessageCreated,
     MessageEdited,
+    BotCallback,
 }
 impl ExternalSubscription {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::MessageCreated => "message.created",
             Self::MessageEdited => "message.edited",
+            Self::BotCallback => "bot.callback",
         }
     }
 
@@ -131,6 +133,7 @@ impl ExternalSubscription {
         match value {
             "message.created" => Some(Self::MessageCreated),
             "message.edited" => Some(Self::MessageEdited),
+            "bot.callback" => Some(Self::BotCallback),
             _ => None,
         }
     }
@@ -475,6 +478,18 @@ pub fn validate_manifest_at(
         if subscription == ExternalSubscription::MessageEdited && manifest.schema_version < 4 {
             return Err(ExternalError::UnsupportedSchemaVersion);
         }
+        if subscription == ExternalSubscription::BotCallback {
+            if manifest.schema_version < 6 {
+                return Err(ExternalError::UnsupportedSchemaVersion);
+            }
+            if contract_revision.is_none_or(|revision| revision < super::protocol::V6_INLINE_SINCE)
+            {
+                return Err(ExternalError::UnsupportedSchemaVersion);
+            }
+            if !seen_capabilities.contains(&ExternalCapability::MessageSendBot) {
+                return Err(ExternalError::InvalidCapability);
+            }
+        }
         if subscriptions.contains(&subscription) {
             return Err(ExternalError::InvalidArgument);
         }
@@ -554,7 +569,15 @@ pub fn validate_manifest_at(
             return Err(ExternalError::InvalidArgument);
         }
     }
-    if !subscriptions.is_empty() && !seen_capabilities.contains(&ExternalCapability::MessageRead) {
+    // Only message-projection subscriptions need message reads. Companion-bot
+    // callbacks carry their own capability gate and never see chat content.
+    let needs_message_read = subscriptions.iter().any(|subscription| {
+        matches!(
+            subscription,
+            ExternalSubscription::MessageCreated | ExternalSubscription::MessageEdited
+        )
+    });
+    if needs_message_read && !seen_capabilities.contains(&ExternalCapability::MessageRead) {
         return Err(ExternalError::InvalidCapability);
     }
     if seen_capabilities.contains(&ExternalCapability::TelegramAccountStatus)
@@ -722,6 +745,29 @@ mod tests {
         assert_eq!(desc.author, "Example author");
         assert_eq!(desc.commands.len(), 1);
         assert_eq!(desc.commands[0].name, "repeat");
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn bot_callback_subscription_does_not_require_message_read() {
+        let base = temp_dir();
+        let dir = create_module_dir(&base, "echo");
+        let mut json = serde_json::from_slice::<serde_json::Value>(&valid_manifest_json()).unwrap();
+        json["schema_version"] = serde_json::json!(6);
+        json["contract_revision"] = serde_json::json!(5);
+        json["capabilities"] = serde_json::json!(["message.send_bot"]);
+        json["subscriptions"] = serde_json::json!(["bot.callback"]);
+        let path = write_manifest(&dir, serde_json::to_vec(&json).unwrap().as_slice());
+        let desc = validate_manifest_at(&path, Some("echo")).unwrap();
+        assert!(
+            desc.capabilities
+                .contains(&ExternalCapability::MessageSendBot)
+        );
+        assert!(
+            desc.subscriptions
+                .contains(&ExternalSubscription::BotCallback)
+        );
+        assert!(!desc.capabilities.contains(&ExternalCapability::MessageRead));
         fs::remove_dir_all(&base).unwrap();
     }
 

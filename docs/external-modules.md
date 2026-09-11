@@ -294,7 +294,9 @@ Schema 3 may also receive `message.created` events and return one scoped
 `message.react` action. Schema 4 adds edited-message support; schema 5 adds the
 allowlisted core account-status gateway; schema 6 adds capability-gated raw
 MTProto (`telegram.raw`, `raw.invoke`, `contract_revision`) and scoped
-peer/message handles. See [Module API v5](module-api-v5.md) and
+peer/message handles. Contract revision 5 adds the companion-bot inline
+surface (`message.send_bot` capability, `inline.form`, `inline.answer`,
+`message.editBot`, `bot.callback`). See [Module API v5](module-api-v5.md) and
 [Module API v6](module-api-v6.md); v2–v5 behavior remains unchanged.
 
 ### Environment

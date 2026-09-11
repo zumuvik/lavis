@@ -1,11 +1,13 @@
-// Command zai is a Lavis external module (Module API v4) that reports
+// Command zai is a Lavis external module (Module API v6) that reports
 // remaining z.ai coding-plan quota. It answers the "ai" command, exposed as
 // ,z.ai (module "z", command "ai") and ,z (default command), with the
-// subcommands quota (default), usage and sub.
+// subcommands quota (default), usage and sub. Without arguments the default
+// command publishes an inline companion-bot menu instead of a plain report.
 package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,12 +19,15 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
-	protocolVersion = 4
-	httpTimeout     = 2 * time.Second
+	httpTimeout = 2 * time.Second
+	// commandBudget must terminate before the host's 5s lifecycle deadline.
+	commandBudget   = 4 * time.Second
+	menuReplyText   = "🤖 Меню отправлено ботом"
 	apiTimeFormat   = "2006-01-02 15:04:05"
 	quotaPath       = "/api/monitor/usage/quota/limit"
 	modelUsagePath  = "/api/monitor/usage/model-usage"
@@ -34,12 +39,42 @@ const (
 var apiBase = "https://api.z.ai"
 
 type request struct {
-	ProtocolVersion int    `json:"protocol_version"`
-	Type            string `json:"type"`
-	RequestID       string `json:"request_id"`
-	ModuleID        string `json:"module_id"`
-	Command         string `json:"command"`
-	Arguments       string `json:"arguments"`
+	ProtocolVersion int             `json:"protocol_version"`
+	Type            string          `json:"type"`
+	RequestID       string          `json:"request_id"`
+	ModuleID        string          `json:"module_id"`
+	Command         string          `json:"command"`
+	Arguments       string          `json:"arguments"`
+	Event           string          `json:"event"`
+	Payload         json.RawMessage `json:"payload,omitempty"`
+	Context         *executeContext `json:"context,omitempty"`
+}
+
+// executeContext carries the opaque peer handle of the invoking chat
+// (contract revision 5); inline.form needs it to publish the menu there.
+type executeContext struct {
+	Peer string `json:"peer"`
+}
+
+// botCallback is the payload of the bot.callback event (contract revision 5).
+type botCallback struct {
+	CallbackID string `json:"callback_id"`
+	Data       string `json:"data"`
+	ChatID     int64  `json:"chat_id"`
+	MessageID  int64  `json:"message_id"`
+	FromUserID int64  `json:"from_user_id"`
+}
+
+type inlineButton struct {
+	Text string `json:"text"`
+	Data string `json:"data"`
+}
+
+// menuButtons is the shared keyboard: data values fit the 32-byte ASCII
+// callback budget after the host adds its "<module_id>|" namespace.
+var menuButtons = [][]inlineButton{
+	{{Text: "📊 Usage", Data: "usage"}, {Text: "💳 Подписки", Data: "sub"}, {Text: "🔄 Обновить", Data: "quota"}},
+	{{Text: "❌ Закрыть", Data: "close"}},
 }
 
 type response struct {
@@ -50,6 +85,213 @@ type response struct {
 	Text            string `json:"text,omitempty"`
 	Code            string `json:"code,omitempty"`
 	Message         string `json:"message,omitempty"`
+	Actions         *[]any `json:"actions,omitempty"`
+}
+
+type module struct {
+	out *lineWriter
+	rpc *rpcTransport
+	hc  *hostCaller
+
+	mu   sync.Mutex
+	peer string
+}
+
+func newModule() *module {
+	out := &lineWriter{w: os.Stdout}
+	rpc := newRPC(out)
+	return &module{out: out, rpc: rpc, hc: &hostCaller{rpc: rpc}}
+}
+
+// notePeer records the latest execute context peer handle.
+func (m *module) notePeer(peer string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.peer = peer
+}
+
+func (m *module) peerHandle() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.peer
+}
+
+func main() {
+	m := newModule()
+	// The stdin loop must never block while a command waits for a host
+	// invoke: host.result frames arrive here and are the only way pending
+	// invokes complete. Requests are handled on a worker goroutine instead.
+	requests := make(chan []byte, 8)
+	done := make(chan struct{})
+	go m.serveRequests(requests, done)
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 4096), maxLineBytes)
+	for scanner.Scan() {
+		line := append([]byte(nil), scanner.Bytes()...)
+		if m.rpc.dispatchAsync(line) {
+			continue
+		}
+		requests <- line
+	}
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+	}
+	// Drain already-buffered requests before exiting; otherwise responses to
+	// the last frames would be lost when stdin closes.
+	close(requests)
+	<-done
+}
+
+func (m *module) serveRequests(requests <-chan []byte, done chan<- struct{}) {
+	defer close(done)
+	for line := range requests {
+		var req request
+		if err := json.Unmarshal(line, &req); err != nil {
+			continue
+		}
+		data, err := encodeFrame(m.handle(req))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			continue
+		}
+		if err := m.out.WriteLine(data); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	}
+}
+
+func (m *module) handle(req request) response {
+	base := response{ProtocolVersion: protocolVersion, RequestID: req.RequestID}
+	if req.ProtocolVersion != protocolVersion {
+		base.Type = "error"
+		base.Code = "PROTOCOL_VERSION"
+		base.Message = "unsupported protocol version"
+		return base
+	}
+	switch req.Type {
+	case "initialize":
+		base.Type = "initialized"
+		base.ModuleID = req.ModuleID
+	case "health":
+		base.Type = "health"
+	case "shutdown":
+		os.Exit(0)
+	case "execute":
+		base.Type = "result"
+		if req.Context != nil {
+			m.notePeer(req.Context.Peer)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), commandBudget)
+		defer cancel()
+		text, err := m.execute(ctx, req.Command, req.Arguments)
+		if err != nil {
+			base.Type = "error"
+			base.Code = "BAD_INPUT"
+			base.Message = err.Error()
+			fmt.Fprintf(os.Stderr, "execute %s %s: %v\n", req.Command, req.Arguments, err)
+		} else {
+			base.Text = text
+		}
+	case "event":
+		base.Type = "event_result"
+		empty := []any{}
+		base.Actions = &empty
+		m.handleEvent(req)
+	default:
+		base.Type = "error"
+		base.Code = "UNKNOWN_TYPE"
+		base.Message = "unknown request type"
+	}
+	return base
+}
+
+// handleEvent answers a bot.callback by redrawing the bot's menu message in
+// place. The press is always acknowledged first, even when the redraw fails,
+// so the client does not leave the button in a loading state.
+func (m *module) handleEvent(req request) {
+	if req.Event != "bot.callback" {
+		return
+	}
+	var cb botCallback
+	if len(req.Payload) > 0 {
+		if err := json.Unmarshal(req.Payload, &cb); err != nil {
+			fmt.Fprintf(os.Stderr, "bot.callback payload: %v\n", err)
+			return
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), commandBudget)
+	defer cancel()
+
+	// Acknowledge the press before any report fetching: z.ai calls can eat
+	// the whole command budget, and the client spinner expires in seconds.
+	_ = m.hc.hostCall(ctx, "inline.answer", map[string]any{
+		"callback_id": cb.CallbackID,
+		"text":        "",
+		"show_alert":  false,
+	})
+
+	text := ""
+	buttons := menuButtons
+	switch cb.Data {
+	case "usage":
+		text = usageReport()
+	case "sub":
+		text = subscriptionReport()
+	case "quota":
+		text = quotaReport()
+	case "close":
+		text = "🔒 Меню закрыто"
+		buttons = [][]inlineButton{}
+	default:
+		text = "❓ Неизвестное действие"
+	}
+	if err := m.hc.hostCall(ctx, "message.editBot", map[string]any{
+		"chat_id":    cb.ChatID,
+		"message_id": cb.MessageID,
+		"text":       text,
+		"buttons":    buttons,
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "message.editBot: %v\n", err)
+	}
+}
+
+// execute never returns a module error: expected conditions (missing token,
+// API failures) are reported as result text so the exact reason stays visible.
+func (m *module) execute(ctx context.Context, command, arguments string) (string, error) {
+	if strings.ToLower(strings.TrimSpace(command)) != "ai" {
+		return "❌ Неизвестная команда: " + command + ". Доступно: ai", nil
+	}
+	switch strings.ToLower(strings.TrimSpace(arguments)) {
+	case "":
+		return m.menuCommand(ctx)
+	case "quota":
+		return quotaReport(), nil
+	case "usage":
+		return usageReport(), nil
+	case "sub":
+		return subscriptionReport(), nil
+	default:
+		return "❌ Неизвестный аргумент: " + arguments + ". Доступно: quota, usage, sub", nil
+	}
+}
+
+// menuCommand publishes the inline menu through the host into the invoking
+// chat. It requires the peer handle from the execute context; without one
+// the command fails explicitly instead of silently skipping the menu.
+func (m *module) menuCommand(ctx context.Context) (string, error) {
+	peer := m.peerHandle()
+	if peer == "" {
+		return "", fmt.Errorf("хост не передал peer: inline-меню недоступно")
+	}
+	if err := m.hc.hostCall(ctx, "inline.form", map[string]any{
+		"peer":    peer,
+		"text":    quotaReport(),
+		"buttons": menuButtons,
+	}); err != nil {
+		return "", fmt.Errorf("меню: %w", err)
+	}
+	return menuReplyText, nil
 }
 
 // apiEnvelope holds the fields shared by every z.ai monitor/biz response.
@@ -125,71 +367,6 @@ type subscription struct {
 type subscriptionsResponse struct {
 	apiEnvelope
 	Data []subscription `json:"data"`
-}
-
-func main() {
-	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Buffer(make([]byte, 4096), 64*1024)
-	encoder := json.NewEncoder(os.Stdout)
-	encoder.SetEscapeHTML(false)
-	for scanner.Scan() {
-		var req request
-		if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
-			continue
-		}
-		if err := encoder.Encode(handle(req)); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-	}
-}
-
-func handle(req request) response {
-	base := response{ProtocolVersion: protocolVersion, RequestID: req.RequestID}
-	if req.ProtocolVersion != protocolVersion {
-		base.Type = "error"
-		base.Code = "PROTOCOL_VERSION"
-		base.Message = "unsupported protocol version"
-		return base
-	}
-	switch req.Type {
-	case "initialize":
-		base.Type = "initialized"
-		base.ModuleID = req.ModuleID
-	case "health":
-		base.Type = "health"
-	case "shutdown":
-		os.Exit(0)
-	case "execute":
-		base.Type = "result"
-		base.Text = execute(req.Command, req.Arguments)
-	default:
-		base.Type = "error"
-		base.Code = "UNKNOWN_TYPE"
-		base.Message = "unknown request type"
-	}
-	return base
-}
-
-// execute never returns a module error: expected conditions (missing token,
-// API failures) are reported as result text so the exact reason stays visible.
-func execute(command, arguments string) string {
-	if strings.ToLower(strings.TrimSpace(command)) != "ai" {
-		return "❌ Неизвестная команда: " + command + ". Доступно: ai"
-	}
-	switch strings.ToLower(strings.TrimSpace(arguments)) {
-	case "", "quota":
-		return quotaReport()
-	case "usage":
-		return usageReport()
-	case "sub":
-		return subscriptionReport()
-	default:
-		return "❌ Неизвестный аргумент: " + arguments + ". Доступно: quota, usage, sub"
-	}
 }
 
 // tokenPath resolves the user's home directory without relying on $HOME:

@@ -23,6 +23,16 @@ pub struct BotMessage {
     pub text: String,
 }
 
+/// An in-place edit of a companion-bot inline form. Callback data is already
+/// host-namespaced before it reaches this boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BotEditMessage {
+    pub chat_id: i64,
+    pub message_id: i64,
+    pub text: String,
+    pub buttons: Vec<Vec<(String, String)>>,
+}
+
 pub type BotSendFuture<'a> = Pin<Box<dyn Future<Output = Result<(), BotApiError>> + Send + 'a>>;
 
 /// The deliberately narrow HTTP boundary used to post messages as the
@@ -33,6 +43,18 @@ pub trait BotSendApi: Send + Sync {
         &'a self,
         token: &'a CompanionToken,
         message: &'a BotMessage,
+    ) -> BotSendFuture<'a>;
+    fn answer_callback<'a>(
+        &'a self,
+        token: &'a CompanionToken,
+        callback_id: &'a str,
+        text: &'a str,
+        show_alert: bool,
+    ) -> BotSendFuture<'a>;
+    fn edit_message_text<'a>(
+        &'a self,
+        token: &'a CompanionToken,
+        message: &'a BotEditMessage,
     ) -> BotSendFuture<'a>;
 }
 
@@ -179,6 +201,84 @@ impl BotSendApi for HttpBotApi {
             });
             if let Some(thread) = message.message_thread_id {
                 payload["message_thread_id"] = serde_json::json!(thread);
+            }
+            let response = self
+                .client
+                .post(url)
+                .json(&payload)
+                .send()
+                .await
+                .map_err(request_error)?;
+            if !response.status().is_success() {
+                return Err(BotApiError::Rejected);
+            }
+            let body = read_bounded_body(response).await?;
+            parse_send_body(&body)
+        })
+    }
+
+    fn answer_callback<'a>(
+        &'a self,
+        token: &'a CompanionToken,
+        callback_id: &'a str,
+        text: &'a str,
+        show_alert: bool,
+    ) -> BotSendFuture<'a> {
+        Box::pin(async move {
+            let url = format!(
+                "https://api.telegram.org/bot{}/answerCallbackQuery",
+                token.as_str()
+            );
+            let mut payload = serde_json::json!({ "callback_query_id": callback_id });
+            if !text.is_empty() {
+                payload["text"] = serde_json::json!(text);
+            }
+            if show_alert {
+                payload["show_alert"] = serde_json::json!(true);
+            }
+            let response = self
+                .client
+                .post(url)
+                .json(&payload)
+                .send()
+                .await
+                .map_err(request_error)?;
+            if !response.status().is_success() {
+                return Err(BotApiError::Rejected);
+            }
+            let body = read_bounded_body(response).await?;
+            parse_send_body(&body)
+        })
+    }
+
+    fn edit_message_text<'a>(
+        &'a self,
+        token: &'a CompanionToken,
+        message: &'a BotEditMessage,
+    ) -> BotSendFuture<'a> {
+        Box::pin(async move {
+            let url = format!(
+                "https://api.telegram.org/bot{}/editMessageText",
+                token.as_str()
+            );
+            let mut payload = serde_json::json!({
+                "chat_id": message.chat_id,
+                "message_id": message.message_id,
+                "text": message.text,
+            });
+            if !message.buttons.is_empty() {
+                let keyboard: Vec<Vec<serde_json::Value>> = message
+                    .buttons
+                    .iter()
+                    .map(|row| {
+                        row.iter()
+                            .map(|(text, data)| {
+                                serde_json::json!({ "text": text, "callback_data": data })
+                            })
+                            .collect()
+                    })
+                    .collect();
+                payload["reply_markup"] = serde_json::json!({ "inline_keyboard": keyboard });
             }
             let response = self
                 .client

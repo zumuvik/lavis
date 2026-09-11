@@ -68,6 +68,40 @@ impl SharedSelfEditLedger {
     }
 }
 
+/// Peer/message pairs of via-bot inline forms sent from the user session.
+/// They arrive as self-authored updates whose text is module-controlled, so
+/// they must be consumed before command routing: otherwise a module could
+/// smuggle owner-prefixed command text into its menu and escalate.
+#[derive(Clone, Debug, Default)]
+pub struct SharedBotFormLedger(Arc<Mutex<VecDeque<(PeerId, i32)>>>);
+
+impl SharedBotFormLedger {
+    pub fn register(&self, peer_id: PeerId, message_id: i32) {
+        let mut ledger = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if ledger.len() >= MAX_ENTRIES {
+            ledger.pop_front();
+        }
+        ledger.push_back((peer_id, message_id));
+    }
+
+    pub fn consume(&self, peer_id: PeerId, message_id: i32) -> bool {
+        let mut ledger = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let index = ledger
+            .iter()
+            .position(|entry| *entry == (peer_id, message_id));
+        match index {
+            Some(index) => ledger.remove(index).is_some(),
+            None => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,5 +129,19 @@ mod tests {
         assert!(ledger.register(peer, 999, "new".into()).is_err());
         assert!(ledger.consume(peer, 0, "0"));
         assert!(!ledger.consume(peer, 999, "new"));
+    }
+
+    #[test]
+    fn bot_form_ledger_is_bounded_and_shared() {
+        let ledger = SharedBotFormLedger::default();
+        let mirror = ledger.clone();
+        let peer = PeerId::user(3).unwrap();
+        // One extra registration evicts the oldest entry.
+        for index in 0..=MAX_ENTRIES as i32 {
+            ledger.register(peer, index);
+        }
+        assert!(!mirror.consume(peer, 0));
+        assert!(mirror.consume(peer, MAX_ENTRIES as i32));
+        assert!(!ledger.consume(peer, MAX_ENTRIES as i32));
     }
 }

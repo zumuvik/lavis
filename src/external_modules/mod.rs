@@ -1,6 +1,7 @@
 pub mod acquisition;
 pub mod approval;
 pub mod bot_send;
+pub mod bot_updates;
 pub mod control;
 pub mod entities;
 pub mod events;

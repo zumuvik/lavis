@@ -119,6 +119,7 @@ pub struct RuntimeState {
     external_snapshot: ExternalRuntimeSnapshot,
     expected_self_edits: crate::message_provenance::SharedSelfEditLedger,
     setup_notification_ids: VecDeque<(PeerId, i32)>,
+    bot_form_ledger: crate::message_provenance::SharedBotFormLedger,
     setup_edit_fallback_sources: VecDeque<(PeerId, i32)>,
     setup: Option<SetupCoordinator>,
     // Projection is held closed after setup is configured until BotFather's
@@ -335,6 +336,7 @@ impl RuntimeState {
             external_manager: None,
             external_snapshot: ExternalRuntimeSnapshot::new(),
             expected_self_edits: crate::message_provenance::SharedSelfEditLedger::default(),
+            bot_form_ledger: crate::message_provenance::SharedBotFormLedger::default(),
             setup_notification_ids: VecDeque::new(),
             setup_edit_fallback_sources: VecDeque::new(),
             setup: None,
@@ -469,6 +471,14 @@ impl RuntimeState {
         ledger: crate::message_provenance::SharedSelfEditLedger,
     ) {
         self.expected_self_edits = ledger;
+    }
+
+    pub fn set_bot_form_ledger(&mut self, ledger: crate::message_provenance::SharedBotFormLedger) {
+        self.bot_form_ledger = ledger;
+    }
+
+    pub(crate) fn consume_bot_form_message(&mut self, peer_id: PeerId, message_id: i32) -> bool {
+        self.bot_form_ledger.consume(peer_id, message_id)
     }
 
     pub fn configure_module_installation(

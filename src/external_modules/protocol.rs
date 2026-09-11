@@ -13,12 +13,15 @@ pub const V6_MAX_JSON_DEPTH: usize = 8;
 pub const V6_MAX_JSON_STRING_BYTES: usize = 8 * 1024;
 pub const V6_MAX_JSON_COLLECTION_ITEMS: usize = 64;
 pub const V6_ALPHA_CONTRACT_REVISION: u32 = 2;
-pub const V6_CURRENT_CONTRACT_REVISION: u32 = 4;
+pub const V6_CURRENT_CONTRACT_REVISION: u32 = 5;
 /// Minimum revision for the context-rich execute path and host.invoke frames.
 pub const V6_HOST_CONTRACT_REVISION: u32 = 3;
 /// Revision that introduced `context.companion`; older modules keep the
 /// exact contract-3 wire shape.
 pub const V6_COMPANION_SINCE: u32 = 4;
+/// Revision that introduced the companion-bot interactive surface
+/// (`inline.form`, `inline.answer`, `message.editBot`, `bot.callback`).
+pub const V6_INLINE_SINCE: u32 = 5;
 pub const V6_TIMEOUT_START: &str = "after_write_flush";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,6 +174,18 @@ pub enum V6CoreFrame {
     },
 }
 
+/// Companion-bot interactive push: the owner pressed a callback button on a
+/// bot-sent inline form. The module replies with an event_result; responses
+/// travel through host.invoke methods, so actions are not needed here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BotCallbackEvent {
+    pub callback_id: String,
+    pub data: String,
+    pub chat_id: i64,
+    pub message_id: i64,
+    pub from_user_id: i64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum V6OutboundCoreFrame {
     Initialize {
@@ -188,6 +203,10 @@ pub enum V6OutboundCoreFrame {
         request_id: String,
         event: MessageEventKind,
         payload: MessageEvent,
+    },
+    BotCallbackEvent {
+        request_id: String,
+        payload: BotCallbackEvent,
     },
     Health {
         request_id: String,
@@ -286,6 +305,25 @@ impl V6OutboundCoreFrame {
                     }),
                 )
             }
+            Self::BotCallbackEvent {
+                request_id,
+                payload,
+            } => serialize_v6_lifecycle(
+                request_id,
+                serde_json::json!({
+                    "protocol_version": 6,
+                    "type": "event",
+                    "request_id": request_id,
+                    "event": "bot.callback",
+                    "payload": {
+                        "callback_id": payload.callback_id,
+                        "data": payload.data,
+                        "chat_id": payload.chat_id,
+                        "message_id": payload.message_id,
+                        "from_user_id": payload.from_user_id,
+                    },
+                }),
+            ),
             Self::Health { request_id } => serialize_v6_lifecycle(
                 request_id,
                 serde_json::json!({

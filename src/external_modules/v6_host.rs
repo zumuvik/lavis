@@ -1,9 +1,7 @@
-use super::{
-    manifest::{ExternalCapability, ExternalModuleDescriptor},
-    v6_handles::{V6HandleKind, V6HandleRegistry},
-};
+use super::v6_handles::{V6HandleKind, V6HandleRegistry};
 use crate::message_provenance::SharedSelfEditLedger;
 use crate::message_provenance::edit_definitely_rejected;
+use grammers_session::types::PeerId;
 use serde::Deserialize;
 use serde_json::value::RawValue;
 use std::{
@@ -67,6 +65,77 @@ impl MessageSendBotParams {
     }
 }
 
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InlineFormParams {
+    pub peer: String,
+    pub text: String,
+    #[serde(default)]
+    pub buttons: Vec<Vec<InlineButton>>,
+}
+
+impl InlineFormParams {
+    pub fn validate(&self, prefix_len: usize) -> Result<(), &'static str> {
+        if self.peer.is_empty() {
+            return Err("peer handle is required");
+        }
+        if self.text.is_empty() || self.text.contains('\0') {
+            return Err("text is required");
+        }
+        if self.text.encode_utf16().count() > 4096 {
+            return Err("text is too long");
+        }
+        validate_button_rows(&self.buttons, prefix_len)
+    }
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InlineAnswerParams {
+    pub callback_id: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub show_alert: bool,
+}
+
+impl InlineAnswerParams {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.callback_id.is_empty() || self.callback_id.len() > 128 {
+            return Err("callback_id is required");
+        }
+        if self.text.contains('\0') || self.text.encode_utf16().count() > 200 {
+            return Err("callback text is too long");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MessageEditBotParams {
+    pub chat_id: i64,
+    pub message_id: i64,
+    pub text: String,
+    #[serde(default)]
+    pub buttons: Vec<Vec<InlineButton>>,
+}
+
+impl MessageEditBotParams {
+    pub fn validate(&self, prefix_len: usize) -> Result<(), &'static str> {
+        if self.chat_id == 0 || self.message_id <= 0 {
+            return Err("chat_id and message_id are required");
+        }
+        if self.text.is_empty() || self.text.contains('\0') {
+            return Err("text is required");
+        }
+        if self.text.encode_utf16().count() > 4096 {
+            return Err("text is too long");
+        }
+        validate_button_rows(&self.buttons, prefix_len)
+    }
+}
+
 /// Offline boundary for companion-bot posts. The runtime integration supplies
 /// the token-backed implementation; production and tests share this trait so
 /// the host executor never touches HTTP or credentials directly.
@@ -79,15 +148,94 @@ pub trait HostBotSend: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 }
 
+/// One inline-keyboard button of a companion-bot menu. `data` is module-
+/// defined and is namespaced by the host before it reaches Bot API.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct InlineButton {
+    pub text: String,
+    pub data: String,
+}
+
+pub const MAX_INLINE_BUTTON_DATA_BYTES: usize = 32;
+pub const MAX_INLINE_ROWS: usize = 16;
+pub const MAX_INLINE_BUTTONS_PER_ROW: usize = 8;
+
+impl InlineButton {
+    pub fn validate(&self, prefix_len: usize) -> Result<(), &'static str> {
+        if self.text.is_empty() || self.text.encode_utf16().count() > 64 {
+            return Err("button text must be 1..=64 utf16 units");
+        }
+        if self.data.is_empty()
+            || self.data.contains('\0')
+            || self.data.len() + prefix_len + 1 > MAX_INLINE_BUTTON_DATA_BYTES * 2
+        {
+            return Err("button data is too long");
+        }
+        Ok(())
+    }
+}
+
+pub fn validate_button_rows(
+    rows: &[Vec<InlineButton>],
+    prefix_len: usize,
+) -> Result<(), &'static str> {
+    if rows.len() > MAX_INLINE_ROWS {
+        return Err("too many button rows");
+    }
+    for row in rows {
+        if row.is_empty() || row.len() > MAX_INLINE_BUTTONS_PER_ROW {
+            return Err("button row must hold 1..=8 buttons");
+        }
+        for button in row {
+            button.validate(prefix_len)?;
+        }
+    }
+    Ok(())
+}
+
+/// The companion-bot interactive surface used by `inline.form`,
+/// `inline.answer`, and `message.editBot`. Implementations own the inline
+/// menu registry, the Bot API boundary, and the user-session inline bridge.
+pub trait HostInlineSurface: Send + Sync {
+    /// Publish the prepared menu and send it into `peer` as a via-bot
+    /// message. `data_prefix` is the `<module_id>|` callback namespace.
+    fn form<'a>(
+        &'a self,
+        peer: grammers_session::types::PeerId,
+        text: &'a str,
+        buttons: &'a [Vec<InlineButton>],
+        data_prefix: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+    /// Acknowledge a callback press (toast or alert).
+    fn answer<'a>(
+        &'a self,
+        callback_id: &'a str,
+        text: &'a str,
+        show_alert: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+    /// Redraw a bot-sent inline form message in place.
+    fn edit<'a>(
+        &'a self,
+        chat_id: i64,
+        message_id: i64,
+        text: &'a str,
+        buttons: &'a [Vec<InlineButton>],
+        data_prefix: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+}
+
 /// Narrow host-side validation boundary. Telegram mutation is deliberately
 /// supplied by the runtime integration, while this type owns capability and
 /// opaque-handle checks shared by production and tests.
 pub struct V6HostExecutor {
+    module_id: String,
     handles: Arc<Mutex<V6HandleRegistry>>,
     can_edit: bool,
     can_send_bot: bool,
+    inline_ok: bool,
     ledger: SharedSelfEditLedger,
     bot: Option<Arc<dyn HostBotSend>>,
+    inline: Option<Arc<dyn HostInlineSurface>>,
 }
 
 impl Default for V6HostExecutor {
@@ -100,31 +248,29 @@ impl V6HostExecutor {
     pub fn new() -> Self {
         Self::from_capability(false)
     }
-    pub fn from_descriptor(descriptor: &ExternalModuleDescriptor) -> Self {
-        Self::from_capability(
-            descriptor
-                .capabilities
-                .contains(&ExternalCapability::MessageEdit),
-        )
-    }
-    fn from_capability(can_edit: bool) -> Self {
+    pub fn from_capability(can_edit: bool) -> Self {
         Self::with_registry(
+            String::new(),
             can_edit,
             Arc::new(Mutex::new(V6HandleRegistry::new())),
             SharedSelfEditLedger::default(),
         )
     }
     pub(crate) fn with_registry(
+        module_id: String,
         can_edit: bool,
         handles: Arc<Mutex<V6HandleRegistry>>,
         ledger: SharedSelfEditLedger,
     ) -> Self {
         Self {
+            module_id,
             handles,
             can_edit,
             can_send_bot: false,
+            inline_ok: false,
             ledger,
             bot: None,
+            inline: None,
         }
     }
     pub(crate) fn with_bot_send(
@@ -135,6 +281,20 @@ impl V6HostExecutor {
         self.can_send_bot = can_send_bot;
         self.bot = bot;
         self
+    }
+    pub(crate) fn with_inline_surface(
+        mut self,
+        can_inline: bool,
+        surface: Option<Arc<dyn HostInlineSurface>>,
+    ) -> Self {
+        self.inline_ok = can_inline;
+        self.inline = surface;
+        self
+    }
+    /// Callback-data namespace: `<module_id>|<data>` keeps presses routable
+    /// to the owning module without trusting module-supplied routing.
+    pub(crate) fn data_prefix(&self) -> String {
+        format!("{}|", self.module_id)
     }
     pub fn validate_edit(&mut self, params: &MessageEditParams) -> Result<(), &'static str> {
         if !self.can_edit {
@@ -155,8 +315,106 @@ impl V6HostExecutor {
         match method {
             "message.edit" => self.execute_edit(params).await,
             "message.sendBot" => self.execute_send_bot(params).await,
+            "inline.form" => self.execute_inline_form(params).await,
+            "inline.answer" => self.execute_inline_answer(params).await,
+            "message.editBot" => self.execute_message_edit_bot(params).await,
             _ => Err("unknown host method"),
         }
+    }
+
+    async fn execute_inline_form(
+        &self,
+        params: Box<RawValue>,
+    ) -> Result<serde_json::Value, &'static str> {
+        if !self.inline_ok {
+            return Err("capability denied");
+        }
+        let surface = self.inline.as_ref().ok_or("inline surface unavailable")?;
+        let prefix = self.data_prefix();
+        let params: InlineFormParams =
+            serde_json::from_str(params.get()).map_err(|_| "invalid params")?;
+        params.validate(prefix.len())?;
+        let peer = self
+            .handles
+            .lock()
+            .map_err(|_| "invalid peer handle")?
+            .resolve_peer(&params.peer)
+            .map_err(|_| "invalid peer handle")?;
+        surface
+            .form(peer, &params.text, &params.buttons, &prefix)
+            .await
+            .map_err(|message| match message.as_str() {
+                "inline form rejected" => "inline form rejected",
+                "inline form timeout" => "inline form timeout",
+                _ => "inline form unavailable",
+            })?;
+        Ok(serde_json::Value::Null)
+    }
+
+    async fn execute_inline_answer(
+        &self,
+        params: Box<RawValue>,
+    ) -> Result<serde_json::Value, &'static str> {
+        if !self.inline_ok {
+            return Err("capability denied");
+        }
+        let surface = self.inline.as_ref().ok_or("inline surface unavailable")?;
+        let params: InlineAnswerParams =
+            serde_json::from_str(params.get()).map_err(|_| "invalid params")?;
+        params.validate()?;
+        surface
+            .answer(&params.callback_id, &params.text, params.show_alert)
+            .await
+            .map_err(|message| match message.as_str() {
+                "callback answer rejected" => "callback answer rejected",
+                "callback answer timeout" => "callback answer timeout",
+                _ => "callback answer unavailable",
+            })?;
+        Ok(serde_json::Value::Null)
+    }
+
+    async fn execute_message_edit_bot(
+        &self,
+        params: Box<RawValue>,
+    ) -> Result<serde_json::Value, &'static str> {
+        if !self.inline_ok {
+            return Err("capability denied");
+        }
+        let surface = self.inline.as_ref().ok_or("inline surface unavailable")?;
+        let prefix = self.data_prefix();
+        let params: MessageEditBotParams =
+            serde_json::from_str(params.get()).map_err(|_| "invalid params")?;
+        params.validate(prefix.len())?;
+        // The edit arrives back as a self-authored MessageEdited update; arm
+        // the ledger first so the runtime suppresses it before command
+        // routing sees module-controlled text.
+        let peer_id = peer_id_from_bot_chat_id(params.chat_id);
+        if let Some(peer_id) = peer_id {
+            let _ = self
+                .ledger
+                .register(peer_id, params.message_id as i32, params.text.clone());
+        }
+        let result = surface
+            .edit(
+                params.chat_id,
+                params.message_id,
+                &params.text,
+                &params.buttons,
+                &prefix,
+            )
+            .await
+            .map_err(|message| match message.as_str() {
+                "bot edit rejected" => "bot edit rejected",
+                "bot edit timeout" => "bot edit timeout",
+                _ => "bot edit unavailable",
+            });
+        if result.is_err()
+            && let Some(peer_id) = peer_id
+        {
+            self.ledger
+                .remove(peer_id, params.message_id as i32, &params.text);
+        }
+        result.map(|_| serde_json::Value::Null)
     }
 
     async fn execute_edit(&self, params: Box<RawValue>) -> Result<serde_json::Value, &'static str> {
@@ -218,6 +476,20 @@ impl V6HostExecutor {
                 _ => "bot send unavailable",
             })?;
         Ok(serde_json::Value::Null)
+    }
+}
+
+/// Bot API chat ids map onto MTProto peers by convention: users are
+/// positive, basic groups are negative small ids, and channels/supergroups
+/// carry the -100 prefix. Supergroup migration invalidates the mapping on
+/// the Bot API side only, which the ledger treats as a plain miss.
+fn peer_id_from_bot_chat_id(chat_id: i64) -> Option<PeerId> {
+    if chat_id >= 0 {
+        PeerId::user(chat_id)
+    } else if chat_id <= -1_000_000_000_000 {
+        PeerId::channel(-(chat_id + 1_000_000_000_000))
+    } else {
+        PeerId::chat(-chat_id)
     }
 }
 

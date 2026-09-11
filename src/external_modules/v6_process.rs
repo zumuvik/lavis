@@ -116,6 +116,7 @@ impl V6Process {
             restart_generation,
             crate::message_provenance::SharedSelfEditLedger::default(),
             None,
+            None,
         )
         .await
     }
@@ -126,6 +127,7 @@ impl V6Process {
         restart_generation: u64,
         self_edit_ledger: crate::message_provenance::SharedSelfEditLedger,
         bot_send: Option<Arc<dyn super::v6_host::HostBotSend>>,
+        bot_inline: Option<Arc<dyn super::v6_host::HostInlineSurface>>,
     ) -> Result<Self, V6StartFailure> {
         if descriptor.protocol_version != 6
             || !descriptor.entrypoint.starts_with(&descriptor.module_dir)
@@ -232,6 +234,7 @@ impl V6Process {
         let pending_handle_releases = Arc::new(Mutex::new(Vec::new()));
         let host = Arc::new(
             V6HostExecutor::with_registry(
+                descriptor.id.clone(),
                 descriptor
                     .capabilities
                     .contains(&super::manifest::ExternalCapability::MessageEdit),
@@ -243,6 +246,13 @@ impl V6Process {
                     .capabilities
                     .contains(&super::manifest::ExternalCapability::MessageSendBot),
                 bot_send,
+            )
+            .with_inline_surface(
+                descriptor
+                    .contract_revision
+                    .unwrap_or(super::protocol::V6_ALPHA_CONTRACT_REVISION)
+                    >= super::protocol::V6_INLINE_SINCE,
+                bot_inline,
             ),
         );
         tokio::spawn(supervise(
@@ -321,6 +331,29 @@ impl V6Process {
         let frame = self.event(request_id.clone(), event, payload).await?;
         match frame {
             V6InboundFrame::EventResult { actions, .. } => Ok((request_id, actions)),
+            V6InboundFrame::Error { message, .. } => Err(ExternalError::ModuleError(message)),
+            _ => Err(ExternalError::ProtocolDecode),
+        }
+    }
+
+    /// Push a companion-bot callback press to the module. Actions are not
+    /// consumed here: the module responds through host.invoke methods.
+    pub(crate) async fn dispatch_bot_callback(
+        &self,
+        payload: protocol::BotCallbackEvent,
+    ) -> Result<(), ExternalError> {
+        let request_id = protocol::request_id();
+        let frame = self
+            .request(
+                V6OutboundCoreFrame::BotCallbackEvent {
+                    request_id: request_id.clone(),
+                    payload,
+                },
+                Expected::EventResult,
+            )
+            .await?;
+        match frame {
+            V6InboundFrame::EventResult { .. } => Ok(()),
             V6InboundFrame::Error { message, .. } => Err(ExternalError::ModuleError(message)),
             _ => Err(ExternalError::ProtocolDecode),
         }
@@ -814,7 +847,11 @@ async fn supervise(
                             fatal_stage = "host";
                             break;
                         }
-                        if method != "message.edit" && method != "message.sendBot" {
+                        if !matches!(
+                            method.as_str(),
+                            "message.edit" | "message.sendBot" | "inline.form" | "inline.answer"
+                                | "message.editBot"
+                        ) {
                             fatal_reason = Some(FatalReason::ProtocolDecode);
                             fatal_stage = "host";
                             break;
@@ -1223,6 +1260,7 @@ fn outbound_stage(frame: &V6OutboundCoreFrame) -> &'static str {
         V6OutboundCoreFrame::Initialize { .. } => "initialize",
         V6OutboundCoreFrame::Execute { .. } => "execute",
         V6OutboundCoreFrame::Event { .. } => "event",
+        V6OutboundCoreFrame::BotCallbackEvent { .. } => "event",
         V6OutboundCoreFrame::Health { .. } => "health",
         V6OutboundCoreFrame::Shutdown { .. } => "shutdown",
         V6OutboundCoreFrame::TelegramResult { .. } => "rpc",
@@ -1560,6 +1598,7 @@ fn request_id(frame: &V6OutboundCoreFrame) -> Option<&str> {
         V6OutboundCoreFrame::Initialize { request_id, .. }
         | V6OutboundCoreFrame::Execute { request_id, .. }
         | V6OutboundCoreFrame::Event { request_id, .. }
+        | V6OutboundCoreFrame::BotCallbackEvent { request_id, .. }
         | V6OutboundCoreFrame::Health { request_id }
         | V6OutboundCoreFrame::Shutdown { request_id } => Some(request_id),
         V6OutboundCoreFrame::TelegramResult { .. } | V6OutboundCoreFrame::HostResult { .. } => None,
