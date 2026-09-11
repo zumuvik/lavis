@@ -55,10 +55,28 @@ impl RuntimeState {
         let locale = self.locale();
         match self.module_approvals.issue(pending) {
             Ok((id, _)) => match self.module_approvals.get(id) {
-                Ok(plan) => Response::plain_with_locale(
-                    locale,
-                    render_install_plan(locale, plan, id, &prefix),
-                ),
+                Ok(plan) => {
+                    let installed = match &self.external_manager {
+                        Some(handle) => {
+                            let manager = handle.lock().await;
+                            manager
+                                .descriptor_by_id(&plan.module_id)
+                                .map(|descriptor| descriptor.version.clone())
+                        }
+                        None => None,
+                    };
+                    let mut text = render_install_plan(locale, plan, id, &prefix);
+                    if let Some(current) = installed {
+                        text.push('\n');
+                        text.push_str(&lm_format(
+                            locale,
+                            LmText::UpdatePlanned,
+                            &plan.module_id,
+                            &current,
+                        ));
+                    }
+                    Response::plain_with_locale(locale, text)
+                }
                 Err(error) => {
                     tracing::warn!(
                         event = "external_module_approval_plan_unavailable",
@@ -109,6 +127,10 @@ impl RuntimeState {
         if let Some(handle) = &self.external_manager {
             let manager = handle.lock().await;
             if manager.descriptor_by_id(&module_id).is_some() {
+                // The duplicate rejection leaves this approval unredeemed;
+                // revoke it so the pending quota and the staged wrapper don't
+                // rot until TTL.
+                let _ = self.module_approvals.revoke(id);
                 return Response::plain_with_locale(
                     self.locale(),
                     lm_format(self.locale(), LmText::AlreadyRegistered, &module_id, ""),
