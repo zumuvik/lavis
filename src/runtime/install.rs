@@ -103,40 +103,20 @@ impl RuntimeState {
                 lm_text(self.locale(), LmText::ApprovalInvalid),
             );
         };
-        let Some(installation) = &self.module_installation else {
+        // Clone the install root up front: later steps need &mut self while
+        // the module installation still borrows it.
+        let Some(install_root) = self
+            .module_installation
+            .as_ref()
+            .map(|installation| installation.root.clone())
+        else {
             return Response::plain_with_locale(
                 self.locale(),
                 lm_text(self.locale(), LmText::InstallUnavailable),
             );
         };
-        let module_id = match self.module_approvals.get(id) {
-            Ok(plan) => plan.module_id.clone(),
-            Err(ApprovalError::Unavailable | ApprovalError::InvalidId) => {
-                return Response::plain_with_locale(
-                    self.locale(),
-                    lm_text(self.locale(), LmText::ApprovalInvalid),
-                );
-            }
-            Err(_) => {
-                return Response::plain_with_locale(
-                    self.locale(),
-                    lm_text(self.locale(), LmText::PlanUnavailable),
-                );
-            }
-        };
-        if let Some(handle) = &self.external_manager {
-            let manager = handle.lock().await;
-            if manager.descriptor_by_id(&module_id).is_some() {
-                // The duplicate rejection leaves this approval unredeemed;
-                // revoke it so the pending quota and the staged wrapper don't
-                // rot until TTL.
-                let _ = self.module_approvals.revoke(id);
-                return Response::plain_with_locale(
-                    self.locale(),
-                    lm_format(self.locale(), LmText::AlreadyRegistered, &module_id, ""),
-                );
-            }
-        }
+        // Redeem first so the pending quota and the staged wrapper are released
+        // for every outcome below, including duplicate and update failures.
         let pending = match self.module_approvals.redeem(id) {
             Ok(pending) => pending,
             Err(ApprovalError::Unavailable | ApprovalError::InvalidId) => {
@@ -152,21 +132,189 @@ impl RuntimeState {
                 );
             }
         };
+        let plan = pending.plan;
+        let module_id = plan.module_id.clone();
         let Some(wrapper) = pending.stage.take_wrapper() else {
             return Response::plain_with_locale(
                 self.locale(),
                 lm_text(self.locale(), LmText::VerifiedPackageUnavailable),
             );
         };
-        let installed = match crate::external_modules::installer::install_staged_module(
-            &wrapper,
-            &installation.root,
+        let redeem_failed_cleanup = |wrapper: &std::path::Path| {
+            if let Err(cleanup) =
+                crate::external_modules::installer::cleanup_redeemed_stage(wrapper)
+            {
+                tracing::warn!(
+                    event = "external_module_redeemed_stage_cleanup_failed",
+                    wrapper = %cleanup.wrapper.display(),
+                    ?cleanup.kind,
+                    "Could not remove redeemed external module staging"
+                );
+            }
+        };
+        if let Some(config) = &self.module_control {
+            match control::is_declaratively_managed(&config.declarative_state_path, &module_id) {
+                Ok(true) => {
+                    redeem_failed_cleanup(&wrapper);
+                    return Response::plain_with_locale(
+                        self.locale(),
+                        lm_text(self.locale(), LmText::Declarative),
+                    );
+                }
+                Err(_) => {
+                    redeem_failed_cleanup(&wrapper);
+                    return Response::plain_with_locale(
+                        self.locale(),
+                        lm_text(self.locale(), LmText::PlanUnavailable),
+                    );
+                }
+                Ok(false) => {}
+            }
+        }
+        let (was_enabled, previous_version) = match (&self.module_control, &self.external_manager) {
+            (Some(config), Some(handle)) => {
+                let state = match ExternalStateStore::load(config.state_path.clone()).await {
+                    Ok(state) => state,
+                    Err(_) => {
+                        redeem_failed_cleanup(&wrapper);
+                        return Response::plain_with_locale(
+                            self.locale(),
+                            lm_text(self.locale(), LmText::StateUnavailable),
+                        );
+                    }
+                };
+                let manager = handle.lock().await;
+                let previous = manager
+                    .descriptor_by_id(&module_id)
+                    .map(|descriptor| descriptor.version.clone());
+                (state.is_enabled(&module_id), previous)
+            }
+            _ => (false, None),
+        };
+        let Some(previous_version) = previous_version else {
+            return self
+                .confirm_fresh_install(&install_root, &wrapper, &plan, &module_id)
+                .await;
+        };
+        self.confirm_update(
+            &install_root,
+            wrapper,
+            &plan,
             &module_id,
+            previous_version,
+            was_enabled,
+        )
+        .await
+    }
+
+    async fn confirm_update(
+        &mut self,
+        install_root: &std::path::Path,
+        wrapper: std::path::PathBuf,
+        plan: &crate::external_modules::source_inspection::ModuleInstallPlan,
+        module_id: &str,
+        previous_version: String,
+        was_enabled: bool,
+    ) -> Response {
+        let backups_root = install_root
+            .parent()
+            .unwrap_or(install_root)
+            .join("module-backups");
+        if let Some(handle) = &self.external_manager {
+            handle.stop_module(module_id).await;
+        }
+        match crate::external_modules::installer::update_staged_module(
+            &wrapper,
+            install_root,
+            &backups_root,
+            module_id,
+        ) {
+            Ok(updated) => {
+                crate::external_modules::installer::prune_module_backups(
+                    &backups_root,
+                    module_id,
+                    &updated.backup_path,
+                );
+                if let Some(handle) = &self.external_manager {
+                    let mut manager = handle.lock().await;
+                    manager.replace_descriptor(updated.descriptor);
+                }
+                if was_enabled && let Some(handle) = &self.external_manager {
+                    handle
+                        .startup_enabled(&std::collections::BTreeSet::from([module_id.to_owned()]))
+                        .await;
+                }
+                let receipt = crate::external_modules::receipts::receipt_from_plan(
+                    plan,
+                    Some(previous_version.clone()),
+                    SystemTime::now(),
+                );
+                if let Err(error) = receipt {
+                    tracing::warn!(
+                        event = "external_module_receipt_build_failed",
+                        error = %error,
+                        "Updated external module receipt could not be built"
+                    );
+                } else if let Err(error) = crate::external_modules::receipts::write_receipt(
+                    &crate::external_modules::receipts::receipts_root(install_root),
+                    &receipt.unwrap(),
+                ) {
+                    tracing::warn!(
+                        event = "external_module_receipt_write_failed",
+                        error = %error,
+                        "Updated external module receipt could not be persisted"
+                    );
+                }
+                self.refresh_snapshot().await;
+                Response::plain_with_locale(
+                    self.locale(),
+                    lm_format(
+                        self.locale(),
+                        LmText::Updated,
+                        module_id,
+                        &format!("v{previous_version} → v{}", plan.module_version),
+                    ),
+                )
+            }
+            Err(error) => {
+                // The old generation is guaranteed to be back on disk; bring
+                // the old process up again under the still-registered
+                // descriptor.
+                if was_enabled && let Some(handle) = &self.external_manager {
+                    handle
+                        .startup_enabled(&std::collections::BTreeSet::from([module_id.to_owned()]))
+                        .await;
+                }
+                self.refresh_snapshot().await;
+                Response::plain_with_locale(
+                    self.locale(),
+                    lm_format(
+                        self.locale(),
+                        LmText::UpdateFailed,
+                        module_id,
+                        error.reason(),
+                    ),
+                )
+            }
+        }
+    }
+
+    async fn confirm_fresh_install(
+        &mut self,
+        install_root: &std::path::Path,
+        wrapper: &std::path::Path,
+        plan: &crate::external_modules::source_inspection::ModuleInstallPlan,
+        module_id: &str,
+    ) -> Response {
+        let installed = match crate::external_modules::installer::install_staged_module(
+            wrapper,
+            install_root,
+            module_id,
         ) {
             Ok(installed) => installed,
             Err(error) => {
                 if let Err(cleanup) =
-                    crate::external_modules::installer::cleanup_redeemed_stage(&wrapper)
+                    crate::external_modules::installer::cleanup_redeemed_stage(wrapper)
                 {
                     tracing::warn!(
                         event = "external_module_redeemed_stage_cleanup_failed",
@@ -186,6 +334,17 @@ impl RuntimeState {
                 };
             }
         };
+        if let Err(error) = crate::external_modules::receipts::write_receipt(
+            &crate::external_modules::receipts::receipts_root(install_root),
+            &crate::external_modules::receipts::receipt_from_plan(plan, None, SystemTime::now())
+                .expect("plan receipt build cannot fail for a validated plan"),
+        ) {
+            tracing::warn!(
+                event = "external_module_receipt_write_failed",
+                error = %error,
+                "Installed external module receipt could not be persisted"
+            );
+        }
         if let Some(handle) = &self.external_manager {
             let registered = {
                 let mut manager = handle.lock().await;
@@ -200,14 +359,14 @@ impl RuntimeState {
                 self.refresh_snapshot().await;
                 return Response::plain_with_locale(
                     self.locale(),
-                    lm_format(self.locale(), LmText::RegistrationConflict, &module_id, ""),
+                    lm_format(self.locale(), LmText::RegistrationConflict, module_id, ""),
                 );
             }
         }
         self.refresh_snapshot().await;
         Response::plain_with_locale(
             self.locale(),
-            lm_format(self.locale(), LmText::InstalledDisabled, &module_id, ""),
+            lm_format(self.locale(), LmText::InstalledDisabled, module_id, ""),
         )
     }
 

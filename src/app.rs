@@ -404,6 +404,13 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
                 "Could not remove abandoned external module staging"
             );
         }
+        external_modules::installer::reconcile_module_backups(
+            &module_root,
+            &module_root
+                .parent()
+                .context("external module root has no parent")?
+                .join("module-backups"),
+        );
 
         let descriptors = external_modules::manifest::discover_modules(&module_root)
             .unwrap_or_else(|error| {

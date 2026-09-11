@@ -294,26 +294,37 @@ impl RuntimeState {
                     &module.id,
                 )
                 .await;
-                Response::plain_with_locale(
-                    self.locale(),
-                    render_lm_info(
+                let mut body = render_lm_info(
+                    locale,
+                    LmInfoResponse {
+                        display_name: &module.display_name,
+                        id: &module.id,
+                        version: &module.version,
+                        author: &module.author,
+                        enabled: enabled_label(locale, module.enabled),
+                        management: management_label(locale, module.management),
+                        entrypoint: &module.entrypoint,
+                        protocol_version: module.protocol_version,
+                        capabilities: &capabilities,
+                        commands: &commands,
+                        runtime: &runtime,
+                        diagnostic: diagnostic.as_deref(),
+                    },
+                );
+                if let Ok(Some(receipt)) = crate::external_modules::receipts::read_receipt(
+                    &crate::external_modules::receipts::receipts_root(&config.root),
+                    &module.id,
+                ) {
+                    let digest_short: String = receipt.archive_digest.chars().take(12).collect();
+                    body.push('\n');
+                    body.push_str(&lm_format(
                         locale,
-                        LmInfoResponse {
-                            display_name: &module.display_name,
-                            id: &module.id,
-                            version: &module.version,
-                            author: &module.author,
-                            enabled: enabled_label(locale, module.enabled),
-                            management: management_label(locale, module.management),
-                            entrypoint: &module.entrypoint,
-                            protocol_version: module.protocol_version,
-                            capabilities: &capabilities,
-                            commands: &commands,
-                            runtime: &runtime,
-                            diagnostic: diagnostic.as_deref(),
-                        },
-                    ),
-                )
+                        LmText::ReceiptLine,
+                        &module.id,
+                        &format!("v{} · sha256:{}…", receipt.version, digest_short),
+                    ));
+                }
+                Response::plain_with_locale(self.locale(), body)
             }
             Err(control::ModuleControlError::InvalidInstalledModule) => {
                 Response::plain_with_locale(

@@ -11,6 +11,7 @@ pub mod manager;
 pub mod manifest;
 pub mod process;
 pub mod protocol;
+pub mod receipts;
 pub mod source_inspection;
 pub mod state;
 pub mod v6_executor;

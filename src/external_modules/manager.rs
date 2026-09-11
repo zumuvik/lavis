@@ -211,6 +211,20 @@ impl ExternalManager {
         self.descriptors.iter().find(|d| d.id == id)
     }
 
+    /// Replaces the descriptor for `descriptor.id`, keeping the vec order
+    /// stable, or appends it when the id is not registered yet. Used by the
+    /// update flow, where the new generation is already validated on disk.
+    pub fn replace_descriptor(&mut self, descriptor: ExternalModuleDescriptor) {
+        match self.descriptors.iter_mut().find(|d| d.id == descriptor.id) {
+            Some(existing) => *existing = descriptor,
+            None => self.descriptors.push(descriptor),
+        }
+    }
+
+    pub fn remove_descriptor(&mut self, id: &str) {
+        self.descriptors.retain(|d| d.id != id);
+    }
+
     pub fn has_running_process(&self, id: &str) -> bool {
         self.processes
             .get(id)
@@ -689,6 +703,18 @@ impl ExternalManagerHandle {
         }
     }
 
+    /// Removes a single module from the process index and shuts its process
+    /// down gracefully. Missing or already-stopped modules are a no-op.
+    pub async fn stop_module(&self, module_id: &str) {
+        let process = {
+            let mut manager = self.inner.lock().await;
+            manager.processes.remove(module_id)
+        };
+        if let Some(process) = process {
+            shutdown_process(module_id, process).await;
+        }
+    }
+
     pub async fn dispatch_event(
         &self,
         module_id: &str,
@@ -920,6 +946,46 @@ mod tests {
         assert_eq!(manager.descriptor_by_id("sample").unwrap().version, "1.0");
         assert!(!manager.has_running_process("sample"));
         assert!(manager.command_refs().is_empty());
+    }
+
+    #[test]
+    fn replace_descriptor_updates_in_place_and_appends_missing_ids() {
+        let mut manager = ExternalManager::new();
+        manager.set_descriptors(vec![descriptor("a", "1"), descriptor("b", "1")]);
+        manager.replace_descriptor(descriptor("b", "2"));
+        assert_eq!(manager.descriptor_by_id("b").unwrap().version, "2");
+        let order: Vec<&str> = manager
+            .descriptors()
+            .iter()
+            .map(|d| d.id.as_str())
+            .collect();
+        assert_eq!(order, vec!["a", "b"]);
+        manager.replace_descriptor(descriptor("c", "1"));
+        let order: Vec<&str> = manager
+            .descriptors()
+            .iter()
+            .map(|d| d.id.as_str())
+            .collect();
+        assert_eq!(order, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn remove_descriptor_drops_only_the_target_id() {
+        let mut manager = ExternalManager::new();
+        manager.set_descriptors(vec![descriptor("a", "1"), descriptor("b", "1")]);
+        manager.remove_descriptor("a");
+        assert!(manager.descriptor_by_id("a").is_none());
+        assert!(manager.descriptor_by_id("b").is_some());
+        // Removing an unknown id is a no-op.
+        manager.remove_descriptor("missing");
+        assert!(manager.descriptor_by_id("b").is_some());
+    }
+
+    #[tokio::test]
+    async fn stop_module_is_a_no_op_for_missing_processes() {
+        let handle = super::ExternalManagerHandle::new(ExternalManager::new());
+        handle.stop_module("sample").await;
+        assert!(!handle.lock().await.has_running_process("sample"));
     }
 
     #[test]

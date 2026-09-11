@@ -942,6 +942,9 @@ pub enum LmText {
     ApprovalInvalid,
     AlreadyRegistered,
     UpdatePlanned,
+    Updated,
+    UpdateFailed,
+    ReceiptLine,
     VerifiedPackageUnavailable,
     InstallRollbackFailed,
     InstallValidationFailed,
@@ -1049,6 +1052,16 @@ pub fn lm_text(locale: Locale, key: LmText) -> &'static str {
         (Locale::Russian, LmText::UpdatePlanned) => {
             "♻️ Модуль {id} уже установлен (v{detail}) — подтверждение заменит его."
         }
+        (Locale::English, LmText::Updated) => "✅ Module {id} updated ({detail}).",
+        (Locale::Russian, LmText::Updated) => "✅ Модуль {id} обновлён ({detail}).",
+        (Locale::English, LmText::UpdateFailed) => {
+            "⚠️ Update of {id} failed — the previous version was restored. {detail}"
+        }
+        (Locale::Russian, LmText::UpdateFailed) => {
+            "⚠️ Обновление {id} не удалось — прежняя версия восстановлена. {detail}"
+        }
+        (Locale::English, LmText::ReceiptLine) => "🧾 Installed: {detail}",
+        (Locale::Russian, LmText::ReceiptLine) => "🧾 Установлен: {detail}",
         (Locale::English, LmText::VerifiedPackageUnavailable) => {
             "⚠️ The verified package is unavailable."
         }
@@ -1711,6 +1724,9 @@ mod tests {
             LmText::ApprovalInvalid,
             LmText::AlreadyRegistered,
             LmText::UpdatePlanned,
+            LmText::Updated,
+            LmText::UpdateFailed,
+            LmText::ReceiptLine,
             LmText::Cancelled,
         ] {
             let english = lm_format(Locale::English, key, "fixture", ".");

@@ -230,6 +230,16 @@ fn management_for(id: &str, declarative_ids: &BTreeSet<String>) -> ModuleManagem
     }
 }
 
+/// Whether `id` is managed declaratively (NixOS) and must never be mutated by
+/// manual flows such as `lm install` updates.
+pub fn is_declaratively_managed(
+    declarative_state_path: &Path,
+    id: &str,
+) -> Result<bool, ModuleControlError> {
+    validate_module_id(id).map_err(|_| ModuleControlError::InvalidModuleId)?;
+    Ok(load_declarative_ids(declarative_state_path)?.contains(id))
+}
+
 fn to_info(
     descriptor: ExternalModuleDescriptor,
     enabled: bool,
