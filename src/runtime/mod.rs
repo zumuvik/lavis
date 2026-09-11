@@ -401,7 +401,7 @@ impl RuntimeState {
             SetupPhase::AwaitingUsername { deadline, .. }
             | SetupPhase::AwaitingConfirmation { deadline, .. }
             | SetupPhase::Running { deadline, .. } => Some(*deadline),
-            SetupPhase::Idle => None,
+            SetupPhase::Idle | SetupPhase::EnablingInline { .. } => None,
         }
     }
 
@@ -422,6 +422,7 @@ impl RuntimeState {
         Some(Response::plain(setup_text(locale, SetupText::TimedOut)))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn handle_setup_input(
         &mut self,
         client: &Client,
@@ -430,6 +431,7 @@ impl RuntimeState {
         outgoing: bool,
         edited: bool,
         text: &str,
+        buttons: &[crate::setup_telegram::BotFatherButton],
     ) -> SetupInput {
         let locale = self.locale();
         let Some(setup) = &mut self.setup else {
@@ -442,7 +444,9 @@ impl RuntimeState {
                     provision: None,
                 };
             }
-            let outcome = setup.handle_botfather_reply(client, text, locale).await;
+            let outcome = setup
+                .handle_botfather_reply(client, text, buttons, locale)
+                .await;
             let resolved = setup.botfather_peer.is_some();
             if resolved {
                 self.external_projection_permitted = true;

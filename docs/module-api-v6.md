@@ -342,8 +342,11 @@ companion-bot credentials exclusively.
 The host runs a Bot API `getUpdates` long-poll loop for the companion bot with
 `allowed_updates: ["inline_query", "callback_query"]`. Callback presses
 authored by users other than the signed-in user are rejected host-side and
-never reach any module. Operator requirement: inline mode must be enabled for
-the companion bot via BotFather, otherwise `inline_query` updates are never
+never reach any module. Inline mode is a BotFather conversation setting with
+no Bot API equivalent: Lavis drives that conversation automatically — it
+enables inline mode right after creating the companion bot and on
+`,setup repair`. If the automated flow fails, enable it manually with
+`/setinline` at @BotFather, otherwise `inline_query` updates are never
 delivered.
 
 #### `message.sendBot`

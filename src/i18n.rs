@@ -224,6 +224,9 @@ pub enum SetupText {
     RepairTokenUnsafe,
     RepairTokenMismatch,
     RepairIdentitySaveFailed,
+    InlineEnabling,
+    InlineEnabled,
+    InlineFailed,
     ProvisionCompleted,
     ProvisionWithoutCommunity,
     ProvisionWithoutFolderCapacity,
@@ -379,6 +382,20 @@ pub fn setup_text(locale: Locale, key: SetupText) -> &'static str {
         (Locale::English, SetupText::RepairStarted) => "⏳ Companion workspace repair started.",
         (Locale::Russian, SetupText::RepairStarted) => {
             "⏳ Восстановление companion workspace начато."
+        }
+        (Locale::English, SetupText::InlineEnabling) => "⚙️ Enabling inline mode for the bot…",
+        (Locale::Russian, SetupText::InlineEnabling) => "⚙️ Включаю inline-режим у бота…",
+        (Locale::English, SetupText::InlineEnabled) => {
+            "✅ Inline mode enabled — module inline menus are ready."
+        }
+        (Locale::Russian, SetupText::InlineEnabled) => {
+            "✅ Inline-режим включён — инлайн-меню модулей готовы."
+        }
+        (Locale::English, SetupText::InlineFailed) => {
+            "⚠️ Could not enable inline mode automatically. Enable it manually: /setinline with @BotFather."
+        }
+        (Locale::Russian, SetupText::InlineFailed) => {
+            "⚠️ Не удалось включить inline-режим автоматически. Включи вручную: /setinline у @BotFather."
         }
         (Locale::English, SetupText::RepairNoData) => "⚠️ No safe data is available for repair.",
         (Locale::Russian, SetupText::RepairNoData) => {

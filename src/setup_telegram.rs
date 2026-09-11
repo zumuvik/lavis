@@ -92,16 +92,29 @@ fn provision_outcome(result: ProvisionResult) -> ProvisionOutcome {
 pub type SetupFuture<'a> =
     Pin<Box<dyn Future<Output = Result<(), SetupTelegramError>> + Send + 'a>>;
 
+/// A callback button from a BotFather reply. `data` is the raw callback
+/// payload required by `messages.getBotCallbackAnswer`.
+#[derive(Clone, Debug)]
+pub struct BotFatherButton {
+    pub msg_id: i32,
+    pub text: String,
+    pub data: Vec<u8>,
+}
+
 /// MTProto boundary. The production adapter is intentionally responsible for
 /// raw grammers calls (channel/forum/topic/admin/folder); orchestration never
 /// deals in raw TL fields.
 pub trait TelegramSetup: Send + Sync {
     fn send_botfather<'a>(&'a self, text: &'a str) -> SetupFuture<'a>;
+    fn press_botfather_button<'a>(&'a self, _msg_id: i32, _data: &'a [u8]) -> SetupFuture<'a> {
+        Box::pin(async { Err(SetupTelegramError::Telegram) })
+    }
 }
 
 /// Production delivery adapter. `PeerRef` is obtained from
 /// `Client::resolve_username("BotFather")` and retains the access hash needed
 /// by `Client::send_message`.
+#[derive(Clone)]
 pub struct GrammersTelegramSetup {
     client: Client,
     botfather: PeerRef,
@@ -140,6 +153,29 @@ impl TelegramSetup for GrammersTelegramSetup {
             tokio::time::timeout(BOTFATHER_OPERATION_TIMEOUT, async {
                 self.client
                     .send_message(self.botfather, InputMessage::new().text(text))
+                    .await
+                    .map(|_| ())
+                    .map_err(|_| SetupTelegramError::Telegram)
+            })
+            .await
+            .map_err(|_| SetupTelegramError::Timeout)?
+        })
+    }
+
+    fn press_botfather_button<'a>(&'a self, msg_id: i32, data: &'a [u8]) -> SetupFuture<'a> {
+        Box::pin(async move {
+            tokio::time::timeout(BOTFATHER_OPERATION_TIMEOUT, async {
+                let peer = grammers_client::tl::enums::InputPeer::from(&self.botfather);
+                self.client
+                    .invoke(
+                        &grammers_client::tl::functions::messages::GetBotCallbackAnswer {
+                            game: false,
+                            peer,
+                            msg_id,
+                            data: Some(data.to_vec()),
+                            password: None,
+                        },
+                    )
                     .await
                     .map(|_| ())
                     .map_err(|_| SetupTelegramError::Telegram)
@@ -272,6 +308,10 @@ impl CompanionSetup {
         Ok(BotFatherProgress::Pending)
     }
 
+    pub fn username(&self) -> String {
+        self.username.normalized().to_owned()
+    }
+
     pub fn provision_request(&self, client: Client) -> ProvisionRequest {
         ProvisionRequest::new(
             client,
@@ -347,6 +387,120 @@ fn is_cancel_acknowledgement(text: &str) -> bool {
         || text.contains("no active conversation")
 }
 
+pub const INLINE_PLACEHOLDER: &str = "Что спросить у Lavis?";
+pub const INLINE_DESCRIPTION: &str = "Lavis companion bot";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InlineEnableProgress {
+    Pending,
+    Enabled,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InlinePrompt {
+    Placeholder,
+    Description,
+    Result,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InlineStep {
+    SetInlineSent,
+    ChooseBot,
+    Prompt(InlinePrompt),
+    Done,
+}
+
+/// A BotFather conversation that enables inline mode for an existing bot via
+/// `/setinline`. It runs only after the companion bot is provisioned, so it
+/// never races the `/newbot` machine.
+pub struct InlineEnableSetup {
+    username: String,
+    step: InlineStep,
+}
+
+impl InlineEnableSetup {
+    pub fn new(username: String) -> Self {
+        Self {
+            username,
+            step: InlineStep::SetInlineSent,
+        }
+    }
+
+    pub async fn start(&mut self, telegram: &impl TelegramSetup) -> Result<(), SetupTelegramError> {
+        // Clearing a stale BotFather flow is best effort. Its reply is not a
+        // prerequisite for this new conversation.
+        let _ = send_with_timeout(telegram, "/cancel").await;
+        self.step = InlineStep::ChooseBot;
+        send_with_timeout(telegram, "/setinline").await
+    }
+
+    pub async fn on_botfather_reply(
+        &mut self,
+        text: &str,
+        buttons: &[BotFatherButton],
+        telegram: &impl TelegramSetup,
+    ) -> Result<InlineEnableProgress, SetupTelegramError> {
+        if self.step == InlineStep::Done {
+            return Ok(InlineEnableProgress::Enabled);
+        }
+        let lowercase = text.to_ascii_lowercase();
+        match self.step {
+            InlineStep::SetInlineSent | InlineStep::Done => {}
+            InlineStep::ChooseBot => {
+                if !buttons.is_empty() {
+                    let matched = buttons
+                        .iter()
+                        .find(|button| button.text.to_ascii_lowercase().contains(&self.username));
+                    match matched {
+                        Some(button) => {
+                            telegram
+                                .press_botfather_button(button.msg_id, &button.data)
+                                .await?;
+                        }
+                        None => {
+                            self.step = InlineStep::Done;
+                            return Ok(InlineEnableProgress::Failed);
+                        }
+                    }
+                } else if is_inline_choose_bot_prompt(&lowercase) {
+                    send_with_timeout(telegram, &format!("@{}", self.username)).await?;
+                } else {
+                    return Ok(InlineEnableProgress::Pending);
+                }
+                self.step = InlineStep::Prompt(InlinePrompt::Placeholder);
+            }
+            InlineStep::Prompt(prompt) => {
+                if is_inline_success(&lowercase) {
+                    self.step = InlineStep::Done;
+                    return Ok(InlineEnableProgress::Enabled);
+                }
+                match prompt {
+                    InlinePrompt::Placeholder if lowercase.contains("placeholder") => {
+                        send_with_timeout(telegram, INLINE_PLACEHOLDER).await?;
+                        self.step = InlineStep::Prompt(InlinePrompt::Description);
+                    }
+                    InlinePrompt::Description if lowercase.contains("description") => {
+                        send_with_timeout(telegram, INLINE_DESCRIPTION).await?;
+                        self.step = InlineStep::Prompt(InlinePrompt::Result);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(InlineEnableProgress::Pending)
+    }
+}
+
+fn is_inline_choose_bot_prompt(text: &str) -> bool {
+    text.contains("choose a bot")
+}
+
+fn is_inline_success(text: &str) -> bool {
+    text.contains("success") || text.contains("enabled")
+}
+
 async fn send_with_timeout(
     telegram: &impl TelegramSetup,
     text: &str,
@@ -372,10 +526,20 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::{Arc, Mutex};
 
-    struct TelegramMock(Arc<Mutex<Vec<String>>>);
+    type PressedLog = Arc<Mutex<Vec<(i32, Vec<u8>)>>>;
+    struct TelegramMock(Arc<Mutex<Vec<String>>>, PressedLog);
+    impl TelegramMock {
+        fn new(sent: Arc<Mutex<Vec<String>>>) -> Self {
+            Self(sent, Arc::new(Mutex::new(Vec::new())))
+        }
+    }
     impl TelegramSetup for TelegramMock {
         fn send_botfather<'a>(&'a self, text: &'a str) -> SetupFuture<'a> {
             self.0.lock().unwrap().push(text.into());
+            Box::pin(async { Ok(()) })
+        }
+        fn press_botfather_button<'a>(&'a self, msg_id: i32, data: &'a [u8]) -> SetupFuture<'a> {
+            self.1.lock().unwrap().push((msg_id, data.to_vec()));
             Box::pin(async { Ok(()) })
         }
     }
@@ -408,7 +572,7 @@ mod tests {
     #[tokio::test]
     async fn advances_botfather_conversation_only_after_replies() {
         let sent = Arc::new(Mutex::new(Vec::new()));
-        let telegram = TelegramMock(sent.clone());
+        let telegram = TelegramMock::new(sent.clone());
         let path = std::env::temp_dir().join(format!("lavis-setup-{}", std::process::id()));
         std::fs::create_dir_all(&path).unwrap();
         #[cfg(unix)]
@@ -475,7 +639,7 @@ mod tests {
     #[tokio::test]
     async fn ignores_delayed_cancel_reply_until_the_expected_prompt_arrives() {
         let sent = Arc::new(Mutex::new(Vec::new()));
-        let telegram = TelegramMock(sent.clone());
+        let telegram = TelegramMock::new(sent.clone());
         let mut setup = CompanionSetup::new(
             crate::setup::validate_username("lavis_test_bot").unwrap(),
             PathBuf::new(),
@@ -500,7 +664,7 @@ mod tests {
 
     #[tokio::test]
     async fn limit_and_flood_are_terminal_before_any_expected_prompt() {
-        let telegram = TelegramMock(Arc::new(Mutex::new(Vec::new())));
+        let telegram = TelegramMock::new(Arc::new(Mutex::new(Vec::new())));
         for step in [Step::NewBot, Step::DisplayName, Step::Username] {
             for (reply, expected) in [
                 ("Too many bots", BotFatherProgress::LimitReached),
@@ -526,7 +690,7 @@ mod tests {
     #[tokio::test]
     async fn validated_identity_is_durable_before_the_validated_stage() {
         let sent = Arc::new(Mutex::new(Vec::new()));
-        let telegram = TelegramMock(sent);
+        let telegram = TelegramMock::new(sent);
         let path =
             std::env::temp_dir().join(format!("lavis-setup-identity-{}", std::process::id()));
         std::fs::create_dir_all(&path).unwrap();
@@ -561,6 +725,100 @@ mod tests {
         assert!(state.stages.bot_created);
         assert_eq!(state.status, "bot_validated");
         let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn inline_enable_presses_matching_button_and_completes() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let telegram = TelegramMock::new(sent.clone());
+        let pressed = telegram.1.clone();
+        let buttons = [
+            BotFatherButton {
+                msg_id: 10,
+                text: "@someone_else".into(),
+                data: b"x".to_vec(),
+            },
+            BotFatherButton {
+                msg_id: 11,
+                text: "🤖 @lavis_test_bot".into(),
+                data: b"cb1".to_vec(),
+            },
+        ];
+        let mut setup = InlineEnableSetup::new("lavis_test_bot".into());
+        setup.start(&telegram).await.unwrap();
+        assert_eq!(*sent.lock().unwrap(), ["/cancel", "/setinline"]);
+        let mut progress = setup
+            .on_botfather_reply("Choose a bot to change inline status.", &buttons, &telegram)
+            .await
+            .unwrap();
+        assert_eq!(progress, InlineEnableProgress::Pending);
+        assert_eq!(*pressed.lock().unwrap(), [(11, b"cb1".to_vec())]);
+        progress = setup
+            .on_botfather_reply("Input inline placeholder for the bot.", &[], &telegram)
+            .await
+            .unwrap();
+        assert_eq!(progress, InlineEnableProgress::Pending);
+        assert_eq!(sent.lock().unwrap().last().unwrap(), INLINE_PLACEHOLDER);
+        progress = setup
+            .on_botfather_reply("Success! Inline mode for the bot enabled.", &[], &telegram)
+            .await
+            .unwrap();
+        assert_eq!(progress, InlineEnableProgress::Enabled);
+    }
+
+    #[tokio::test]
+    async fn inline_enable_fails_without_matching_button() {
+        let telegram = TelegramMock::new(Arc::new(Mutex::new(Vec::new())));
+        let buttons = [BotFatherButton {
+            msg_id: 10,
+            text: "@someone_else".into(),
+            data: b"x".to_vec(),
+        }];
+        let mut setup = InlineEnableSetup::new("lavis_test_bot".into());
+        setup.start(&telegram).await.unwrap();
+        let progress = setup
+            .on_botfather_reply("Choose a bot:", &buttons, &telegram)
+            .await
+            .unwrap();
+        assert_eq!(progress, InlineEnableProgress::Failed);
+    }
+
+    #[tokio::test]
+    async fn inline_enable_tolerates_missing_description_prompt() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let telegram = TelegramMock::new(sent.clone());
+        let mut setup = InlineEnableSetup::new("lavis_test_bot".into());
+        setup.start(&telegram).await.unwrap();
+        assert_eq!(
+            setup
+                .on_botfather_reply("Choose a bot for inline mode.", &[], &telegram,)
+                .await
+                .unwrap(),
+            InlineEnableProgress::Pending
+        );
+        assert_eq!(sent.lock().unwrap().last().unwrap(), "@lavis_test_bot");
+        assert_eq!(
+            setup
+                .on_botfather_reply("Input inline placeholder:", &[], &telegram)
+                .await
+                .unwrap(),
+            InlineEnableProgress::Pending
+        );
+        assert_eq!(sent.lock().unwrap().last().unwrap(), INLINE_PLACEHOLDER);
+        assert_eq!(
+            setup
+                .on_botfather_reply("Success! Enabled.", &[], &telegram)
+                .await
+                .unwrap(),
+            InlineEnableProgress::Enabled
+        );
+        assert!(
+            !sent
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|text| text == INLINE_DESCRIPTION)
+        );
     }
 
     #[test]

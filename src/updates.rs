@@ -912,6 +912,7 @@ async fn process_update(
     let setup_input = if matches!(&action, Some(Action::Setup(_))) {
         None
     } else {
+        let botfather_buttons = botfather_buttons(&message);
         match runtime
             .handle_setup_input(
                 client,
@@ -920,6 +921,7 @@ async fn process_update(
                 outgoing,
                 edited,
                 message.text(),
+                &botfather_buttons,
             )
             .await
         {
@@ -1259,6 +1261,28 @@ pub(crate) fn receipt_target_from_peer_ref(peer: PeerRef) -> ReceiptTarget {
             access_hash: peer.auth.hash(),
         },
     }
+}
+
+fn botfather_buttons(
+    message: &grammers_client::update::Message,
+) -> Vec<crate::setup_telegram::BotFatherButton> {
+    let Some(tl::enums::ReplyMarkup::ReplyInlineMarkup(markup)) = message.reply_markup() else {
+        return Vec::new();
+    };
+    let mut buttons = Vec::new();
+    for row in &markup.rows {
+        let tl::enums::KeyboardButtonRow::Row(row) = row;
+        for button in &row.buttons {
+            if let tl::enums::KeyboardButton::Callback(callback) = button {
+                buttons.push(crate::setup_telegram::BotFatherButton {
+                    msg_id: message.id(),
+                    text: callback.text.clone(),
+                    data: callback.data.clone(),
+                });
+            }
+        }
+    }
+    buttons
 }
 
 fn peer_ref_from_receipt_target(target: &ReceiptTarget) -> Option<PeerRef> {

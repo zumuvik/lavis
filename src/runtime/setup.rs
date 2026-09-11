@@ -27,6 +27,10 @@ pub(super) enum SetupPhase {
         attempts: u8,
         deadline: Instant,
     },
+    EnablingInline {
+        flow: crate::setup_telegram::InlineEnableSetup,
+        transport: GrammersTelegramSetup,
+    },
 }
 
 pub(super) struct BotFatherOutcome {
@@ -223,8 +227,37 @@ impl SetupCoordinator {
         &mut self,
         client: &Client,
         text: &str,
+        buttons: &[crate::setup_telegram::BotFatherButton],
         locale: Locale,
     ) -> BotFatherOutcome {
+        if let SetupPhase::EnablingInline { flow, transport } = &mut self.phase {
+            let result = flow.on_botfather_reply(text, buttons, transport).await;
+            let outcome = match result {
+                Ok(crate::setup_telegram::InlineEnableProgress::Enabled) => BotFatherOutcome {
+                    response: Some(Response::plain(setup_text(
+                        locale,
+                        SetupText::InlineEnabled,
+                    ))),
+                    provision: None,
+                },
+                Ok(crate::setup_telegram::InlineEnableProgress::Failed) => BotFatherOutcome {
+                    response: Some(Response::plain(setup_text(locale, SetupText::InlineFailed))),
+                    provision: None,
+                },
+                Ok(crate::setup_telegram::InlineEnableProgress::Pending) => BotFatherOutcome {
+                    response: None,
+                    provision: None,
+                },
+                Err(_) => BotFatherOutcome {
+                    response: Some(Response::plain(setup_text(locale, SetupText::InlineFailed))),
+                    provision: None,
+                },
+            };
+            if outcome.response.is_some() {
+                self.phase = SetupPhase::Idle;
+            }
+            return outcome;
+        }
         let SetupPhase::Running {
             flow,
             transport,
@@ -261,7 +294,16 @@ impl SetupCoordinator {
             }
             Ok(BotFatherProgress::ProvisionReady) => {
                 let request = flow.provision_request(client.clone());
-                self.phase = SetupPhase::Idle;
+                let mut inline = crate::setup_telegram::InlineEnableSetup::new(flow.username());
+                let started = inline.start(transport).await.is_ok();
+                self.phase = if started {
+                    SetupPhase::EnablingInline {
+                        flow: inline,
+                        transport: transport.clone(),
+                    }
+                } else {
+                    SetupPhase::Idle
+                };
                 BotFatherOutcome {
                     response: None,
                     provision: Some(request),
@@ -414,7 +456,7 @@ impl SetupCoordinator {
         })
     }
 
-    pub(super) async fn repair(&self, client: &Client, locale: Locale) -> RuntimeExecution {
+    pub(super) async fn repair(&mut self, client: &Client, locale: Locale) -> RuntimeExecution {
         let api = match HttpBotApi::new() {
             Ok(api) => api,
             Err(_) => {
@@ -426,25 +468,49 @@ impl SetupCoordinator {
     }
 
     pub(super) async fn repair_with_api(
-        &self,
+        &mut self,
         client: &Client,
         bot_api: &impl BotApi,
         locale: Locale,
     ) -> RuntimeExecution {
         match self.repair_preflight(bot_api, locale).await {
-            Ok(username) => RuntimeExecution {
-                response: Response::plain(setup_text(locale, SetupText::RepairStarted)),
-                provision: Some(ProvisionRequest::new(
+            Ok(username) => {
+                let provision = ProvisionRequest::new(
                     client.clone(),
                     self.state_path.clone(),
                     self.token_path.clone(),
-                    username,
-                )),
-                shutdown: None,
-                post_edit: None,
-                onboarding_page: false,
-                media: None,
-            },
+                    username.clone(),
+                );
+                if let Ok((transport, peer)) = GrammersTelegramSetup::resolve(client).await {
+                    let mut inline = crate::setup_telegram::InlineEnableSetup::new(username);
+                    if inline.start(&transport).await.is_ok() {
+                        self.botfather_peer = Some(peer);
+                        self.phase = SetupPhase::EnablingInline {
+                            flow: inline,
+                            transport,
+                        };
+                        return RuntimeExecution {
+                            response: Response::plain(setup_text(
+                                locale,
+                                SetupText::InlineEnabling,
+                            )),
+                            provision: Some(provision),
+                            shutdown: None,
+                            post_edit: None,
+                            onboarding_page: false,
+                            media: None,
+                        };
+                    }
+                }
+                RuntimeExecution {
+                    response: Response::plain(setup_text(locale, SetupText::RepairStarted)),
+                    provision: Some(provision),
+                    shutdown: None,
+                    post_edit: None,
+                    onboarding_page: false,
+                    media: None,
+                }
+            }
             Err(response) => response.into(),
         }
     }
