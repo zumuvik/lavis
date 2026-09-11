@@ -27,7 +27,6 @@ const (
 	httpTimeout = 2 * time.Second
 	// commandBudget must terminate before the host's 5s lifecycle deadline.
 	commandBudget   = 4 * time.Second
-	menuReplyText   = "🤖 Меню отправлено ботом"
 	apiTimeFormat   = "2006-01-02 15:04:05"
 	quotaPath       = "/api/monitor/usage/quota/limit"
 	modelUsagePath  = "/api/monitor/usage/model-usage"
@@ -58,11 +57,12 @@ type executeContext struct {
 
 // botCallback is the payload of the bot.callback event (contract revision 5).
 type botCallback struct {
-	CallbackID string `json:"callback_id"`
-	Data       string `json:"data"`
-	ChatID     int64  `json:"chat_id"`
-	MessageID  int64  `json:"message_id"`
-	FromUserID int64  `json:"from_user_id"`
+	CallbackID      string `json:"callback_id"`
+	Data            string `json:"data"`
+	ChatID          int64  `json:"chat_id"`
+	MessageID       int64  `json:"message_id"`
+	FromUserID      int64  `json:"from_user_id"`
+	InlineMessageID string `json:"inline_message_id"`
 }
 
 type inlineButton struct {
@@ -246,6 +246,16 @@ func (m *module) handleEvent(req request) {
 	default:
 		text = "❓ Неизвестное действие"
 	}
+	if cb.InlineMessageID != "" {
+		if err := m.hc.hostCall(ctx, "message.editBot", map[string]any{
+			"inline_message_id": cb.InlineMessageID,
+			"text":              text,
+			"buttons":           buttons,
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "message.editBot: %v\n", err)
+		}
+		return
+	}
 	if err := m.hc.hostCall(ctx, "message.editBot", map[string]any{
 		"chat_id":    cb.ChatID,
 		"message_id": cb.MessageID,
@@ -291,7 +301,9 @@ func (m *module) menuCommand(ctx context.Context) (string, error) {
 	}); err != nil {
 		return "", fmt.Errorf("меню: %w", err)
 	}
-	return menuReplyText, nil
+	// The menu itself is the via-bot message; an empty result keeps the host
+	// from posting any extra reply text.
+	return "", nil
 }
 
 // apiEnvelope holds the fields shared by every z.ai monitor/biz response.

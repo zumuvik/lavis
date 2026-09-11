@@ -114,8 +114,12 @@ impl InlineAnswerParams {
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MessageEditBotParams {
-    pub chat_id: i64,
-    pub message_id: i64,
+    #[serde(default)]
+    pub chat_id: Option<i64>,
+    #[serde(default)]
+    pub message_id: Option<i64>,
+    #[serde(default)]
+    pub inline_message_id: Option<String>,
     pub text: String,
     #[serde(default)]
     pub buttons: Vec<Vec<InlineButton>>,
@@ -123,8 +127,14 @@ pub struct MessageEditBotParams {
 
 impl MessageEditBotParams {
     pub fn validate(&self, prefix_len: usize) -> Result<(), &'static str> {
-        if self.chat_id == 0 || self.message_id <= 0 {
-            return Err("chat_id and message_id are required");
+        let inline = self
+            .inline_message_id
+            .as_deref()
+            .is_some_and(|id| !id.is_empty());
+        let chat = self.chat_id.is_some_and(|chat_id| chat_id != 0)
+            && self.message_id.is_some_and(|message_id| message_id > 0);
+        if !inline && !chat {
+            return Err("inline_message_id or chat_id and message_id are required");
         }
         if self.text.is_empty() || self.text.contains('\0') {
             return Err("text is required");
@@ -213,11 +223,14 @@ pub trait HostInlineSurface: Send + Sync {
         text: &'a str,
         show_alert: bool,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
-    /// Redraw a bot-sent inline form message in place.
+    /// Redraw a bot-sent inline form message in place. Either
+    /// `inline_message_id` (via-bot messages) or `chat_id` + `message_id`
+    /// identifies the target; the other one is empty/zero.
     fn edit<'a>(
         &'a self,
         chat_id: i64,
         message_id: i64,
+        inline_message_id: &'a str,
         text: &'a str,
         buttons: &'a [Vec<InlineButton>],
         data_prefix: &'a str,
@@ -385,19 +398,26 @@ impl V6HostExecutor {
         let params: MessageEditBotParams =
             serde_json::from_str(params.get()).map_err(|_| "invalid params")?;
         params.validate(prefix.len())?;
+        let inline_message_id = params
+            .inline_message_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .unwrap_or("");
         // The edit arrives back as a self-authored MessageEdited update; arm
         // the ledger first so the runtime suppresses it before command
         // routing sees module-controlled text.
-        let peer_id = peer_id_from_bot_chat_id(params.chat_id);
+        let peer_id = peer_id_from_bot_chat_id(params.chat_id.unwrap_or(0));
+        let message_id = params.message_id.unwrap_or(0);
         if let Some(peer_id) = peer_id {
             let _ = self
                 .ledger
-                .register(peer_id, params.message_id as i32, params.text.clone());
+                .register(peer_id, message_id as i32, params.text.clone());
         }
         let result = surface
             .edit(
-                params.chat_id,
-                params.message_id,
+                params.chat_id.unwrap_or(0),
+                message_id,
+                inline_message_id,
                 &params.text,
                 &params.buttons,
                 &prefix,
@@ -411,8 +431,7 @@ impl V6HostExecutor {
         if result.is_err()
             && let Some(peer_id) = peer_id
         {
-            self.ledger
-                .remove(peer_id, params.message_id as i32, &params.text);
+            self.ledger.remove(peer_id, message_id as i32, &params.text);
         }
         result.map(|_| serde_json::Value::Null)
     }

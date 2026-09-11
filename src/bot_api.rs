@@ -24,11 +24,13 @@ pub struct BotMessage {
 }
 
 /// An in-place edit of a companion-bot inline form. Callback data is already
-/// host-namespaced before it reaches this boundary.
+/// host-namespaced before it reaches this boundary. Via-bot messages that the
+/// bot cannot address by chat are edited by `inline_message_id` instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BotEditMessage {
     pub chat_id: i64,
     pub message_id: i64,
+    pub inline_message_id: Option<String>,
     pub text: String,
     pub buttons: Vec<Vec<(String, String)>>,
 }
@@ -261,11 +263,18 @@ impl BotSendApi for HttpBotApi {
                 "https://api.telegram.org/bot{}/editMessageText",
                 token.as_str()
             );
-            let mut payload = serde_json::json!({
-                "chat_id": message.chat_id,
-                "message_id": message.message_id,
-                "text": message.text,
-            });
+            let mut payload = if let Some(inline_message_id) = &message.inline_message_id {
+                serde_json::json!({
+                    "inline_message_id": inline_message_id,
+                    "text": message.text,
+                })
+            } else {
+                serde_json::json!({
+                    "chat_id": message.chat_id,
+                    "message_id": message.message_id,
+                    "text": message.text,
+                })
+            };
             if !message.buttons.is_empty() {
                 let keyboard: Vec<Vec<serde_json::Value>> = message
                     .buttons

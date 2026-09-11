@@ -119,6 +119,15 @@ impl RuntimeState {
             )
             .await;
         let response = match &result {
+            Ok(text) if text.trim().is_empty() => {
+                // The module produced its effect out of band (e.g. an inline
+                // form sent via the companion bot): an empty reply must not
+                // trigger the provenance footer or any outgoing message.
+                Response {
+                    text: String::new(),
+                    entities: Vec::new(),
+                }
+            }
             Ok(text) => {
                 let found = self
                     .external_snapshot

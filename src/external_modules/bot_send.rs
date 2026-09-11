@@ -114,10 +114,26 @@ impl CompanionBotSender {
             },
             _ => return Err("companion bot is not configured".to_owned()),
         };
-        // PeerId carries no access hash; convert through a PeerRef with
-        // ambient authority. Telegram accepts it for peers known to the
-        // session (dialogs, groups, the self user).
-        let destination_peer = input_peer_from_id(peer)?;
+        // PeerId carries no access hash; resolve through the session so the
+        // destination uses a real access hash (ambient authority fails with
+        // CHANNEL_INVALID outside the self chat).
+        let reference = grammers_session::types::PeerRef {
+            id: peer,
+            auth: grammers_session::types::PeerAuth::default(),
+        };
+        let resolved = tokio::time::timeout(
+            Self::INLINE_CALL_TIMEOUT,
+            self.client.resolve_peer(reference),
+        )
+        .await
+        .map_err(|_| "inline form timeout".to_owned())?
+        .map_err(|_| "inline form rejected".to_owned())?;
+        let peer_ref = tokio::time::timeout(Self::INLINE_CALL_TIMEOUT, resolved.to_ref())
+            .await
+            .map_err(|_| "inline form timeout".to_owned())?
+            .map_err(|_| "inline form rejected".to_owned())?
+            .ok_or_else(|| "inline form rejected".to_owned())?;
+        let destination_peer = tl::enums::InputPeer::from(&peer_ref);
 
         let response = tokio::time::timeout(
             Self::INLINE_CALL_TIMEOUT,
@@ -214,15 +230,6 @@ impl CompanionBotSender {
     }
 }
 
-fn input_peer_from_id(peer: PeerId) -> Result<grammers_client::tl::enums::InputPeer, String> {
-    use grammers_session::types::{PeerAuth, PeerRef};
-    let reference = PeerRef {
-        id: peer,
-        auth: PeerAuth::default(),
-    };
-    Ok(grammers_client::tl::enums::InputPeer::from(&reference))
-}
-
 impl HostBotSend for CompanionBotSender {
     fn send<'a>(
         &'a self,
@@ -307,6 +314,7 @@ impl HostInlineSurface for CompanionBotSender {
         &'a self,
         chat_id: i64,
         message_id: i64,
+        inline_message_id: &'a str,
         text: &'a str,
         buttons: &'a [Vec<InlineButton>],
         data_prefix: &'a str,
@@ -322,6 +330,11 @@ impl HostInlineSurface for CompanionBotSender {
             let message = BotEditMessage {
                 chat_id,
                 message_id,
+                inline_message_id: if inline_message_id.is_empty() {
+                    None
+                } else {
+                    Some(inline_message_id.to_owned())
+                },
                 text: text.to_owned(),
                 buttons: Self::prefixed_rows(buttons, data_prefix),
             };

@@ -1114,6 +1114,12 @@ async fn process_update(
         None
     };
     let rendered_text = execution.response.text;
+    if rendered_text.is_empty() && execution.response.entities.is_empty() {
+        // Silent result (e.g. an external module that acted out of band):
+        // leave the command message untouched instead of editing in an
+        // empty string.
+        return shutdown_reason;
+    }
     let mut source_edit_succeeded = false;
     if let Some(media_url) = execution.media {
         // The media edit must be suppressed like any other Lavis-owned edit,

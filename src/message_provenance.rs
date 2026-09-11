@@ -87,18 +87,16 @@ impl SharedBotFormLedger {
         ledger.push_back((peer_id, message_id));
     }
 
-    pub fn consume(&self, peer_id: PeerId, message_id: i32) -> bool {
-        let mut ledger = self
+    /// Non-consuming check: a via-bot menu must be suppressed on every
+    /// update, not only the first — the bot keeps editing that message with
+    /// fresh module-controlled text, and each edit is a fresh escalation
+    /// attempt. Entries age out through the bounded ring instead.
+    pub fn suppresses(&self, peer_id: PeerId, message_id: i32) -> bool {
+        let ledger = self
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let index = ledger
-            .iter()
-            .position(|entry| *entry == (peer_id, message_id));
-        match index {
-            Some(index) => ledger.remove(index).is_some(),
-            None => false,
-        }
+        ledger.iter().any(|entry| *entry == (peer_id, message_id))
     }
 }
 
@@ -132,7 +130,7 @@ mod tests {
     }
 
     #[test]
-    fn bot_form_ledger_is_bounded_and_shared() {
+    fn bot_form_ledger_is_bounded_shared_and_idempotent() {
         let ledger = SharedBotFormLedger::default();
         let mirror = ledger.clone();
         let peer = PeerId::user(3).unwrap();
@@ -140,8 +138,10 @@ mod tests {
         for index in 0..=MAX_ENTRIES as i32 {
             ledger.register(peer, index);
         }
-        assert!(!mirror.consume(peer, 0));
-        assert!(mirror.consume(peer, MAX_ENTRIES as i32));
-        assert!(!ledger.consume(peer, MAX_ENTRIES as i32));
+        assert!(!mirror.suppresses(peer, 0));
+        // Suppression is non-consuming: every edit of the same menu message
+        // stays suppressed.
+        assert!(mirror.suppresses(peer, MAX_ENTRIES as i32));
+        assert!(ledger.suppresses(peer, MAX_ENTRIES as i32));
     }
 }

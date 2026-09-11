@@ -138,6 +138,26 @@ func TestBotCallbackEditsMenu(t *testing.T) {
 	}
 }
 
+func TestBotCallbackInlineMessageIDUsesInlineEdit(t *testing.T) {
+	stubAPI(t, `{}`)
+	writeTokenFile(t, "token=secret\n")
+	w, m := newTestModule(t, true, "")
+
+	m.handle(request{ProtocolVersion: protocolVersion, RequestID: "ev-4", Type: "event", Event: "bot.callback", Payload: json.RawMessage(`{"callback_id":"cb-12","data":"quota","from_user_id":789,"inline_message_id":"AgAB-abc"}`)})
+	waitFor(t, func() bool {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		return strings.Count(w.written.String(), `"type":"host.invoke"`) == 2
+	})
+	body := w.written.String()
+	if !strings.Contains(body, `"inline_message_id":"AgAB-abc"`) {
+		t.Fatalf("inline_message_id lost:\n%s", body)
+	}
+	if strings.Contains(body, `"chat_id"`) || strings.Contains(body, `"message_id"`) {
+		t.Fatalf("inline edit must not address the chat:\n%s", body)
+	}
+}
+
 func TestBotCallbackCloseClearsButtons(t *testing.T) {
 	stubAPI(t, `{}`)
 	writeTokenFile(t, "token=secret\n")

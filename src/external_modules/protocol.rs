@@ -184,6 +184,9 @@ pub struct BotCallbackEvent {
     pub chat_id: i64,
     pub message_id: i64,
     pub from_user_id: i64,
+    /// Present when the press landed on a via-bot message Telegram can only
+    /// address by its inline id (e.g. Saved Messages); empty otherwise.
+    pub inline_message_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -321,6 +324,7 @@ impl V6OutboundCoreFrame {
                         "chat_id": payload.chat_id,
                         "message_id": payload.message_id,
                         "from_user_id": payload.from_user_id,
+                        "inline_message_id": payload.inline_message_id,
                     },
                 }),
             ),

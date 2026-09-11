@@ -328,7 +328,7 @@ func TestHandleExecuteMenuSendsInlineForm(t *testing.T) {
 		Command:         "ai",
 		Context:         &executeContext{Peer: "peer-abc"},
 	})
-	if resp.Type != "result" || resp.Text != menuReplyText {
+	if resp.Type != "result" || resp.Text != "" {
 		t.Fatalf("menu execute: %+v", resp)
 	}
 	frames := buf.String()
@@ -421,7 +421,7 @@ func TestHandleExecuteReportsAPIText(t *testing.T) {
 	// With a peer the API failure text travels inside the inline.form payload.
 	m2, buf2 := hostTestRPC(t, true, "")
 	resp = m2.handle(request{ProtocolVersion: protocolVersion, Type: "execute", RequestID: "r9", Command: "ai", Context: &executeContext{Peer: "peer-xyz"}})
-	if resp.Type != "result" || resp.Text != menuReplyText {
+	if resp.Type != "result" || resp.Text != "" {
 		t.Fatalf("menu execute: %+v", resp)
 	}
 	if !strings.Contains(buf2.String(), "token expired or incorrect") {

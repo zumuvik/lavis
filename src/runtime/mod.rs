@@ -484,7 +484,7 @@ impl RuntimeState {
     }
 
     pub(crate) fn consume_bot_form_message(&mut self, peer_id: PeerId, message_id: i32) -> bool {
-        self.bot_form_ledger.consume(peer_id, message_id)
+        self.bot_form_ledger.suppresses(peer_id, message_id)
     }
 
     pub fn configure_module_installation(
