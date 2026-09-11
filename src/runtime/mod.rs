@@ -401,7 +401,9 @@ impl RuntimeState {
             SetupPhase::AwaitingUsername { deadline, .. }
             | SetupPhase::AwaitingConfirmation { deadline, .. }
             | SetupPhase::Running { deadline, .. } => Some(*deadline),
-            SetupPhase::Idle | SetupPhase::EnablingInline { .. } => None,
+            SetupPhase::Idle
+            | SetupPhase::EnablingInline { .. }
+            | SetupPhase::SettingUserpic { .. } => None,
         }
     }
 

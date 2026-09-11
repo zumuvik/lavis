@@ -19,6 +19,10 @@ pub const DISPLAY_NAME: &str = "Lavis — really your userbot";
 pub const PROVISION_TIMEOUT: Duration = Duration::from_secs(90);
 pub const BOTFATHER_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// The companion bot avatar ships with the binary (assets/botlogo.png,
+/// tracked in git and included by the Nix source filter).
+pub const BOT_USERPIC: &[u8] = include_bytes!("../assets/botlogo.png");
+
 /// The only data a detached provisioning task may own. It deliberately does
 /// not retain runtime or external-module state.
 #[derive(Clone)]
@@ -109,6 +113,9 @@ pub trait TelegramSetup: Send + Sync {
     fn press_botfather_button<'a>(&'a self, _msg_id: i32, _data: &'a [u8]) -> SetupFuture<'a> {
         Box::pin(async { Err(SetupTelegramError::Telegram) })
     }
+    fn send_botfather_photo<'a>(&'a self, _bytes: &'a [u8]) -> SetupFuture<'a> {
+        Box::pin(async { Err(SetupTelegramError::Telegram) })
+    }
 }
 
 /// Production delivery adapter. `PeerRef` is obtained from
@@ -176,6 +183,27 @@ impl TelegramSetup for GrammersTelegramSetup {
                             password: None,
                         },
                     )
+                    .await
+                    .map(|_| ())
+                    .map_err(|_| SetupTelegramError::Telegram)
+            })
+            .await
+            .map_err(|_| SetupTelegramError::Timeout)?
+        })
+    }
+
+    fn send_botfather_photo<'a>(&'a self, bytes: &'a [u8]) -> SetupFuture<'a> {
+        Box::pin(async move {
+            tokio::time::timeout(BOTFATHER_OPERATION_TIMEOUT, async {
+                let mut stream = std::io::Cursor::new(bytes.to_vec());
+                let uploaded = self
+                    .client
+                    .upload_stream(&mut stream, bytes.len(), "lavis-bot.png".to_string())
+                    .await
+                    .map_err(|_| SetupTelegramError::Telegram)?;
+                let message = InputMessage::new().photo(uploaded);
+                self.client
+                    .send_message(self.botfather, message)
                     .await
                     .map(|_| ())
                     .map_err(|_| SetupTelegramError::Telegram)
@@ -428,6 +456,10 @@ impl InlineEnableSetup {
         }
     }
 
+    pub fn username(&self) -> String {
+        self.username.clone()
+    }
+
     pub async fn start(&mut self, telegram: &impl TelegramSetup) -> Result<(), SetupTelegramError> {
         // Clearing a stale BotFather flow is best effort. Its reply is not a
         // prerequisite for this new conversation.
@@ -493,6 +525,104 @@ impl InlineEnableSetup {
     }
 }
 
+/// A BotFather conversation that sets the companion bot avatar via
+/// `/setuserpic`. It chains after the inline conversation settles so
+/// BotFather runs one conversation at a time.
+pub struct BotPhotoSetup {
+    username: String,
+    step: BotPhotoStep,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BotPhotoStep {
+    SetUserpicSent,
+    ChooseBot,
+    PhotoAwait,
+    WaitConfirm,
+    Done,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BotPhotoProgress {
+    Pending,
+    Completed,
+    Failed,
+}
+
+impl BotPhotoSetup {
+    pub fn new(username: String) -> Self {
+        Self {
+            username,
+            step: BotPhotoStep::SetUserpicSent,
+        }
+    }
+
+    pub async fn start(&mut self, telegram: &impl TelegramSetup) -> Result<(), SetupTelegramError> {
+        let _ = send_with_timeout(telegram, "/cancel").await;
+        self.step = BotPhotoStep::ChooseBot;
+        send_with_timeout(telegram, "/setuserpic").await
+    }
+
+    pub async fn on_botfather_reply(
+        &mut self,
+        text: &str,
+        buttons: &[BotFatherButton],
+        telegram: &impl TelegramSetup,
+    ) -> Result<BotPhotoProgress, SetupTelegramError> {
+        if self.step == BotPhotoStep::Done {
+            return Ok(BotPhotoProgress::Completed);
+        }
+        let lowercase = text.to_ascii_lowercase();
+        match self.step {
+            BotPhotoStep::SetUserpicSent | BotPhotoStep::Done => {}
+            BotPhotoStep::ChooseBot => {
+                if !buttons.is_empty() {
+                    let matched = buttons
+                        .iter()
+                        .find(|button| button.text.to_ascii_lowercase().contains(&self.username));
+                    match matched {
+                        Some(button) => {
+                            telegram
+                                .press_botfather_button(button.msg_id, &button.data)
+                                .await?;
+                        }
+                        None => {
+                            self.step = BotPhotoStep::Done;
+                            return Ok(BotPhotoProgress::Failed);
+                        }
+                    }
+                } else if is_inline_choose_bot_prompt(&lowercase) {
+                    send_with_timeout(telegram, &format!("@{}", self.username)).await?;
+                } else {
+                    return Ok(BotPhotoProgress::Pending);
+                }
+                self.step = BotPhotoStep::PhotoAwait;
+            }
+            BotPhotoStep::PhotoAwait => {
+                if is_inline_success(&lowercase) {
+                    self.step = BotPhotoStep::Done;
+                    return Ok(BotPhotoProgress::Completed);
+                }
+                if is_photo_prompt(&lowercase) {
+                    telegram.send_botfather_photo(BOT_USERPIC).await?;
+                    self.step = BotPhotoStep::WaitConfirm;
+                }
+            }
+            BotPhotoStep::WaitConfirm => {
+                if is_inline_success(&lowercase) {
+                    self.step = BotPhotoStep::Done;
+                    return Ok(BotPhotoProgress::Completed);
+                }
+            }
+        }
+        Ok(BotPhotoProgress::Pending)
+    }
+}
+
+fn is_photo_prompt(text: &str) -> bool {
+    text.contains("send") && (text.contains("photo") || text.contains("picture"))
+}
+
 fn is_inline_choose_bot_prompt(text: &str) -> bool {
     text.contains("choose a bot")
 }
@@ -527,10 +657,15 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     type PressedLog = Arc<Mutex<Vec<(i32, Vec<u8>)>>>;
-    struct TelegramMock(Arc<Mutex<Vec<String>>>, PressedLog);
+    type PhotoLog = Arc<Mutex<Vec<()>>>;
+    struct TelegramMock(Arc<Mutex<Vec<String>>>, PressedLog, PhotoLog);
     impl TelegramMock {
         fn new(sent: Arc<Mutex<Vec<String>>>) -> Self {
-            Self(sent, Arc::new(Mutex::new(Vec::new())))
+            Self(
+                sent,
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(Mutex::new(Vec::new())),
+            )
         }
     }
     impl TelegramSetup for TelegramMock {
@@ -540,6 +675,10 @@ mod tests {
         }
         fn press_botfather_button<'a>(&'a self, msg_id: i32, data: &'a [u8]) -> SetupFuture<'a> {
             self.1.lock().unwrap().push((msg_id, data.to_vec()));
+            Box::pin(async { Ok(()) })
+        }
+        fn send_botfather_photo<'a>(&'a self, _: &'a [u8]) -> SetupFuture<'a> {
+            self.2.lock().unwrap().push(());
             Box::pin(async { Ok(()) })
         }
     }
@@ -660,6 +799,69 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(*sent.lock().unwrap(), ["/cancel", "/newbot", DISPLAY_NAME]);
+    }
+
+    #[tokio::test]
+    async fn bot_photo_conversation_presses_and_uploads() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let telegram = TelegramMock::new(sent.clone());
+        let mut setup = BotPhotoSetup::new("lavis_test_bot".into());
+        setup.start(&telegram).await.unwrap();
+        setup
+            .on_botfather_reply(
+                "Choose a bot to change the profile photo of your bot.",
+                &[BotFatherButton {
+                    msg_id: 5,
+                    text: "🤖 @lavis_test_bot".into(),
+                    data: b"cb".to_vec(),
+                }],
+                &telegram,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            setup
+                .on_botfather_reply(
+                    "OK. Send me the new profile photo for the bot.",
+                    &[],
+                    &telegram
+                )
+                .await
+                .unwrap(),
+            BotPhotoProgress::Pending
+        );
+        assert_eq!(
+            setup
+                .on_botfather_reply("Success! Profile photo updated.", &[], &telegram)
+                .await
+                .unwrap(),
+            BotPhotoProgress::Completed
+        );
+        assert!(!telegram.2.lock().unwrap().is_empty());
+        assert_eq!(*sent.lock().unwrap(), ["/cancel", "/setuserpic"]);
+    }
+
+    #[tokio::test]
+    async fn bot_photo_without_matching_button_fails() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let telegram = TelegramMock::new(sent);
+        let mut setup = BotPhotoSetup::new("lavis_test_bot".into());
+        setup.start(&telegram).await.unwrap();
+        assert_eq!(
+            setup
+                .on_botfather_reply(
+                    "Choose a bot to change the profile photo of your bot.",
+                    &[BotFatherButton {
+                        msg_id: 5,
+                        text: "🤖 @someone_else".into(),
+                        data: b"x".to_vec(),
+                    }],
+                    &telegram,
+                )
+                .await
+                .unwrap(),
+            BotPhotoProgress::Failed
+        );
     }
 
     #[tokio::test]

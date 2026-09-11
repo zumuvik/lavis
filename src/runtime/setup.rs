@@ -31,6 +31,10 @@ pub(super) enum SetupPhase {
         flow: crate::setup_telegram::InlineEnableSetup,
         transport: GrammersTelegramSetup,
     },
+    SettingUserpic {
+        flow: crate::setup_telegram::BotPhotoSetup,
+        transport: GrammersTelegramSetup,
+    },
 }
 
 pub(super) struct BotFatherOutcome {
@@ -230,6 +234,37 @@ impl SetupCoordinator {
         buttons: &[crate::setup_telegram::BotFatherButton],
         locale: Locale,
     ) -> BotFatherOutcome {
+        if let SetupPhase::SettingUserpic { flow, transport } = &mut self.phase {
+            let result = flow.on_botfather_reply(text, buttons, transport).await;
+            match result {
+                Ok(crate::setup_telegram::BotPhotoProgress::Completed) => {
+                    tracing::info!(
+                        event = "setup_bot_userpic_set",
+                        "Companion bot avatar updated via BotFather"
+                    );
+                    self.phase = SetupPhase::Idle;
+                }
+                Ok(crate::setup_telegram::BotPhotoProgress::Failed) => {
+                    tracing::warn!(
+                        event = "setup_bot_userpic_failed",
+                        "Companion bot avatar could not be set via BotFather"
+                    );
+                    self.phase = SetupPhase::Idle;
+                }
+                Ok(crate::setup_telegram::BotPhotoProgress::Pending) => {}
+                Err(_) => {
+                    tracing::warn!(
+                        event = "setup_bot_userpic_failed",
+                        "Companion bot avatar conversation errored"
+                    );
+                    self.phase = SetupPhase::Idle;
+                }
+            }
+            return BotFatherOutcome {
+                response: None,
+                provision: None,
+            };
+        }
         if let SetupPhase::EnablingInline { flow, transport } = &mut self.phase {
             let result = flow.on_botfather_reply(text, buttons, transport).await;
             let outcome = match result {
@@ -254,7 +289,21 @@ impl SetupCoordinator {
                 },
             };
             if outcome.response.is_some() {
-                self.phase = SetupPhase::Idle;
+                // Chain the bot avatar conversation after the inline one
+                // settles, whichever way it settled: BotFather runs one
+                // conversation at a time, and /cancel in the photo machine
+                // clears any residue.
+                let mut photo = crate::setup_telegram::BotPhotoSetup::new(flow.username());
+                let chained = photo.start(transport).await.is_ok();
+                let cloned_transport = transport.clone();
+                if chained {
+                    self.phase = SetupPhase::SettingUserpic {
+                        flow: photo,
+                        transport: cloned_transport,
+                    };
+                } else {
+                    self.phase = SetupPhase::Idle;
+                }
             }
             return outcome;
         }
