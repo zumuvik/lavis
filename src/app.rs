@@ -26,6 +26,7 @@ pub mod fastfetch;
 pub mod help;
 pub mod i18n;
 pub mod info;
+pub mod log_forwarder;
 pub mod message_provenance;
 pub mod modules;
 pub mod onboarding;
@@ -438,6 +439,10 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
                 Ok(setup_state_path) => {
                     let token_path = config::ConfigPaths::companion_token_path_with(&environment)
                         .context("failed to determine companion token path")?;
+                    crate::log_forwarder::spawn_worker(
+                        setup_state_path.clone(),
+                        token_path.clone(),
+                    );
                     match external_modules::bot_send::CompanionBotSender::new(
                         setup_state_path.clone(),
                         token_path,

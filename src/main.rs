@@ -1,12 +1,16 @@
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    tracing_subscriber::fmt()
-        .compact()
-        .with_env_filter(filter)
+    // Installed before app startup so early runtime warnings are forwarded.
+    lavis::log_forwarder::install_bridge(64);
+
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().compact())
+        .with(filter)
+        .with(lavis::log_forwarder::bridge_layer())
         .try_init()
         .map_err(|error| anyhow::anyhow!("failed to initialize structured logging: {error}"))?;
 
