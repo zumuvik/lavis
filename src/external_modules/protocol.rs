@@ -415,6 +415,9 @@ enum V6WireFrame {
     Result {
         protocol_version: u32,
         request_id: String,
+        /// An empty result is valid ("nothing to say"); older modules may
+        /// even omit the field entirely, so the parse is tolerant.
+        #[serde(default)]
         text: String,
     },
     #[serde(rename = "error")]

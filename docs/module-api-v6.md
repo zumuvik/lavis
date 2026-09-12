@@ -111,6 +111,8 @@ lifecycle response is pending.
 | Lavis → module | `{"type":"health","request_id":"4"}` | `{"type":"health","request_id":"4"}` |
 | Lavis → module | `{"type":"shutdown","request_id":"5"}` | no response; the module exits |
 
+An empty `text` in a result is valid and means "no reply". The host parser tolerates a missing `text` field for compatibility; modules should always emit the field.
+
 The `initialized` response must repeat the exact `module_id` from the
 `initialize` request; a mismatch is fatal. An `event_result` requires an
 `actions` array (bounded to one action, with at most three reactions per

@@ -44,9 +44,13 @@ async fn run(config: BotUpdatesConfig) {
             return;
         }
     };
-    let mut offset: i64 = 0;
+    // offset = -1 bootstraps the loop: Telegram returns only the newest
+    // pending update, so a restart skips the backlog instead of replaying
+    // it; the next request confirms with offset = last_id + 1. At most one
+    // pre-restart update is dispatched this way, and a stale press is a
+    // harmless no-op (its callback id has long expired).
+    let mut offset: i64 = -1;
     let mut failure_streak: u32 = 0;
-    let mut swallow_first_batch = true;
     loop {
         let token = match load_token(&config.state_path, &config.token_path).await {
             Ok(token) => token,
@@ -125,15 +129,6 @@ async fn run(config: BotUpdatesConfig) {
                 continue;
             }
         };
-        if swallow_first_batch {
-            // Updates queued before (re)start are stale: their callback ids
-            // expire within seconds, so replaying them only produces noise.
-            swallow_first_batch = false;
-            if let Some(max_id) = batch.iter().map(|update| update.update_id).max() {
-                offset = max_id + 1;
-            }
-            continue;
-        }
         if let Some(max_id) = batch.iter().map(|update| update.update_id).max() {
             offset = max_id + 1;
         }

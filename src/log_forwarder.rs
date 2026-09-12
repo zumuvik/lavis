@@ -142,6 +142,7 @@ async fn worker(state_path: PathBuf, token_path: PathBuf, mut rx: Receiver<Strin
     let mut topic_id: Option<i32> = None;
     let mut topic_unavailable = false;
     let mut topic_creation_attempted = false;
+    let mut send_rejected_warned = false;
 
     while let Some(line) = rx.recv().await {
         if token.is_none() {
@@ -177,6 +178,13 @@ async fn worker(state_path: PathBuf, token_path: PathBuf, mut rx: Receiver<Strin
                 };
                 if topic_id.is_none() {
                     topic_unavailable = true;
+                    // The bridge layer excludes this target from re-forwarding,
+                    // so this warn reaches journalctl without a feedback loop.
+                    tracing::warn!(
+                        target: "lavis_log_forwarder",
+                        event = "log_forwarder_topic_unavailable",
+                        "Logs topic is unavailable — log lines are dropped until restart; run ,setup repair"
+                    );
                 }
             }
         }
@@ -204,6 +212,14 @@ async fn worker(state_path: PathBuf, token_path: PathBuf, mut rx: Receiver<Strin
             if matches!(error, crate::bot_api::BotApiError::Rejected) {
                 // The token may have been rotated or revoked: reload lazily.
                 token = None;
+            }
+            if !send_rejected_warned {
+                send_rejected_warned = true;
+                tracing::warn!(
+                    target: "lavis_log_forwarder",
+                    event = "log_forwarder_send_rejected",
+                    "Companion bot rejected log delivery — dropping lines"
+                );
             }
             // Never tracing::log here: the layer would re-forward this
             // module's own events (feedback loop). Just back off.
