@@ -52,7 +52,8 @@ type request struct {
 // executeContext carries the opaque peer handle of the invoking chat
 // (contract revision 5); inline.form needs it to publish the menu there.
 type executeContext struct {
-	Peer string `json:"peer"`
+	Peer    string `json:"peer"`
+	Message string `json:"message"`
 }
 
 // botCallback is the payload of the bot.callback event (contract revision 5).
@@ -93,8 +94,9 @@ type module struct {
 	rpc *rpcTransport
 	hc  *hostCaller
 
-	mu   sync.Mutex
-	peer string
+	mu        sync.Mutex
+	peer      string
+	msgHandle string
 }
 
 func newModule() *module {
@@ -114,6 +116,20 @@ func (m *module) peerHandle() string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.peer
+}
+
+// noteMessage records the latest execute context message handle (the
+// owner's command message, deletable on their behalf).
+func (m *module) noteMessage(handle string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.msgHandle = handle
+}
+
+func (m *module) messageHandle() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.msgHandle
 }
 
 func main() {
@@ -181,6 +197,7 @@ func (m *module) handle(req request) response {
 		base.Type = "result"
 		if req.Context != nil {
 			m.notePeer(req.Context.Peer)
+			m.noteMessage(req.Context.Message)
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), commandBudget)
 		defer cancel()
@@ -241,6 +258,17 @@ func (m *module) handleEvent(req request) {
 	case "quota":
 		text = quotaReport()
 	case "close":
+		if cb.ChatID != 0 && cb.MessageID != 0 {
+			// Closing removes the menu instead of redrawing a dead shell.
+			// The bot can only delete its own message in chats where it has
+			// moderation rights; otherwise fall back to the closed stub.
+			if err := m.hc.hostCall(ctx, "message.deleteBot", map[string]any{
+				"chat_id":    cb.ChatID,
+				"message_id": cb.MessageID,
+			}); err == nil {
+				return
+			}
+		}
 		text = "🔒 Меню закрыто"
 		buttons = [][]inlineButton{}
 	default:
@@ -300,6 +328,12 @@ func (m *module) menuCommand(ctx context.Context) (string, error) {
 		"buttons": menuButtons,
 	}); err != nil {
 		return "", fmt.Errorf("меню: %w", err)
+	}
+	// The via-bot menu replaces the command message entirely: remove the
+	// owner's `,z` from the chat. Best effort — a failure must not fail
+	// the command after the menu has already been published.
+	if handle := m.messageHandle(); handle != "" {
+		_ = m.hc.hostCall(ctx, "message.deleteInvoker", map[string]any{"message": handle})
 	}
 	// The menu itself is the via-bot message; an empty result keeps the host
 	// from posting any extra reply text.

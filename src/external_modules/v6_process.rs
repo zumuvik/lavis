@@ -850,7 +850,8 @@ async fn supervise(
                         if !matches!(
                             method.as_str(),
                             "message.edit" | "message.sendBot" | "inline.form" | "inline.answer"
-                                | "message.editBot"
+                                | "message.editBot" | "message.deleteInvoker"
+                                | "message.deleteBot"
                         ) {
                             fatal_reason = Some(FatalReason::ProtocolDecode);
                             fatal_stage = "host";

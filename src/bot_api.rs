@@ -58,6 +58,12 @@ pub trait BotSendApi: Send + Sync {
         token: &'a CompanionToken,
         message: &'a BotEditMessage,
     ) -> BotSendFuture<'a>;
+    fn delete_message<'a>(
+        &'a self,
+        token: &'a CompanionToken,
+        chat_id: i64,
+        message_id: i64,
+    ) -> BotSendFuture<'a>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -289,6 +295,36 @@ impl BotSendApi for HttpBotApi {
                     .collect();
                 payload["reply_markup"] = serde_json::json!({ "inline_keyboard": keyboard });
             }
+            let response = self
+                .client
+                .post(url)
+                .json(&payload)
+                .send()
+                .await
+                .map_err(request_error)?;
+            if !response.status().is_success() {
+                return Err(BotApiError::Rejected);
+            }
+            let body = read_bounded_body(response).await?;
+            parse_send_body(&body)
+        })
+    }
+
+    fn delete_message<'a>(
+        &'a self,
+        token: &'a CompanionToken,
+        chat_id: i64,
+        message_id: i64,
+    ) -> BotSendFuture<'a> {
+        Box::pin(async move {
+            let url = format!(
+                "https://api.telegram.org/bot{}/deleteMessage",
+                token.as_str()
+            );
+            let payload = serde_json::json!({
+                "chat_id": chat_id,
+                "message_id": message_id,
+            });
             let response = self
                 .client
                 .post(url)

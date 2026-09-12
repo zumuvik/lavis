@@ -146,6 +146,19 @@ impl MessageEditBotParams {
     }
 }
 
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MessageDeleteInvokerParams {
+    pub message: String,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MessageDeleteBotParams {
+    pub chat_id: i64,
+    pub message_id: i64,
+}
+
 /// Offline boundary for companion-bot posts. The runtime integration supplies
 /// the token-backed implementation; production and tests share this trait so
 /// the host executor never touches HTTP or credentials directly.
@@ -234,6 +247,13 @@ pub trait HostInlineSurface: Send + Sync {
         text: &'a str,
         buttons: &'a [Vec<InlineButton>],
         data_prefix: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+
+    /// Deletes a bot-sent inline form message (the Close action).
+    fn delete_bot_message<'a>(
+        &'a self,
+        chat_id: i64,
+        message_id: i64,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 }
 
@@ -331,8 +351,58 @@ impl V6HostExecutor {
             "inline.form" => self.execute_inline_form(params).await,
             "inline.answer" => self.execute_inline_answer(params).await,
             "message.editBot" => self.execute_message_edit_bot(params).await,
+            "message.deleteInvoker" => self.execute_delete_invoker(params).await,
+            "message.deleteBot" => self.execute_message_delete_bot(params).await,
             _ => Err("unknown host method"),
         }
+    }
+
+    /// Deletes the invoking command message (`,z`), which is always
+    /// self-authored: the message handle carries the deletion authority.
+    async fn execute_delete_invoker(
+        &self,
+        params: Box<RawValue>,
+    ) -> Result<serde_json::Value, &'static str> {
+        if !self.inline_ok {
+            return Err("capability denied");
+        }
+        let params: MessageDeleteInvokerParams =
+            serde_json::from_str(params.get()).map_err(|_| "invalid params")?;
+        if params.message.is_empty() {
+            return Err("invalid message handle");
+        }
+        let message = self
+            .handles
+            .lock()
+            .map_err(|_| "invalid message handle")?
+            .resolve_message(&params.message)
+            .map_err(|_| "invalid message handle")?;
+        message.delete().await.map_err(|_| "delete failed")?;
+        Ok(serde_json::Value::Null)
+    }
+
+    async fn execute_message_delete_bot(
+        &self,
+        params: Box<RawValue>,
+    ) -> Result<serde_json::Value, &'static str> {
+        if !self.can_send_bot {
+            return Err("capability denied");
+        }
+        let surface = self.inline.as_ref().ok_or("inline surface unavailable")?;
+        let params: MessageDeleteBotParams =
+            serde_json::from_str(params.get()).map_err(|_| "invalid params")?;
+        if params.chat_id == 0 || params.message_id <= 0 {
+            return Err("chat_id and message_id are required");
+        }
+        surface
+            .delete_bot_message(params.chat_id, params.message_id)
+            .await
+            .map_err(|message| match message.as_str() {
+                "bot delete rejected" => "bot delete rejected",
+                "bot delete timeout" => "bot delete timeout",
+                _ => "bot delete unavailable",
+            })?;
+        Ok(serde_json::Value::Null)
     }
 
     async fn execute_inline_form(

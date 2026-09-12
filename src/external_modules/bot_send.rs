@@ -30,6 +30,20 @@ pub struct CompanionBotSender {
     bot_form: crate::message_provenance::SharedBotFormLedger,
 }
 
+/// Logs the sanitized Telegram rejection name (constant identifiers only —
+/// never tokens or URLs) so menu failures are diagnosable from the Logs
+/// topic and journalctl without exposing anything else.
+fn log_inline_rejection(error: &grammers_client::InvocationError, stage: &str) {
+    if let grammers_client::InvocationError::Rpc(rpc) = error {
+        tracing::warn!(
+            target: "lavis_inline_form",
+            stage,
+            name = %rpc.name,
+            "inline query rejected by Telegram"
+        );
+    }
+}
+
 impl CompanionBotSender {
     pub fn new(
         state_path: PathBuf,
@@ -96,7 +110,10 @@ impl CompanionBotSender {
         )
         .await
         .map_err(|_| "inline form timeout".to_owned())?
-        .map_err(|_| "inline form rejected".to_owned())?;
+        .map_err(|error| {
+            log_inline_rejection(&error, "resolve_bot");
+            "inline form rejected".to_owned()
+        })?;
         let bot = match bot_peer {
             Some(grammers_client::peer::Peer::User(user)) => match user.raw {
                 tl::enums::User::User(user) => {
@@ -127,7 +144,10 @@ impl CompanionBotSender {
         )
         .await
         .map_err(|_| "inline form timeout".to_owned())?
-        .map_err(|_| "inline form rejected".to_owned())?;
+        .map_err(|error| {
+            log_inline_rejection(&error, "resolve_destination");
+            "inline form rejected".to_owned()
+        })?;
         let peer_ref = tokio::time::timeout(Self::INLINE_CALL_TIMEOUT, resolved.to_ref())
             .await
             .map_err(|_| "inline form timeout".to_owned())?
@@ -148,7 +168,10 @@ impl CompanionBotSender {
         )
         .await
         .map_err(|_| "inline form timeout".to_owned())?
-        .map_err(|_| "inline form rejected".to_owned())?;
+        .map_err(|error| {
+            log_inline_rejection(&error, "get_inline_results");
+            "inline form rejected".to_owned()
+        })?;
         let tl::enums::messages::BotResults::Results(results) = response;
         let result_id = match results.results.first() {
             Some(tl::enums::BotInlineResult::Result(result)) => result.id.clone(),
@@ -178,7 +201,10 @@ impl CompanionBotSender {
         )
         .await
         .map_err(|_| "inline form timeout".to_owned())?
-        .map_err(|_| "inline form rejected".to_owned())?;
+        .map_err(|error| {
+            log_inline_rejection(&error, "send_inline_result");
+            "inline form rejected".to_owned()
+        })?;
         // The via-bot menu is a self-authored update whose text is
         // module-controlled; register it so the runtime consumes the update
         // before command routing sees it.
@@ -345,6 +371,30 @@ impl HostInlineSurface for CompanionBotSender {
                     crate::bot_api::BotApiError::Rejected => "bot edit rejected".to_owned(),
                     crate::bot_api::BotApiError::Timeout => "bot edit timeout".to_owned(),
                     _ => "bot edit unavailable".to_owned(),
+                })
+        })
+    }
+
+    fn delete_bot_message<'a>(
+        &'a self,
+        chat_id: i64,
+        message_id: i64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            let token = self
+                .load_token()
+                .await
+                .map_err(|message| match message.as_str() {
+                    "bot send unavailable" => "bot delete unavailable".to_owned(),
+                    other => other.to_owned(),
+                })?;
+            self.api
+                .delete_message(&token, chat_id, message_id)
+                .await
+                .map_err(|error| match error {
+                    crate::bot_api::BotApiError::Rejected => "bot delete rejected".to_owned(),
+                    crate::bot_api::BotApiError::Timeout => "bot delete timeout".to_owned(),
+                    _ => "bot delete unavailable".to_owned(),
                 })
         })
     }

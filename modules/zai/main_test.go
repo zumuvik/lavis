@@ -335,7 +335,7 @@ func TestHandleExecuteMenuSendsInlineForm(t *testing.T) {
 		Type:            "execute",
 		RequestID:       "r5",
 		Command:         "ai",
-		Context:         &executeContext{Peer: "peer-abc"},
+		Context:         &executeContext{Peer: "peer-abc", Message: "msg-abc"},
 	})
 	if resp.Type != "result" || textOf(resp) != "" {
 		t.Fatalf("menu execute: %+v", resp)
@@ -343,6 +343,7 @@ func TestHandleExecuteMenuSendsInlineForm(t *testing.T) {
 	frames := buf.String()
 	for _, want := range []string{
 		`"method":"inline.form"`,
+		`"method":"message.deleteInvoker"`,
 		`"peer":"peer-abc"`,
 		"406 / 2 000",
 		"план lite",

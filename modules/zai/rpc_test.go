@@ -158,7 +158,7 @@ func TestBotCallbackInlineMessageIDUsesInlineEdit(t *testing.T) {
 	}
 }
 
-func TestBotCallbackCloseClearsButtons(t *testing.T) {
+func TestBotCallbackCloseDeletes(t *testing.T) {
 	stubAPI(t, `{}`)
 	writeTokenFile(t, "token=secret\n")
 	w, m := newTestModule(t, true, "")
@@ -167,14 +167,14 @@ func TestBotCallbackCloseClearsButtons(t *testing.T) {
 	waitFor(t, func() bool {
 		w.mu.Lock()
 		defer w.mu.Unlock()
-		return strings.Count(w.written.String(), `"type":"host.invoke"`) == 2
+		return strings.Count(w.written.String(), `"method":"message.deleteBot"`) == 1
 	})
 	body := w.written.String()
-	if !strings.Contains(body, "🔒 Меню закрыто") {
-		t.Fatalf("close text missing:\n%s", body)
+	if !strings.Contains(body, `"chat_id":-100123`) || !strings.Contains(body, `"message_id":456`) {
+		t.Fatalf("deleteBot missing target:\n%s", body)
 	}
-	if !strings.Contains(body, `"buttons":[]`) {
-		t.Fatalf("close must clear buttons:\n%s", body)
+	if strings.Contains(body, `"method":"message.editBot"`) {
+		t.Fatalf("close must not redraw the menu:\n%s", body)
 	}
 }
 
