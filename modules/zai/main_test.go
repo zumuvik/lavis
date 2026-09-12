@@ -17,6 +17,15 @@ import (
 	"time"
 )
 
+// textOf dereferences the optional result text: an empty reply is a nil
+// pointer after the omitempty fix.
+func textOf(resp response) string {
+	if resp.Text == nil {
+		return ""
+	}
+	return *resp.Text
+}
+
 func writeTokenFile(t *testing.T, content string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -328,7 +337,7 @@ func TestHandleExecuteMenuSendsInlineForm(t *testing.T) {
 		Command:         "ai",
 		Context:         &executeContext{Peer: "peer-abc"},
 	})
-	if resp.Type != "result" || resp.Text != "" {
+	if resp.Type != "result" || textOf(resp) != "" {
 		t.Fatalf("menu execute: %+v", resp)
 	}
 	frames := buf.String()
@@ -379,8 +388,8 @@ func TestHandleExecuteUsage(t *testing.T) {
 		}
 	}
 	for _, want := range []string{"528 вызовов", "98 457 618", "GLM-5.3-Flash: 98 457 618", "сегодня:", "7д:"} {
-		if !strings.Contains(resp.Text, want) {
-			t.Fatalf("usage text missing %q:\n%s", want, resp.Text)
+		if !strings.Contains(textOf(resp), want) {
+			t.Fatalf("usage text missing %q:\n%s", want, textOf(resp))
 		}
 	}
 }
@@ -394,8 +403,8 @@ func TestHandleExecuteSub(t *testing.T) {
 		t.Fatalf("execute type: %+v", resp)
 	}
 	for _, want := range []string{"GLM Coding Lite · VALID · автопродление: вкл", "2026-09-30 22:54:22-2026-10-30 22:54:22", "· 18.00"} {
-		if !strings.Contains(resp.Text, want) {
-			t.Fatalf("sub text missing %q:\n%s", want, resp.Text)
+		if !strings.Contains(textOf(resp), want) {
+			t.Fatalf("sub text missing %q:\n%s", want, textOf(resp))
 		}
 	}
 }
@@ -421,7 +430,7 @@ func TestHandleExecuteReportsAPIText(t *testing.T) {
 	// With a peer the API failure text travels inside the inline.form payload.
 	m2, buf2 := hostTestRPC(t, true, "")
 	resp = m2.handle(request{ProtocolVersion: protocolVersion, Type: "execute", RequestID: "r9", Command: "ai", Context: &executeContext{Peer: "peer-xyz"}})
-	if resp.Type != "result" || resp.Text != "" {
+	if resp.Type != "result" || textOf(resp) != "" {
 		t.Fatalf("menu execute: %+v", resp)
 	}
 	if !strings.Contains(buf2.String(), "token expired or incorrect") {
@@ -433,7 +442,8 @@ func TestHandleExecuteReportsAPIText(t *testing.T) {
 }
 
 func TestResponseEncodesCleanText(t *testing.T) {
-	data, err := json.Marshal(response{ProtocolVersion: protocolVersion, Type: "result", RequestID: "r", Text: "a · b — c"})
+	text := "a · b — c"
+	data, err := json.Marshal(response{ProtocolVersion: protocolVersion, Type: "result", RequestID: "r", Text: &text})
 	if err != nil {
 		t.Fatal(err)
 	}

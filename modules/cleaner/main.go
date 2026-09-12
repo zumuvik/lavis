@@ -129,7 +129,7 @@ type response struct {
 	Type            string `json:"type"`
 	RequestID       string `json:"request_id"`
 	ModuleID        string `json:"module_id,omitempty"`
-	Text            string `json:"text"`
+	Text            *string `json:"text,omitempty"`
 	Code            string `json:"code,omitempty"`
 	Message         string `json:"message,omitempty"`
 	Actions         *[]any `json:"actions,omitempty"`
@@ -166,7 +166,7 @@ func (m *module) handle(req request) response {
 			base.Message = err.Error()
 			fmt.Fprintf(os.Stderr, "execute %s %s: %v\n", req.Command, req.Arguments, err)
 		} else {
-			base.Text = text
+			base.Text = &text
 		}
 	case "event":
 		base.Type = "event_result"
