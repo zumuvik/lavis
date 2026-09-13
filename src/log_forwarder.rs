@@ -218,6 +218,7 @@ async fn worker(state_path: PathBuf, token_path: PathBuf, mut rx: Receiver<Strin
                 tracing::warn!(
                     target: "lavis_log_forwarder",
                     event = "log_forwarder_send_rejected",
+                    reason = error.category(),
                     "Companion bot rejected log delivery — dropping lines"
                 );
             }

@@ -83,6 +83,21 @@ pub enum BotApiError {
     WrongUsername,
 }
 
+impl BotApiError {
+    /// A stable, token-free category name for diagnostics.
+    pub fn category(&self) -> &'static str {
+        match self {
+            BotApiError::Transport => "transport",
+            BotApiError::Timeout => "timeout",
+            BotApiError::Rejected => "rejected",
+            BotApiError::Oversized => "oversized",
+            BotApiError::Malformed => "malformed",
+            BotApiError::NotBot => "not_bot",
+            BotApiError::WrongUsername => "wrong_username",
+        }
+    }
+}
+
 const MAX_GET_ME_BODY_BYTES: usize = 64 * 1024;
 
 /// Uses Rustls only (via reqwest's `rustls-tls` feature).  Do not include the

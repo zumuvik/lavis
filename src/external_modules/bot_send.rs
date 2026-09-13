@@ -11,6 +11,8 @@ use super::v6_host::{HostBotSend, HostInlineSurface, InlineButton, peer_id_from_
 use crate::bot_api::{BotEditMessage, BotMessage, BotSendApi, HttpBotApi};
 use crate::setup_store::SetupStore;
 use grammers_client::tl;
+use grammers_session::Session;
+use grammers_session::storages::SqliteSession;
 use grammers_session::types::PeerId;
 use std::{
     collections::HashMap,
@@ -26,6 +28,7 @@ pub struct CompanionBotSender {
     token_path: PathBuf,
     api: HttpBotApi,
     client: grammers_client::Client,
+    session: Arc<SqliteSession>,
     registry: Arc<InlineMenuRegistry>,
     bot_form: crate::message_provenance::SharedBotFormLedger,
 }
@@ -59,6 +62,7 @@ impl CompanionBotSender {
         state_path: PathBuf,
         token_path: PathBuf,
         client: grammers_client::Client,
+        session: Arc<SqliteSession>,
         bot_form: crate::message_provenance::SharedBotFormLedger,
     ) -> Result<Self, crate::bot_api::BotApiError> {
         Ok(Self {
@@ -66,6 +70,7 @@ impl CompanionBotSender {
             token_path,
             api: HttpBotApi::new()?,
             client,
+            session,
             registry: Arc::new(InlineMenuRegistry::default()),
             bot_form,
         })
@@ -413,16 +418,72 @@ impl HostInlineSurface for CompanionBotSender {
                 Some(peer) => peer,
                 None => return Err("bot delete unavailable".to_owned()),
             };
+            // The persistent session carries cached access hashes for every
+            // known dialog, so the menu chat usually resolves without any
+            // network round trip. The zero-auth network resolve stays as a
+            // fallback for peers the session has never seen (basic chats).
+            match self.session.peer_ref(peer).await {
+                Ok(Some(peer_ref)) => {
+                    match tokio::time::timeout(
+                        Self::INLINE_CALL_TIMEOUT,
+                        self.client.delete_messages(peer_ref, &[message_id as i32]),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => return Ok(()),
+                        Ok(Err(error)) => {
+                            log_inline_rejection(&error, "delete_menu");
+                            return Err("bot delete rejected".to_owned());
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                target: "lavis_inline_form",
+                                stage = "delete_menu_timeout",
+                                "menu delete timed out"
+                            );
+                            return Err("bot delete timeout".to_owned());
+                        }
+                    }
+                }
+                Ok(None) => {
+                    tracing::debug!(
+                        target: "lavis_inline_form",
+                        stage = "resolve_menu_session",
+                        chat_id,
+                        "menu chat is not in the session cache, falling back to network resolve"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "lavis_inline_form",
+                        stage = "resolve_menu_session",
+                        chat_id,
+                        error = %error,
+                        "session peer lookup failed, falling back to network resolve"
+                    );
+                }
+            }
             let reference = grammers_session::types::PeerRef {
                 id: peer,
                 auth: grammers_session::types::PeerAuth::default(),
             };
-            let resolved = tokio::time::timeout(
+            let resolved = match tokio::time::timeout(
                 Self::INLINE_CALL_TIMEOUT,
                 self.client.resolve_peer(reference),
             )
             .await
-            .map_err(|_| "bot delete timeout".to_owned())?
+            {
+                Ok(resolved) => resolved,
+                Err(_) => {
+                    tracing::warn!(
+                        target: "lavis_inline_form",
+                        stage = "resolve_menu_timeout",
+                        chat_id,
+                        "menu resolve timed out"
+                    );
+                    return Err("bot delete timeout".to_owned());
+                }
+            }
             .map_err(|error| {
                 tracing::warn!(
                     target: "lavis_inline_form",
@@ -434,7 +495,15 @@ impl HostInlineSurface for CompanionBotSender {
             })?;
             let peer_ref = tokio::time::timeout(Self::INLINE_CALL_TIMEOUT, resolved.to_ref())
                 .await
-                .map_err(|_| "bot delete timeout".to_owned())?
+                .map_err(|_| {
+                    tracing::warn!(
+                        target: "lavis_inline_form",
+                        stage = "resolve_menu_ref_timeout",
+                        chat_id,
+                        "menu reference lookup timed out"
+                    );
+                    "bot delete timeout".to_owned()
+                })?
                 .map_err(|error| {
                     tracing::warn!(
                         target: "lavis_inline_form",
@@ -444,7 +513,15 @@ impl HostInlineSurface for CompanionBotSender {
                     );
                     "bot delete rejected".to_owned()
                 })?
-                .ok_or("bot delete rejected")?;
+                .ok_or_else(|| {
+                    tracing::warn!(
+                        target: "lavis_inline_form",
+                        stage = "resolve_menu_ref",
+                        chat_id,
+                        "menu chat resolved to no reference"
+                    );
+                    "bot delete rejected".to_owned()
+                })?;
             tokio::time::timeout(
                 Self::INLINE_CALL_TIMEOUT,
                 self.client.delete_messages(peer_ref, &[message_id as i32]),

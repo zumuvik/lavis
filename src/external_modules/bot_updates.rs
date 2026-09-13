@@ -214,20 +214,26 @@ async fn handle_callback_query(
     let Some((module_id, inner)) = data.split_once('|') else {
         return;
     };
+    let chat_id = query.message.as_ref().map_or(0, |m| m.chat.id);
+    let message_id = query.message.as_ref().map_or(0, |m| m.message_id);
+    let inline_message_id = query.inline_message_id.clone().unwrap_or_default();
     tracing::info!(
         event = "external_module_bot_callback_received",
         module_id = %module_id,
         from_user_id = query.from.id,
+        chat_id,
+        message_id,
+        inline_message_id = %inline_message_id,
         data = %inner,
         "Companion bot callback received"
     );
     let event = BotCallbackEvent {
         callback_id: query.id,
         data: inner.to_owned(),
-        chat_id: query.message.as_ref().map_or(0, |m| m.chat.id),
-        message_id: query.message.as_ref().map_or(0, |m| m.message_id),
+        chat_id,
+        message_id,
         from_user_id: query.from.id,
-        inline_message_id: query.inline_message_id.unwrap_or_default(),
+        inline_message_id,
     };
     let manager = config.manager.clone();
     let module_id = module_id.to_owned();

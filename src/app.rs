@@ -454,6 +454,7 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
                         setup_state_path.clone(),
                         token_path,
                         guard.inner().client().clone(),
+                        guard.inner().session(),
                         bot_form_ledger.clone(),
                     ) {
                         Ok(sender) => {

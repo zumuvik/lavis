@@ -440,12 +440,36 @@ impl V6HostExecutor {
         let input_peer = match input_peer_from_message(&message) {
             Some(input_peer) => input_peer,
             None => {
-                tracing::warn!(
-                    target: "lavis_inline_form",
-                    stage = "derive_input_peer",
-                    "invoking message has no resolvable chat"
-                );
-                return Err("invalid message handle");
+                // The in-memory peer map is cold for chats without cached
+                // peers (typically groups after restart); the persistent
+                // session still holds their access hashes.
+                match message.peer_ref().await {
+                    Ok(Some(peer_ref)) => {
+                        tracing::debug!(
+                            target: "lavis_inline_form",
+                            stage = "derive_input_peer_session_fallback",
+                            "resolved invoking chat from the session cache"
+                        );
+                        grammers_client::tl::enums::InputPeer::from(&peer_ref)
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            target: "lavis_inline_form",
+                            stage = "derive_input_peer",
+                            "invoking message has no resolvable chat"
+                        );
+                        return Err("invalid message handle");
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "lavis_inline_form",
+                            stage = "derive_input_peer",
+                            error = %error,
+                            "invoking message has no resolvable chat"
+                        );
+                        return Err("invalid message handle");
+                    }
+                }
             }
         };
         surface

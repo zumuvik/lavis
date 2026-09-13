@@ -29,6 +29,9 @@ pub struct TelegramClient {
     module_rpc_handle: SenderPoolFatHandle,
     runner: JoinHandle<()>,
     updates: Option<UnboundedReceiver<grammers_session::updates::UpdatesLike>>,
+    // Retained separately from the sender pool so callers can do
+    // session-backed peer resolution without a network round trip.
+    session: Arc<SqliteSession>,
     session_lock: SessionLock,
 }
 
@@ -56,7 +59,7 @@ impl TelegramClient {
         secure_session_file(config.session_path.clone()).await?;
 
         let api_id = i32::try_from(config.api_id).map_err(|_| ClientError::InvalidApiId)?;
-        let pool = SenderPool::new(session, api_id);
+        let pool = SenderPool::new(session.clone(), api_id);
         let module_rpc_handle = pool.handle.clone();
         let client = Client::new(pool.handle);
         let runner = tokio::spawn(pool.runner.run());
@@ -66,12 +69,17 @@ impl TelegramClient {
             module_rpc_handle,
             runner,
             updates: Some(pool.updates),
+            session,
             session_lock,
         })
     }
 
     pub(crate) fn client(&self) -> &Client {
         &self.client
+    }
+
+    pub(crate) fn session(&self) -> Arc<SqliteSession> {
+        self.session.clone()
     }
 
     pub(crate) fn module_rpc_client(&self) -> ModuleRpcClient {
@@ -98,6 +106,7 @@ impl TelegramClient {
             module_rpc_handle,
             runner,
             updates,
+            session: _,
             session_lock,
         } = self;
         drop(updates);
