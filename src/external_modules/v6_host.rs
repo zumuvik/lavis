@@ -155,7 +155,10 @@ pub struct MessageDeleteInvokerParams {
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MessageDeleteBotParams {
+    // Defaulted: the inline-message correlation path sends neither field.
+    #[serde(default)]
     pub chat_id: i64,
+    #[serde(default)]
     pub message_id: i64,
     #[serde(default)]
     pub inline_message_id: Option<String>,
@@ -800,6 +803,10 @@ mod tests {
         assert!(base(0, 0, Some("")).validate().is_err());
         assert!(base(-100123, 0, None).validate().is_err());
         assert!(base(0, 45, None).validate().is_err());
+        // The module sends the inline branch without the chat pair at all.
+        let inline_only: MessageDeleteBotParams =
+            serde_json::from_str(r#"{"inline_message_id":"AgAAAHjh01T"}"#).unwrap();
+        assert!(inline_only.validate().is_ok());
         // Extra fields stay rejected.
         assert!(
             serde_json::from_str::<MessageDeleteBotParams>(
