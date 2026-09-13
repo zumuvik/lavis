@@ -344,7 +344,7 @@ func TestHandleExecuteMenuSendsInlineForm(t *testing.T) {
 	for _, want := range []string{
 		`"method":"inline.form"`,
 		`"method":"message.deleteInvoker"`,
-		`"peer":"peer-abc"`,
+		`"message":"msg-abc"`,
 		"406 / 2 000",
 		"план lite",
 		`"data":"usage"`,
@@ -367,8 +367,8 @@ func TestHandleExecuteMenuWithoutPeerErrors(t *testing.T) {
 	m, _ := hostTestRPC(t, true, "")
 
 	resp := m.handle(request{ProtocolVersion: protocolVersion, Type: "execute", RequestID: "r5b", Command: "ai"})
-	if resp.Type != "error" || !strings.Contains(resp.Message, "peer") {
-		t.Fatalf("expected peer error, got: %+v", resp)
+	if resp.Type != "error" || !strings.Contains(resp.Message, "message") {
+		t.Fatalf("expected message error, got: %+v", resp)
 	}
 }
 
@@ -430,14 +430,14 @@ func TestHandleExecuteReportsAPIText(t *testing.T) {
 
 	// With a peer the API failure text travels inside the inline.form payload.
 	m2, buf2 := hostTestRPC(t, true, "")
-	resp = m2.handle(request{ProtocolVersion: protocolVersion, Type: "execute", RequestID: "r9", Command: "ai", Context: &executeContext{Peer: "peer-xyz"}})
+	resp = m2.handle(request{ProtocolVersion: protocolVersion, Type: "execute", RequestID: "r9", Command: "ai", Context: &executeContext{Peer: "peer-xyz", Message: "msg-xyz"}})
 	if resp.Type != "result" || textOf(resp) != "" {
 		t.Fatalf("menu execute: %+v", resp)
 	}
 	if !strings.Contains(buf2.String(), "token expired or incorrect") {
 		t.Fatalf("inline.form missing API error text:\n%s", buf2.String())
 	}
-	if !strings.Contains(buf2.String(), `"peer":"peer-xyz"`) {
+	if !strings.Contains(buf2.String(), `"message":"msg-xyz"`) {
 		t.Fatalf("inline.form missing peer:\n%s", buf2.String())
 	}
 }

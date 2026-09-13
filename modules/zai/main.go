@@ -315,15 +315,15 @@ func (m *module) execute(ctx context.Context, command, arguments string) (string
 }
 
 // menuCommand publishes the inline menu through the host into the invoking
-// chat. It requires the peer handle from the execute context; without one
+// chat. It requires the message handle from the execute context; without one
 // the command fails explicitly instead of silently skipping the menu.
 func (m *module) menuCommand(ctx context.Context) (string, error) {
-	peer := m.peerHandle()
-	if peer == "" {
-		return "", fmt.Errorf("хост не передал peer: inline-меню недоступно")
+	msgHandle := m.messageHandle()
+	if msgHandle == "" {
+		return "", fmt.Errorf("хост не передал message: inline-меню недоступно")
 	}
 	if err := m.hc.hostCall(ctx, "inline.form", map[string]any{
-		"peer":    peer,
+		"message": m.messageHandle(),
 		"text":    quotaReport(),
 		"buttons": menuButtons,
 	}); err != nil {
