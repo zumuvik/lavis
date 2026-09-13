@@ -15,7 +15,7 @@ use grammers_session::Session;
 use grammers_session::storages::SqliteSession;
 use grammers_session::types::PeerId;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     future::Future,
     path::PathBuf,
     pin::Pin,
@@ -30,7 +30,56 @@ pub struct CompanionBotSender {
     client: grammers_client::Client,
     session: Arc<SqliteSession>,
     registry: Arc<InlineMenuRegistry>,
+    publications: MenuPublications,
     bot_form: crate::message_provenance::SharedBotFormLedger,
+}
+
+/// Remembers the (peer, message id) of each module's most recently published
+/// menus. Bot API callbacks for via-bot inline messages carry only an
+/// `inline_message_id` (no `query.message`), and the host cannot convert it
+/// to a chat/message pair, so a Close press is correlated to the newest live
+/// publication of that module. LIFO: menus are closed shortly after opening.
+#[derive(Default)]
+struct MenuPublications {
+    entries: Mutex<HashMap<String, VecDeque<(PeerId, i32)>>>,
+}
+
+const MENU_PUBLICATIONS_CAP: usize = 4;
+
+impl MenuPublications {
+    fn record(&self, module_id: &str, peer: PeerId, message_id: i32) {
+        let mut entries = self.lock_entries();
+        let ring = entries.entry(module_id.to_owned()).or_default();
+        if ring.len() >= MENU_PUBLICATIONS_CAP {
+            ring.pop_front();
+        }
+        ring.push_back((peer, message_id));
+    }
+
+    fn take_latest(&self, module_id: &str) -> Option<(PeerId, i32)> {
+        let mut entries = self.lock_entries();
+        entries.get_mut(module_id)?.pop_back()
+    }
+
+    fn lock_entries(&self) -> std::sync::MutexGuard<'_, HashMap<String, VecDeque<(PeerId, i32)>>> {
+        match self.entries.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}
+
+/// The module owning a publication, taken from the callback-data namespace.
+/// `V6HostExecutor::data_prefix` builds the prefix as exactly
+/// `format!("{module_id}|")`, so stripping the trailing separator recovers
+/// the module id; anything else is a caller contract violation.
+fn module_id_from_data_prefix(prefix: &str) -> Option<&str> {
+    let module_id = prefix.strip_suffix('|')?;
+    if module_id.is_empty() || module_id.contains('|') {
+        None
+    } else {
+        Some(module_id)
+    }
 }
 
 /// Logs the sanitized Telegram rejection name (constant identifiers only —
@@ -72,6 +121,7 @@ impl CompanionBotSender {
             client,
             session,
             registry: Arc::new(InlineMenuRegistry::default()),
+            publications: MenuPublications::default(),
             bot_form,
         })
     }
@@ -121,7 +171,7 @@ impl CompanionBotSender {
         &self,
         destination_peer: tl::enums::InputPeer,
         query: &str,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<(PeerId, i32)>, String> {
         let username = self.load_bot_username().await?;
         let bot_peer = tokio::time::timeout(
             Self::INLINE_CALL_TIMEOUT,
@@ -238,10 +288,11 @@ impl CompanionBotSender {
         // The via-bot menu is a self-authored update whose text is
         // module-controlled; register it so the runtime consumes the update
         // before command routing sees it.
-        for (peer_id, message_id) in Self::extract_message_ids(&updates) {
-            self.bot_form.register(peer_id, message_id);
+        let published = Self::extract_message_ids(&updates);
+        for (peer_id, message_id) in &published {
+            self.bot_form.register(*peer_id, *message_id);
         }
-        Ok(())
+        Ok(published)
     }
 
     fn extract_message_ids(updates: &tl::enums::Updates) -> Vec<(PeerId, i32)> {
@@ -332,7 +383,23 @@ impl HostInlineSurface for CompanionBotSender {
                 },
             );
             match self.send_inline_form(input_peer, &query).await {
-                Ok(()) => Ok(()),
+                Ok(published) => {
+                    match module_id_from_data_prefix(data_prefix) {
+                        Some(module_id) => {
+                            for (peer, message_id) in published {
+                                self.publications.record(module_id, peer, message_id);
+                            }
+                        }
+                        None => {
+                            tracing::warn!(
+                                target: "lavis_inline_form",
+                                stage = "record_publication",
+                                "inline form data prefix does not name a module; close correlation unavailable"
+                            );
+                        }
+                    }
+                    Ok(())
+                }
                 Err(error) => {
                     self.registry.take(&query);
                     Err(error)
@@ -409,131 +476,159 @@ impl HostInlineSurface for CompanionBotSender {
         &'a self,
         chat_id: i64,
         message_id: i64,
+        module_id: &'a str,
+        inline_message_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
             // The USER session deletes via-bot messages from its own dialogs
             // unconditionally — the Bot API cannot address Saved Messages and
             // needs moderation rights in groups, so it was the wrong tool.
-            let peer = match peer_id_from_bot_chat_id(chat_id) {
-                Some(peer) => peer,
-                None => return Err("bot delete unavailable".to_owned()),
-            };
-            // The persistent session carries cached access hashes for every
-            // known dialog, so the menu chat usually resolves without any
-            // network round trip. The zero-auth network resolve stays as a
-            // fallback for peers the session has never seen (basic chats).
-            match self.session.peer_ref(peer).await {
-                Ok(Some(peer_ref)) => {
-                    match tokio::time::timeout(
-                        Self::INLINE_CALL_TIMEOUT,
-                        self.client.delete_messages(peer_ref, &[message_id as i32]),
-                    )
-                    .await
-                    {
-                        Ok(Ok(_)) => return Ok(()),
-                        Ok(Err(error)) => {
-                            log_inline_rejection(&error, "delete_menu");
-                            return Err("bot delete rejected".to_owned());
-                        }
-                        Err(_) => {
-                            tracing::warn!(
-                                target: "lavis_inline_form",
-                                stage = "delete_menu_timeout",
-                                "menu delete timed out"
-                            );
-                            return Err("bot delete timeout".to_owned());
-                        }
+            let peer = if chat_id != 0 && message_id > 0 {
+                match peer_id_from_bot_chat_id(chat_id) {
+                    Some(peer) => (peer, message_id as i32),
+                    None => return Err("bot delete unavailable".to_owned()),
+                }
+            } else if !inline_message_id.is_empty() {
+                // Bot API callbacks for via-bot inline messages carry no
+                // `query.message`, only `inline_message_id`, and Telegram
+                // exposes no conversion to a chat/message pair. Correlate
+                // against the menus this host published for the module.
+                tracing::info!(
+                    target: "lavis_inline_form",
+                    stage = "delete_menu_inline",
+                    module_id,
+                    "deleting menu via publication correlation"
+                );
+                match self.publications.take_latest(module_id) {
+                    Some((peer, message_id)) => (peer, message_id),
+                    None => {
+                        tracing::warn!(
+                            target: "lavis_inline_form",
+                            stage = "delete_menu_no_record",
+                            module_id,
+                            "no recorded publication to correlate the close press with"
+                        );
+                        return Err("bot delete rejected".to_owned());
                     }
                 }
-                Ok(None) => {
-                    tracing::debug!(
-                        target: "lavis_inline_form",
-                        stage = "resolve_menu_session",
-                        chat_id,
-                        "menu chat is not in the session cache, falling back to network resolve"
-                    );
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        target: "lavis_inline_form",
-                        stage = "resolve_menu_session",
-                        chat_id,
-                        error = %error,
-                        "session peer lookup failed, falling back to network resolve"
-                    );
-                }
-            }
-            let reference = grammers_session::types::PeerRef {
-                id: peer,
-                auth: grammers_session::types::PeerAuth::default(),
+            } else {
+                return Err("bot delete unavailable".to_owned());
             };
-            let resolved = match tokio::time::timeout(
+            self.delete_by_peer(peer.0, peer.1).await
+        })
+    }
+}
+
+impl CompanionBotSender {
+    /// Deletes a single message by MTProto peer: session-backed access-hash
+    /// resolution first, zero-auth network resolve as fallback for peers the
+    /// session has never seen (basic chats).
+    async fn delete_by_peer(&self, peer: PeerId, message_id: i32) -> Result<(), String> {
+        let session_ref = match self.session.peer_ref(peer).await {
+            Ok(peer_ref) => peer_ref,
+            Err(error) => {
+                tracing::warn!(
+                    target: "lavis_inline_form",
+                    stage = "resolve_menu_session",
+                    chat_id = peer.bare_id_unchecked(),
+                    error = %error,
+                    "session peer lookup failed, falling back to network resolve"
+                );
+                None
+            }
+        };
+        if let Some(peer_ref) = session_ref {
+            return match tokio::time::timeout(
                 Self::INLINE_CALL_TIMEOUT,
-                self.client.resolve_peer(reference),
+                self.client.delete_messages(peer_ref, &[message_id]),
             )
             .await
             {
-                Ok(resolved) => resolved,
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(error)) => {
+                    log_inline_rejection(&error, "delete_menu");
+                    Err("bot delete rejected".to_owned())
+                }
                 Err(_) => {
                     tracing::warn!(
                         target: "lavis_inline_form",
-                        stage = "resolve_menu_timeout",
-                        chat_id,
-                        "menu resolve timed out"
+                        stage = "delete_menu_timeout",
+                        "menu delete timed out"
                     );
-                    return Err("bot delete timeout".to_owned());
+                    Err("bot delete timeout".to_owned())
                 }
+            };
+        }
+        let reference = grammers_session::types::PeerRef {
+            id: peer,
+            auth: grammers_session::types::PeerAuth::default(),
+        };
+        let resolved = match tokio::time::timeout(
+            Self::INLINE_CALL_TIMEOUT,
+            self.client.resolve_peer(reference),
+        )
+        .await
+        {
+            Ok(resolved) => resolved,
+            Err(_) => {
+                tracing::warn!(
+                    target: "lavis_inline_form",
+                    stage = "resolve_menu_timeout",
+                    chat_id = peer.bare_id_unchecked(),
+                    "menu resolve timed out"
+                );
+                return Err("bot delete timeout".to_owned());
             }
+        }
+        .map_err(|error| {
+            tracing::warn!(
+                target: "lavis_inline_form",
+                stage = "resolve_menu",
+                error = %error,
+                "Could not resolve the menu chat"
+            );
+            "bot delete rejected".to_owned()
+        })?;
+        let peer_ref = tokio::time::timeout(Self::INLINE_CALL_TIMEOUT, resolved.to_ref())
+            .await
+            .map_err(|_| {
+                tracing::warn!(
+                    target: "lavis_inline_form",
+                    stage = "resolve_menu_ref_timeout",
+                    chat_id = peer.bare_id_unchecked(),
+                    "menu reference lookup timed out"
+                );
+                "bot delete timeout".to_owned()
+            })?
             .map_err(|error| {
                 tracing::warn!(
                     target: "lavis_inline_form",
-                    stage = "resolve_menu",
+                    stage = "resolve_menu_ref",
                     error = %error,
-                    "Could not resolve the menu chat"
+                    "Could not reference the menu chat"
+                );
+                "bot delete rejected".to_owned()
+            })?
+            .ok_or_else(|| {
+                tracing::warn!(
+                    target: "lavis_inline_form",
+                    stage = "resolve_menu_ref",
+                    chat_id = peer.bare_id_unchecked(),
+                    "menu chat resolved to no reference"
                 );
                 "bot delete rejected".to_owned()
             })?;
-            let peer_ref = tokio::time::timeout(Self::INLINE_CALL_TIMEOUT, resolved.to_ref())
-                .await
-                .map_err(|_| {
-                    tracing::warn!(
-                        target: "lavis_inline_form",
-                        stage = "resolve_menu_ref_timeout",
-                        chat_id,
-                        "menu reference lookup timed out"
-                    );
-                    "bot delete timeout".to_owned()
-                })?
-                .map_err(|error| {
-                    tracing::warn!(
-                        target: "lavis_inline_form",
-                        stage = "resolve_menu_ref",
-                        error = %error,
-                        "Could not reference the menu chat"
-                    );
-                    "bot delete rejected".to_owned()
-                })?
-                .ok_or_else(|| {
-                    tracing::warn!(
-                        target: "lavis_inline_form",
-                        stage = "resolve_menu_ref",
-                        chat_id,
-                        "menu chat resolved to no reference"
-                    );
-                    "bot delete rejected".to_owned()
-                })?;
-            tokio::time::timeout(
-                Self::INLINE_CALL_TIMEOUT,
-                self.client.delete_messages(peer_ref, &[message_id as i32]),
-            )
-            .await
-            .map_err(|_| "bot delete timeout".to_owned())?
-            .map_err(|error| {
-                log_inline_rejection(&error, "delete_menu");
-                "bot delete rejected".to_owned()
-            })?;
-            Ok(())
-        })
+        tokio::time::timeout(
+            Self::INLINE_CALL_TIMEOUT,
+            self.client.delete_messages(peer_ref, &[message_id]),
+        )
+        .await
+        .map_err(|_| "bot delete timeout".to_owned())?
+        .map_err(|error| {
+            log_inline_rejection(&error, "delete_menu");
+            "bot delete rejected".to_owned()
+        })?;
+        Ok(())
     }
 }
 
@@ -658,5 +753,48 @@ mod tests {
             );
         }
         assert_eq!(registry.take("stale"), None);
+    }
+
+    #[test]
+    fn publications_are_lifo_per_module() {
+        let publications = MenuPublications::default();
+        let first = PeerId::chat(1).unwrap();
+        let second = PeerId::chat(2).unwrap();
+        publications.record("z", first, 11);
+        publications.record("z", second, 22);
+        assert_eq!(publications.take_latest("z"), Some((second, 22)));
+        assert_eq!(publications.take_latest("z"), Some((first, 11)));
+        assert_eq!(publications.take_latest("z"), None);
+        assert_eq!(publications.take_latest("other"), None);
+    }
+
+    #[test]
+    fn publications_ring_drops_oldest_at_cap() {
+        let publications = MenuPublications::default();
+        for index in 0..(MENU_PUBLICATIONS_CAP as i32 + 2) {
+            publications.record("z", PeerId::chat(1).unwrap(), 100 + index);
+        }
+        assert_eq!(
+            publications.take_latest("z"),
+            Some((
+                PeerId::chat(1).unwrap(),
+                100 + MENU_PUBLICATIONS_CAP as i32 + 1
+            ))
+        );
+        let mut remaining = Vec::new();
+        while let Some((_, message_id)) = publications.take_latest("z") {
+            remaining.push(message_id);
+        }
+        // The two oldest entries (100, 101) were evicted.
+        assert_eq!(remaining, vec![104, 103, 102]);
+    }
+
+    #[test]
+    fn module_id_from_data_prefix_expects_single_namespace() {
+        assert_eq!(module_id_from_data_prefix("z|"), Some("z"));
+        assert_eq!(module_id_from_data_prefix("cleaner|"), Some("cleaner"));
+        assert_eq!(module_id_from_data_prefix("|"), None);
+        assert_eq!(module_id_from_data_prefix("z"), None);
+        assert_eq!(module_id_from_data_prefix("a|b|"), None);
     }
 }

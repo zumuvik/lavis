@@ -258,13 +258,20 @@ func (m *module) handleEvent(req request) {
 	case "quota":
 		text = quotaReport()
 	case "close":
+		// Closing removes the menu instead of redrawing a dead shell. The
+		// user session deletes the via-bot message unconditionally; for
+		// inline messages the Bot API callback carries no chat/message pair,
+		// so the host correlates the press with its newest publication.
 		if cb.ChatID != 0 && cb.MessageID != 0 {
-			// Closing removes the menu instead of redrawing a dead shell.
-			// The bot can only delete its own message in chats where it has
-			// moderation rights; otherwise fall back to the closed stub.
 			if err := m.hc.hostCall(ctx, "message.deleteBot", map[string]any{
 				"chat_id":    cb.ChatID,
 				"message_id": cb.MessageID,
+			}); err == nil {
+				return
+			}
+		} else if cb.InlineMessageID != "" {
+			if err := m.hc.hostCall(ctx, "message.deleteBot", map[string]any{
+				"inline_message_id": cb.InlineMessageID,
 			}); err == nil {
 				return
 			}

@@ -157,6 +157,24 @@ pub struct MessageDeleteInvokerParams {
 pub struct MessageDeleteBotParams {
     pub chat_id: i64,
     pub message_id: i64,
+    #[serde(default)]
+    pub inline_message_id: Option<String>,
+}
+
+impl MessageDeleteBotParams {
+    fn validate(&self) -> Result<(), &'static str> {
+        let chat = self.chat_id != 0 && self.message_id > 0;
+        let inline = self
+            .inline_message_id
+            .as_deref()
+            .is_some_and(|id| !id.is_empty());
+        // Via-bot inline messages arrive at the module with no chat/message
+        // pair, only `inline_message_id`; the host correlates the publication.
+        if !chat && !inline {
+            return Err("chat_id and message_id are required");
+        }
+        Ok(())
+    }
 }
 
 /// Offline boundary for companion-bot posts. The runtime integration supplies
@@ -253,11 +271,16 @@ pub trait HostInlineSurface: Send + Sync {
         data_prefix: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
-    /// Deletes a bot-sent inline form message (the Close action).
+    /// Deletes a bot-sent inline form message (the Close action). Either
+    /// `chat_id` + `message_id` or a non-empty `inline_message_id` names the
+    /// target; `module_id` scopes inline-message correlation to the module's
+    /// own recorded publications.
     fn delete_bot_message<'a>(
         &'a self,
         chat_id: i64,
         message_id: i64,
+        module_id: &'a str,
+        inline_message_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 }
 
@@ -395,11 +418,19 @@ impl V6HostExecutor {
         let surface = self.inline.as_ref().ok_or("inline surface unavailable")?;
         let params: MessageDeleteBotParams =
             serde_json::from_str(params.get()).map_err(|_| "invalid params")?;
-        if params.chat_id == 0 || params.message_id <= 0 {
-            return Err("chat_id and message_id are required");
-        }
+        params.validate()?;
+        let inline_message_id = params
+            .inline_message_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .unwrap_or("");
         surface
-            .delete_bot_message(params.chat_id, params.message_id)
+            .delete_bot_message(
+                params.chat_id,
+                params.message_id,
+                &self.module_id,
+                inline_message_id,
+            )
             .await
             .map_err(|message| match message.as_str() {
                 "bot delete rejected" => "bot delete rejected",
@@ -754,6 +785,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(value, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn delete_bot_params_accept_chat_pair_or_inline_id() {
+        let base = |chat_id: i64, message_id: i64, inline: Option<&str>| MessageDeleteBotParams {
+            chat_id,
+            message_id,
+            inline_message_id: inline.map(str::to_owned),
+        };
+        assert!(base(-100123, 45, None).validate().is_ok());
+        assert!(base(0, 0, Some("AgAAAHjh01T")).validate().is_ok());
+        assert!(base(0, 0, None).validate().is_err());
+        assert!(base(0, 0, Some("")).validate().is_err());
+        assert!(base(-100123, 0, None).validate().is_err());
+        assert!(base(0, 45, None).validate().is_err());
+        // Extra fields stay rejected.
+        assert!(
+            serde_json::from_str::<MessageDeleteBotParams>(
+                r#"{"chat_id":0,"message_id":0,"inline_message_id":"x","extra":1}"#
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
