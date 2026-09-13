@@ -7,7 +7,7 @@
 //! session). Error strings are static so no token material or HTTP detail
 //! can leak into module-visible diagnostics.
 
-use super::v6_host::{HostBotSend, HostInlineSurface, InlineButton};
+use super::v6_host::{HostBotSend, HostInlineSurface, InlineButton, peer_id_from_bot_chat_id};
 use crate::bot_api::{BotEditMessage, BotMessage, BotSendApi, HttpBotApi};
 use crate::setup_store::SetupStore;
 use grammers_client::tl;
@@ -34,13 +34,23 @@ pub struct CompanionBotSender {
 /// never tokens or URLs) so menu failures are diagnosable from the Logs
 /// topic and journalctl without exposing anything else.
 fn log_inline_rejection(error: &grammers_client::InvocationError, stage: &str) {
-    if let grammers_client::InvocationError::Rpc(rpc) = error {
-        tracing::warn!(
-            target: "lavis_inline_form",
-            stage,
-            name = %rpc.name,
-            "inline query rejected by Telegram"
-        );
+    match error {
+        grammers_client::InvocationError::Rpc(rpc) => {
+            tracing::warn!(
+                target: "lavis_inline_form",
+                stage,
+                name = %rpc.name,
+                "inline query rejected by Telegram"
+            );
+        }
+        other => {
+            tracing::warn!(
+                target: "lavis_inline_form",
+                stage,
+                error = %other,
+                "inline query failed"
+            );
+        }
     }
 }
 
@@ -155,29 +165,53 @@ impl CompanionBotSender {
             .ok_or_else(|| "inline form rejected".to_owned())?;
         let destination_peer = tl::enums::InputPeer::from(&peer_ref);
 
-        let response = tokio::time::timeout(
-            Self::INLINE_CALL_TIMEOUT,
-            self.client
-                .invoke(&tl::functions::messages::GetInlineBotResults {
-                    bot,
-                    peer: destination_peer.clone(),
-                    geo_point: None,
-                    query: query.to_owned(),
-                    offset: String::new(),
-                }),
-        )
-        .await
-        .map_err(|_| "inline form timeout".to_owned())?
-        .map_err(|error| {
-            log_inline_rejection(&error, "get_inline_results");
-            "inline form rejected".to_owned()
-        })?;
-        let tl::enums::messages::BotResults::Results(results) = response;
-        let result_id = match results.results.first() {
-            Some(tl::enums::BotInlineResult::Result(result)) => result.id.clone(),
-            Some(tl::enums::BotInlineResult::BotInlineMediaResult(result)) => result.id.clone(),
-            None => return Err("inline form rejected".to_owned()),
-        };
+        // Telegram can answer a fresh query with an empty result set while
+        // the companion bot is still responding; retry once before failing.
+        let mut result_id = String::new();
+        let mut query_id = 0i64;
+        for attempt in 0..2 {
+            let response = tokio::time::timeout(
+                Self::INLINE_CALL_TIMEOUT,
+                self.client
+                    .invoke(&tl::functions::messages::GetInlineBotResults {
+                        bot: bot.clone(),
+                        peer: destination_peer.clone(),
+                        geo_point: None,
+                        query: query.to_owned(),
+                        offset: String::new(),
+                    }),
+            )
+            .await
+            .map_err(|_| "inline form timeout".to_owned())?
+            .map_err(|error| {
+                log_inline_rejection(&error, "get_inline_results");
+                "inline form rejected".to_owned()
+            })?;
+            let tl::enums::messages::BotResults::Results(results) = response;
+            query_id = results.query_id;
+            match results.results.first() {
+                Some(tl::enums::BotInlineResult::Result(result)) => {
+                    result_id = result.id.clone();
+                    break;
+                }
+                Some(tl::enums::BotInlineResult::BotInlineMediaResult(result)) => {
+                    result_id = result.id.clone();
+                    break;
+                }
+                None => {
+                    tracing::warn!(
+                        target: "lavis_inline_form",
+                        stage = "get_inline_results",
+                        attempt = attempt,
+                        "inline query returned no results"
+                    );
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+        if result_id.is_empty() {
+            return Err("inline form rejected".to_owned());
+        }
         let mut random_id = [0u8; 8];
         getrandom::fill(&mut random_id).map_err(|_| "inline form unavailable".to_owned())?;
         let updates = tokio::time::timeout(
@@ -191,7 +225,7 @@ impl CompanionBotSender {
                     peer: destination_peer,
                     reply_to: None,
                     random_id: i64::from_le_bytes(random_id),
-                    query_id: results.query_id,
+                    query_id,
                     id: result_id,
                     schedule_date: None,
                     send_as: None,
@@ -381,21 +415,56 @@ impl HostInlineSurface for CompanionBotSender {
         message_id: i64,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
-            let token = self
-                .load_token()
+            // The USER session deletes via-bot messages from its own dialogs
+            // unconditionally — the Bot API cannot address Saved Messages and
+            // needs moderation rights in groups, so it was the wrong tool.
+            let peer = match peer_id_from_bot_chat_id(chat_id) {
+                Some(peer) => peer,
+                None => return Err("bot delete unavailable".to_owned()),
+            };
+            let reference = grammers_session::types::PeerRef {
+                id: peer,
+                auth: grammers_session::types::PeerAuth::default(),
+            };
+            let resolved = tokio::time::timeout(
+                Self::INLINE_CALL_TIMEOUT,
+                self.client.resolve_peer(reference),
+            )
+            .await
+            .map_err(|_| "bot delete timeout".to_owned())?
+            .map_err(|error| {
+                tracing::warn!(
+                    target: "lavis_inline_form",
+                    stage = "resolve_menu",
+                    error = %error,
+                    "Could not resolve the menu chat"
+                );
+                "bot delete rejected".to_owned()
+            })?;
+            let peer_ref = tokio::time::timeout(Self::INLINE_CALL_TIMEOUT, resolved.to_ref())
                 .await
-                .map_err(|message| match message.as_str() {
-                    "bot send unavailable" => "bot delete unavailable".to_owned(),
-                    other => other.to_owned(),
-                })?;
-            self.api
-                .delete_message(&token, chat_id, message_id)
-                .await
-                .map_err(|error| match error {
-                    crate::bot_api::BotApiError::Rejected => "bot delete rejected".to_owned(),
-                    crate::bot_api::BotApiError::Timeout => "bot delete timeout".to_owned(),
-                    _ => "bot delete unavailable".to_owned(),
-                })
+                .map_err(|_| "bot delete timeout".to_owned())?
+                .map_err(|error| {
+                    tracing::warn!(
+                        target: "lavis_inline_form",
+                        stage = "resolve_menu_ref",
+                        error = %error,
+                        "Could not reference the menu chat"
+                    );
+                    "bot delete rejected".to_owned()
+                })?
+                .ok_or("bot delete rejected")?;
+            tokio::time::timeout(
+                Self::INLINE_CALL_TIMEOUT,
+                self.client.delete_messages(peer_ref, &[message_id as i32]),
+            )
+            .await
+            .map_err(|_| "bot delete timeout".to_owned())?
+            .map_err(|error| {
+                log_inline_rejection(&error, "delete_menu");
+                "bot delete rejected".to_owned()
+            })?;
+            Ok(())
         })
     }
 }

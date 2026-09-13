@@ -572,7 +572,7 @@ impl V6HostExecutor {
 /// positive, basic groups are negative small ids, and channels/supergroups
 /// carry the -100 prefix. Supergroup migration invalidates the mapping on
 /// the Bot API side only, which the ledger treats as a plain miss.
-fn peer_id_from_bot_chat_id(chat_id: i64) -> Option<PeerId> {
+pub(crate) fn peer_id_from_bot_chat_id(chat_id: i64) -> Option<PeerId> {
     if chat_id >= 0 {
         PeerId::user(chat_id)
     } else if chat_id <= -1_000_000_000_000 {
