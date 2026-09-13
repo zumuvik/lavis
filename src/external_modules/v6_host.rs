@@ -421,13 +421,33 @@ impl V6HostExecutor {
         let params: InlineFormParams =
             serde_json::from_str(params.get()).map_err(|_| "invalid params")?;
         params.validate(prefix.len())?;
-        let message = self
+        let message = match self
             .handles
             .lock()
             .map_err(|_| "invalid message handle")?
             .resolve_message(&params.message)
-            .map_err(|_| "invalid message handle")?;
-        let input_peer = input_peer_from_message(&message).ok_or("invalid message handle")?;
+        {
+            Ok(message) => message,
+            Err(_) => {
+                tracing::warn!(
+                    target: "lavis_inline_form",
+                    stage = "resolve_message",
+                    "module passed an unresolvable message handle"
+                );
+                return Err("invalid message handle");
+            }
+        };
+        let input_peer = match input_peer_from_message(&message) {
+            Some(input_peer) => input_peer,
+            None => {
+                tracing::warn!(
+                    target: "lavis_inline_form",
+                    stage = "derive_input_peer",
+                    "invoking message has no resolvable chat"
+                );
+                return Err("invalid message handle");
+            }
+        };
         surface
             .form(input_peer, &params.text, &params.buttons, &prefix)
             .await
