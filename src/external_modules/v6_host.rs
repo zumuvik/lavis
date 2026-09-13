@@ -68,7 +68,7 @@ impl MessageSendBotParams {
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct InlineFormParams {
-    pub peer: String,
+    pub message: String,
     pub text: String,
     #[serde(default)]
     pub buttons: Vec<Vec<InlineButton>>,
@@ -76,8 +76,8 @@ pub struct InlineFormParams {
 
 impl InlineFormParams {
     pub fn validate(&self, prefix_len: usize) -> Result<(), &'static str> {
-        if self.peer.is_empty() {
-            return Err("peer handle is required");
+        if self.message.is_empty() {
+            return Err("message handle is required");
         }
         if self.text.is_empty() || self.text.contains('\0') {
             return Err("text is required");
@@ -222,9 +222,13 @@ pub fn validate_button_rows(
 pub trait HostInlineSurface: Send + Sync {
     /// Publish the prepared menu and send it into `peer` as a via-bot
     /// message. `data_prefix` is the `<module_id>|` callback namespace.
+    /// Publish the prepared menu and send it into the invoking chat as a
+    /// via-bot message. `input_peer` carries the REAL access hash of the
+    /// invoking chat (derived from the invoking message's own context), and
+    /// `data_prefix` is the `<module_id>|` callback namespace.
     fn form<'a>(
         &'a self,
-        peer: grammers_session::types::PeerId,
+        input_peer: grammers_client::tl::enums::InputPeer,
         text: &'a str,
         buttons: &'a [Vec<InlineButton>],
         data_prefix: &'a str,
@@ -417,14 +421,15 @@ impl V6HostExecutor {
         let params: InlineFormParams =
             serde_json::from_str(params.get()).map_err(|_| "invalid params")?;
         params.validate(prefix.len())?;
-        let peer = self
+        let message = self
             .handles
             .lock()
-            .map_err(|_| "invalid peer handle")?
-            .resolve_peer(&params.peer)
-            .map_err(|_| "invalid peer handle")?;
+            .map_err(|_| "invalid message handle")?
+            .resolve_message(&params.message)
+            .map_err(|_| "invalid message handle")?;
+        let input_peer = input_peer_from_message(&message).ok_or("invalid message handle")?;
         surface
-            .form(peer, &params.text, &params.buttons, &prefix)
+            .form(input_peer, &params.text, &params.buttons, &prefix)
             .await
             .map_err(|message| match message.as_str() {
                 "inline form rejected" => "inline form rejected",
@@ -579,6 +584,44 @@ pub(crate) fn peer_id_from_bot_chat_id(chat_id: i64) -> Option<PeerId> {
         PeerId::channel(-(chat_id + 1_000_000_000_000))
     } else {
         PeerId::chat(-chat_id)
+    }
+}
+
+/// The invoking message's own chat as an InputPeer: the rich message carries
+/// the real access hash from the client's chat cache, so the host never needs
+/// a separate (network) peer resolution for module menus.
+fn input_peer_from_message(
+    message: &grammers_client::message::Message,
+) -> Option<grammers_client::tl::enums::InputPeer> {
+    match message.peer() {
+        Some(grammers_client::peer::Peer::User(user)) => match &user.raw {
+            grammers_client::tl::enums::User::User(raw) => {
+                Some(grammers_client::tl::enums::InputPeer::User(
+                    grammers_client::tl::types::InputPeerUser {
+                        user_id: raw.id,
+                        access_hash: raw.access_hash.unwrap_or_default(),
+                    },
+                ))
+            }
+            _ => None,
+        },
+        Some(grammers_client::peer::Peer::Group(group)) => match &group.raw {
+            grammers_client::tl::enums::Chat::Chat(raw) => {
+                Some(grammers_client::tl::enums::InputPeer::Chat(
+                    grammers_client::tl::types::InputPeerChat { chat_id: raw.id },
+                ))
+            }
+            _ => None,
+        },
+        Some(grammers_client::peer::Peer::Channel(channel)) => {
+            Some(grammers_client::tl::enums::InputPeer::Channel(
+                grammers_client::tl::types::InputPeerChannel {
+                    channel_id: channel.raw.id,
+                    access_hash: channel.raw.access_hash.unwrap_or_default(),
+                },
+            ))
+        }
+        _ => None,
     }
 }
 

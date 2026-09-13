@@ -112,7 +112,11 @@ impl CompanionBotSender {
 
     const INLINE_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
-    async fn send_inline_form(&self, peer: PeerId, query: &str) -> Result<(), String> {
+    async fn send_inline_form(
+        &self,
+        destination_peer: tl::enums::InputPeer,
+        query: &str,
+    ) -> Result<(), String> {
         let username = self.load_bot_username().await?;
         let bot_peer = tokio::time::timeout(
             Self::INLINE_CALL_TIMEOUT,
@@ -141,65 +145,18 @@ impl CompanionBotSender {
             },
             _ => return Err("companion bot is not configured".to_owned()),
         };
-        // PeerId carries no access hash, and an uncached peer (a fresh DM)
-        // needs a network resolve that can hit transient reconnects: retry
-        // the resolve/query chain before giving up. The final send is NOT
-        // retried — a retried send risks double menus.
+        // Telegram races the companion bot's answer on fresh queries, so a
+        // retry gives slow answers a second chance.
         let mut last_error = "inline form rejected".to_owned();
         let mut result_id = String::new();
         let mut query_id = 0i64;
-        let mut destination_peer: Option<tl::enums::InputPeer> = None;
-        for attempt in 0..3u32 {
-            let reference = grammers_session::types::PeerRef {
-                id: peer,
-                auth: grammers_session::types::PeerAuth::default(),
-            };
-            let input_peer = match tokio::time::timeout(Self::INLINE_CALL_TIMEOUT, async {
-                let resolved = self.client.resolve_peer(reference).await.map_err(|error| {
-                    tracing::warn!(
-                        target: "lavis_inline_form",
-                        stage = "resolve_destination",
-                        error = %error,
-                        "Could not resolve the menu chat"
-                    );
-                    "inline form rejected".to_owned()
-                })?;
-                let peer_ref = resolved
-                    .to_ref()
-                    .await
-                    .map_err(|error| {
-                        tracing::warn!(
-                            target: "lavis_inline_form",
-                            stage = "resolve_destination_ref",
-                            error = %error,
-                            "Could not reference the menu chat"
-                        );
-                        "inline form rejected".to_owned()
-                    })?
-                    .ok_or_else(|| "inline form rejected".to_owned())?;
-                Result::<_, String>::Ok(tl::enums::InputPeer::from(&peer_ref))
-            })
-            .await
-            {
-                Ok(Ok(input_peer)) => input_peer,
-                Ok(Err(error)) => {
-                    last_error = error;
-                    tokio::time::sleep(Duration::from_millis(400)).await;
-                    continue;
-                }
-                Err(_) => {
-                    last_error = "inline form timeout".to_owned();
-                    tokio::time::sleep(Duration::from_millis(400)).await;
-                    continue;
-                }
-            };
-
+        for attempt in 0..2u32 {
             let response = match tokio::time::timeout(
                 Self::INLINE_CALL_TIMEOUT,
                 self.client
                     .invoke(&tl::functions::messages::GetInlineBotResults {
                         bot: bot.clone(),
-                        peer: input_peer.clone(),
+                        peer: destination_peer.clone(),
                         geo_point: None,
                         query: query.to_owned(),
                         offset: String::new(),
@@ -241,12 +198,11 @@ impl CompanionBotSender {
                 tl::enums::BotInlineResult::Result(result) => result.id.clone(),
                 tl::enums::BotInlineResult::BotInlineMediaResult(result) => result.id.clone(),
             };
-            destination_peer = Some(input_peer);
             break;
         }
-        let Some(destination_peer) = destination_peer else {
+        if result_id.is_empty() {
             return Err(last_error);
-        };
+        }
         let mut random_id = [0u8; 8];
         getrandom::fill(&mut random_id).map_err(|_| "inline form unavailable".to_owned())?;
         let updates = tokio::time::timeout(
@@ -350,7 +306,7 @@ impl HostBotSend for CompanionBotSender {
 impl HostInlineSurface for CompanionBotSender {
     fn form<'a>(
         &'a self,
-        peer: PeerId,
+        input_peer: tl::enums::InputPeer,
         text: &'a str,
         buttons: &'a [Vec<InlineButton>],
         data_prefix: &'a str,
@@ -370,7 +326,7 @@ impl HostInlineSurface for CompanionBotSender {
                     rows,
                 },
             );
-            match self.send_inline_form(peer, &query).await {
+            match self.send_inline_form(input_peer, &query).await {
                 Ok(()) => Ok(()),
                 Err(error) => {
                     self.registry.take(&query);
