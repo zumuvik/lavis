@@ -141,77 +141,112 @@ impl CompanionBotSender {
             },
             _ => return Err("companion bot is not configured".to_owned()),
         };
-        // PeerId carries no access hash; resolve through the session so the
-        // destination uses a real access hash (ambient authority fails with
-        // CHANNEL_INVALID outside the self chat).
-        let reference = grammers_session::types::PeerRef {
-            id: peer,
-            auth: grammers_session::types::PeerAuth::default(),
-        };
-        let resolved = tokio::time::timeout(
-            Self::INLINE_CALL_TIMEOUT,
-            self.client.resolve_peer(reference),
-        )
-        .await
-        .map_err(|_| "inline form timeout".to_owned())?
-        .map_err(|error| {
-            log_inline_rejection(&error, "resolve_destination");
-            "inline form rejected".to_owned()
-        })?;
-        let peer_ref = tokio::time::timeout(Self::INLINE_CALL_TIMEOUT, resolved.to_ref())
-            .await
-            .map_err(|_| "inline form timeout".to_owned())?
-            .map_err(|_| "inline form rejected".to_owned())?
-            .ok_or_else(|| "inline form rejected".to_owned())?;
-        let destination_peer = tl::enums::InputPeer::from(&peer_ref);
-
-        // Telegram can answer a fresh query with an empty result set while
-        // the companion bot is still responding; retry once before failing.
+        // PeerId carries no access hash, and an uncached peer (a fresh DM)
+        // needs a network resolve that can hit transient reconnects: retry
+        // the resolve/query chain before giving up. The final send is NOT
+        // retried — a retried send risks double menus.
+        let mut last_error = "inline form rejected".to_owned();
         let mut result_id = String::new();
         let mut query_id = 0i64;
-        for attempt in 0..2 {
-            let response = tokio::time::timeout(
+        let mut destination_peer: Option<tl::enums::InputPeer> = None;
+        for attempt in 0..3u32 {
+            let reference = grammers_session::types::PeerRef {
+                id: peer,
+                auth: grammers_session::types::PeerAuth::default(),
+            };
+            let input_peer = match tokio::time::timeout(Self::INLINE_CALL_TIMEOUT, async {
+                let resolved = self.client.resolve_peer(reference).await.map_err(|error| {
+                    tracing::warn!(
+                        target: "lavis_inline_form",
+                        stage = "resolve_destination",
+                        error = %error,
+                        "Could not resolve the menu chat"
+                    );
+                    "inline form rejected".to_owned()
+                })?;
+                let peer_ref = resolved
+                    .to_ref()
+                    .await
+                    .map_err(|error| {
+                        tracing::warn!(
+                            target: "lavis_inline_form",
+                            stage = "resolve_destination_ref",
+                            error = %error,
+                            "Could not reference the menu chat"
+                        );
+                        "inline form rejected".to_owned()
+                    })?
+                    .ok_or_else(|| "inline form rejected".to_owned())?;
+                Result::<_, String>::Ok(tl::enums::InputPeer::from(&peer_ref))
+            })
+            .await
+            {
+                Ok(Ok(input_peer)) => input_peer,
+                Ok(Err(error)) => {
+                    last_error = error;
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    continue;
+                }
+                Err(_) => {
+                    last_error = "inline form timeout".to_owned();
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    continue;
+                }
+            };
+
+            let response = match tokio::time::timeout(
                 Self::INLINE_CALL_TIMEOUT,
                 self.client
                     .invoke(&tl::functions::messages::GetInlineBotResults {
                         bot: bot.clone(),
-                        peer: destination_peer.clone(),
+                        peer: input_peer.clone(),
                         geo_point: None,
                         query: query.to_owned(),
                         offset: String::new(),
                     }),
             )
             .await
-            .map_err(|_| "inline form timeout".to_owned())?
-            .map_err(|error| {
-                log_inline_rejection(&error, "get_inline_results");
-                "inline form rejected".to_owned()
-            })?;
+            {
+                Ok(response) => response,
+                Err(_) => {
+                    last_error = "inline form timeout".to_owned();
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    continue;
+                }
+            };
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    log_inline_rejection(&error, "get_inline_results");
+                    last_error = "inline form rejected".to_owned();
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    continue;
+                }
+            };
             let tl::enums::messages::BotResults::Results(results) = response;
             query_id = results.query_id;
-            match results.results.first() {
-                Some(tl::enums::BotInlineResult::Result(result)) => {
-                    result_id = result.id.clone();
-                    break;
-                }
-                Some(tl::enums::BotInlineResult::BotInlineMediaResult(result)) => {
-                    result_id = result.id.clone();
-                    break;
-                }
-                None => {
-                    tracing::warn!(
-                        target: "lavis_inline_form",
-                        stage = "get_inline_results",
-                        attempt = attempt,
-                        "inline query returned no results"
-                    );
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(400)).await;
+            let Some(first) = results.results.first() else {
+                // Telegram races the companion bot's answer on fresh queries.
+                tracing::warn!(
+                    target: "lavis_inline_form",
+                    stage = "get_inline_results",
+                    attempt,
+                    "inline query returned no results"
+                );
+                last_error = "inline form rejected (no results)".to_owned();
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                continue;
+            };
+            result_id = match first {
+                tl::enums::BotInlineResult::Result(result) => result.id.clone(),
+                tl::enums::BotInlineResult::BotInlineMediaResult(result) => result.id.clone(),
+            };
+            destination_peer = Some(input_peer);
+            break;
         }
-        if result_id.is_empty() {
-            return Err("inline form rejected".to_owned());
-        }
+        let Some(destination_peer) = destination_peer else {
+            return Err(last_error);
+        };
         let mut random_id = [0u8; 8];
         getrandom::fill(&mut random_id).map_err(|_| "inline form unavailable".to_owned())?;
         let updates = tokio::time::timeout(
