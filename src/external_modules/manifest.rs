@@ -60,6 +60,7 @@ pub enum ExternalCapability {
     TelegramRaw,
     MessageEdit,
     MessageSendBot,
+    MessageDelete,
 }
 
 impl ExternalCapability {
@@ -76,6 +77,7 @@ impl ExternalCapability {
             Self::TelegramRaw => "telegram.raw",
             Self::MessageEdit => "message.edit",
             Self::MessageSendBot => "message.send_bot",
+            Self::MessageDelete => "message.delete",
         }
     }
 
@@ -93,6 +95,7 @@ impl ExternalCapability {
             Self::TelegramRaw => "полный доступ к Telegram RPC без песочницы",
             Self::MessageEdit => "редактирование собственных сообщений",
             Self::MessageSendBot => "отправка сообщений от имени companion-бота",
+            Self::MessageDelete => "удаление собственных сообщений",
         }
     }
 
@@ -109,6 +112,7 @@ impl ExternalCapability {
             "telegram.raw" => Some(Self::TelegramRaw),
             "message.edit" => Some(Self::MessageEdit),
             "message.send_bot" => Some(Self::MessageSendBot),
+            "message.delete" => Some(Self::MessageDelete),
             _ => None,
         }
     }

@@ -102,6 +102,14 @@ use policy::{SensitiveCommandDenial, authorize_sensitive_message};
 use lm::lm_usage;
 
 pub use dispatch::CreatedEventDispatchResult;
+
+/// Setup-store context for the reactions veto and audit trail: resolved once
+/// per message-event batch, before the reaction task is spawned.
+pub(crate) struct ReactionAuditContext {
+    pub(crate) state_path: std::path::PathBuf,
+    pub(crate) token_path: std::path::PathBuf,
+    pub(crate) companion_chat_id: Option<i64>,
+}
 #[cfg(test)]
 pub(crate) use dispatch::external_event_error_category;
 
@@ -640,6 +648,16 @@ impl RuntimeState {
 
     pub(crate) fn locale(&self) -> Locale {
         self.settings.locale().unwrap_or(Locale::Russian)
+    }
+
+    /// Resolves the companion identity and setup-store paths for the
+    /// reactions veto and audit trail. Without a setup coordinator there is
+    /// no companion chat, so the audit is simply disabled.
+    pub(crate) async fn reaction_audit_context(&self) -> Option<ReactionAuditContext> {
+        match &self.setup {
+            Some(coordinator) => coordinator.reaction_audit_context().await,
+            None => None,
+        }
     }
 
     pub fn register_expected_self_edit(
@@ -1349,6 +1367,7 @@ mod tests {
                     "123456:abcdefghijklmnopqrstUVWX",
                     false,
                     vec![],
+                    None,
                 )
                 .is_none()
         );
@@ -2559,6 +2578,7 @@ for line in sys.stdin:
                 "event",
                 true,
                 vec![],
+                None,
             )
             .expect("only subscribed v3 modules should receive events");
 

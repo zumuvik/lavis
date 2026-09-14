@@ -7,7 +7,6 @@
 
 use crate::bot_api::{BotMessage, BotSendApi, HttpBotApi};
 use crate::setup_store::SetupStore;
-use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Mutex, OnceLock,
@@ -160,17 +159,23 @@ async fn worker(state_path: PathBuf, token_path: PathBuf, mut rx: Receiver<Strin
             continue;
         };
         if topic_id.is_none() && !topic_unavailable {
-            topic_id = load_logs_topic_id(&state_path, &token_path).await;
+            topic_id = crate::companion_forum::load_persisted_topic_id(
+                &state_path,
+                &token_path,
+                crate::companion_forum::CompanionTopic::Logs,
+            )
+            .await;
             if topic_id.is_none() && !topic_creation_attempted {
                 topic_creation_attempted = true;
                 topic_id = match client.as_ref() {
                     Some(client) => {
-                        create_logs_topic(
+                        crate::companion_forum::ensure_forum_topic(
                             client,
                             &loaded_token,
                             resolved_chat_id,
-                            &state_path,
-                            &token_path,
+                            state_path.clone(),
+                            token_path.clone(),
+                            crate::companion_forum::CompanionTopic::Logs,
                         )
                         .await
                     }
@@ -254,68 +259,6 @@ async fn load_state(
 async fn load_companion_chat_id(state_path: &Path, token_path: &Path) -> Option<i64> {
     let state = load_state(state_path.to_path_buf(), token_path.to_path_buf()).await?;
     state.identities.companion_chat_id
-}
-
-async fn load_logs_topic_id(state_path: &Path, token_path: &Path) -> Option<i32> {
-    let state = load_state(state_path.to_path_buf(), token_path.to_path_buf()).await?;
-    state.identities.companion_logs_topic_id
-}
-
-#[derive(Deserialize)]
-struct ForumTopicResponse {
-    ok: bool,
-    result: Option<ForumTopicResult>,
-}
-
-#[derive(Deserialize)]
-struct ForumTopicResult {
-    message_thread_id: i32,
-}
-
-/// Creates the "Logs" forum topic once per process and persists its id in the
-/// setup state so later restarts reuse it.
-async fn create_logs_topic(
-    client: &reqwest::Client,
-    token: &crate::setup_store::CompanionToken,
-    chat_id: i64,
-    state_path: &Path,
-    token_path: &Path,
-) -> Option<i32> {
-    let url = format!(
-        "https://api.telegram.org/bot{}/createForumTopic",
-        token.as_str()
-    );
-    let response = client
-        .post(url)
-        .timeout(SEND_BACKOFF)
-        .json(&serde_json::json!({ "chat_id": chat_id, "name": "Logs" }))
-        .send()
-        .await
-        .ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-    let body = response.bytes().await.ok()?;
-    if body.len() > 64 * 1024 {
-        return None;
-    }
-    let parsed: ForumTopicResponse = serde_json::from_slice(&body).ok()?;
-    let thread_id = parsed
-        .ok
-        .then_some(parsed.result)
-        .flatten()?
-        .message_thread_id;
-    let state_path = state_path.to_path_buf();
-    let token_path = token_path.to_path_buf();
-    // Persisting the topic id is best-effort: the process can still use it.
-    let _ = tokio::task::spawn_blocking(move || {
-        let mut store = SetupStore::new(state_path, token_path);
-        let mut state = store.load_state()?;
-        state.identities.companion_logs_topic_id = Some(thread_id);
-        store.save_state(&state)
-    })
-    .await;
-    Some(thread_id)
 }
 
 #[cfg(test)]

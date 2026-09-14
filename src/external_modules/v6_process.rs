@@ -238,6 +238,9 @@ impl V6Process {
                 descriptor
                     .capabilities
                     .contains(&super::manifest::ExternalCapability::MessageEdit),
+                descriptor
+                    .capabilities
+                    .contains(&super::manifest::ExternalCapability::MessageDelete),
                 handles.clone(),
                 self_edit_ledger,
             )

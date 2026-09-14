@@ -18,6 +18,7 @@ pub mod bot_api;
 pub mod client;
 pub mod command;
 pub mod commands;
+pub mod companion_forum;
 pub mod config;
 pub mod credentials;
 pub mod error;

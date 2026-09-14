@@ -2,7 +2,10 @@ use super::{
     manifest::{
         ExternalAction, ExternalCapability, ExternalModuleDescriptor, ExternalSubscription,
     },
-    protocol::{EventAction, MAX_REACTIONS_PER_ACTION, MessageEventKind, ReactionSpec},
+    protocol::{
+        EventAction, MAX_ACTION_NOTE_CHARS, MAX_REACTIONS_PER_ACTION, MessageEventKind,
+        ReactionSpec,
+    },
 };
 use std::collections::HashSet;
 
@@ -33,6 +36,7 @@ pub enum ReactionValidationError {
     DuplicateReaction,
     InvalidEmoji,
     InvalidCustomEmojiDocumentId,
+    NoteTooLong,
 }
 
 impl EventScope {
@@ -87,6 +91,11 @@ pub fn validate_reaction_action(
         return Err(ReactionValidationError::CapabilityMissing);
     }
     scope.validate(&descriptor.id, request_id, action)?;
+    if let Some(note) = &action.note
+        && note.chars().count() > MAX_ACTION_NOTE_CHARS
+    {
+        return Err(ReactionValidationError::NoteTooLong);
+    }
     if action.reactions.len() > MAX_REACTIONS_PER_ACTION {
         return Err(ReactionValidationError::TooManyReactions);
     }
@@ -193,6 +202,7 @@ mod tests {
             reactions: vec![ReactionSpec::CustomEmoji {
                 document_id: "5456140674028019486".to_owned(),
             }],
+            note: None,
         };
         assert!(module_can_receive_event(
             &descriptor,
@@ -225,11 +235,13 @@ mod tests {
                     document_id: "5456140674028019486".to_owned(),
                 },
             ],
+            note: None,
         };
         assert!(validate_reaction_action(&descriptor, &scope(), "7", &action).is_ok());
         let remove = EventAction {
             message_ref: "opaque".to_owned(),
             reactions: Vec::new(),
+            note: None,
         };
         assert!(validate_reaction_action(&descriptor, &scope(), "7", &remove).is_ok());
     }
@@ -243,6 +255,7 @@ mod tests {
                 ReactionSpec::Emoji("👍".to_owned()),
                 ReactionSpec::Emoji("👍".to_owned()),
             ],
+            note: None,
         };
         assert_eq!(
             validate_reaction_action(&descriptor, &scope(), "7", &action),

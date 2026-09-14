@@ -295,6 +295,7 @@ pub struct V6HostExecutor {
     handles: Arc<Mutex<V6HandleRegistry>>,
     can_edit: bool,
     can_send_bot: bool,
+    can_delete: bool,
     inline_ok: bool,
     ledger: SharedSelfEditLedger,
     bot: Option<Arc<dyn HostBotSend>>,
@@ -315,6 +316,7 @@ impl V6HostExecutor {
         Self::with_registry(
             String::new(),
             can_edit,
+            false,
             Arc::new(Mutex::new(V6HandleRegistry::new())),
             SharedSelfEditLedger::default(),
         )
@@ -322,6 +324,7 @@ impl V6HostExecutor {
     pub(crate) fn with_registry(
         module_id: String,
         can_edit: bool,
+        can_delete: bool,
         handles: Arc<Mutex<V6HandleRegistry>>,
         ledger: SharedSelfEditLedger,
     ) -> Self {
@@ -330,6 +333,7 @@ impl V6HostExecutor {
             handles,
             can_edit,
             can_send_bot: false,
+            can_delete,
             inline_ok: false,
             ledger,
             bot: None,
@@ -382,6 +386,7 @@ impl V6HostExecutor {
             "inline.answer" => self.execute_inline_answer(params).await,
             "message.editBot" => self.execute_message_edit_bot(params).await,
             "message.deleteInvoker" => self.execute_delete_invoker(params).await,
+            "message.delete" => self.execute_delete(params).await,
             "message.deleteBot" => self.execute_message_delete_bot(params).await,
             _ => Err("unknown host method"),
         }
@@ -629,6 +634,35 @@ impl V6HostExecutor {
         }
     }
 
+    /// Deletes the message named by a delete-authority handle via the user
+    /// session. Only self-authored messages qualify: the outgoing check is
+    /// enforced here because the handle authority itself is issued for
+    /// command-context and outgoing event messages only.
+    async fn execute_delete(
+        &self,
+        params: Box<RawValue>,
+    ) -> Result<serde_json::Value, &'static str> {
+        if !self.can_delete {
+            return Err("capability denied");
+        }
+        let params: MessageDeleteInvokerParams =
+            serde_json::from_str(params.get()).map_err(|_| "invalid params")?;
+        if params.message.is_empty() {
+            return Err("invalid message handle");
+        }
+        let message = self
+            .handles
+            .lock()
+            .map_err(|_| "invalid message handle")?
+            .resolve_message(&params.message)
+            .map_err(|_| "invalid message handle")?;
+        if !message.outgoing() {
+            return Err("message is not outgoing");
+        }
+        message.delete().await.map_err(|_| "delete failed")?;
+        Ok(serde_json::Value::Null)
+    }
+
     async fn execute_send_bot(
         &self,
         params: Box<RawValue>,
@@ -837,8 +871,12 @@ mod tests {
         );
         assert_eq!(
             denied
-                .execute("message.delete", raw_params(r#"{"chat_id":1}"#))
+                .execute("message.delete", raw_params(r#"{"message":"h"}"#))
                 .await,
+            Err("capability denied")
+        );
+        assert_eq!(
+            denied.execute("message.nope", raw_params("{}")).await,
             Err("unknown host method")
         );
     }

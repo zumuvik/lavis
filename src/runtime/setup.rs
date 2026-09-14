@@ -505,6 +505,26 @@ impl SetupCoordinator {
         })
     }
 
+    /// Paths and companion identity for the reactions audit and veto. A
+    /// missing companion chat only disables the audit/veto, not the paths.
+    pub(crate) async fn reaction_audit_context(
+        &self,
+    ) -> Option<crate::runtime::ReactionAuditContext> {
+        let state_path = self.state_path.clone();
+        let token_path = self.token_path.clone();
+        let state = tokio::task::spawn_blocking(move || {
+            SetupStore::new(state_path, token_path).load_state()
+        })
+        .await
+        .ok()?
+        .ok()?;
+        Some(crate::runtime::ReactionAuditContext {
+            state_path: self.state_path.clone(),
+            token_path: self.token_path.clone(),
+            companion_chat_id: state.identities.companion_chat_id,
+        })
+    }
+
     pub(super) async fn repair(&mut self, client: &Client, locale: Locale) -> RuntimeExecution {
         let api = match HttpBotApi::new() {
             Ok(api) => api,

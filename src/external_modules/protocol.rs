@@ -83,6 +83,10 @@ pub struct V6CommandContext {
     pub text: String,
     pub replied: Option<V6ReplyContext>,
     pub companion: Option<V6CompanionContext>,
+    /// Numeric dialog id (Bot API format) of the command chat, when the
+    /// invoking message's chat is known. Menus need it to toggle per-chat
+    /// scope without an extra host round trip.
+    pub chat_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -97,7 +101,15 @@ pub struct EventAction {
     /// The complete desired reaction set. Protocol v4 permits zero to three
     /// reactions; an empty set removes the account's reactions from a message.
     pub reactions: Vec<ReactionSpec>,
+    /// Optional audit label explaining WHY the reaction is set (e.g. the
+    /// trigger word). Never shown to Telegram peers; only for the host-side
+    /// reactions audit log.
+    pub note: Option<String>,
 }
+
+/// Hard bound for [`EventAction::note`]; longer notes are rejected in
+/// `events.rs` validation.
+pub const MAX_ACTION_NOTE_CHARS: usize = 128;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CoreMessage {
@@ -266,6 +278,9 @@ impl V6OutboundCoreFrame {
                             "chat_id": companion.chat_id,
                             "access_hash": companion.access_hash,
                         });
+                    }
+                    if let Some(chat_id) = context.chat_id {
+                        wire_context["chat_id"] = serde_json::json!(chat_id);
                     }
                 }
                 serialize_v6_lifecycle(
@@ -1241,9 +1256,14 @@ fn parse_event_action(
     } else {
         return Err(ExternalError::ProtocolDecode);
     };
+    let note = value
+        .get("note")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned);
     Ok(EventAction {
         message_ref,
         reactions,
+        note,
     })
 }
 
@@ -1756,6 +1776,7 @@ mod tests {
                     text: "reply".to_owned(),
                 }),
                 companion: None,
+                chat_id: None,
             }),
         };
         let value: serde_json::Value = serde_json::from_str(&frame.serialize().unwrap()).unwrap();
@@ -1789,6 +1810,7 @@ mod tests {
                     chat_id: -1002871795336,
                     access_hash: 123456789012345,
                 }),
+                chat_id: Some(-1001234567890),
             }),
         };
         let value: serde_json::Value = serde_json::from_str(&frame.serialize().unwrap()).unwrap();
@@ -1814,10 +1836,12 @@ mod tests {
                 text: "t".to_owned(),
                 replied: None,
                 companion: None,
+                chat_id: None,
             }),
         };
         let value: serde_json::Value = serde_json::from_str(&frame.serialize().unwrap()).unwrap();
         assert!(value["context"].get("companion").is_none());
+        assert!(value["context"].get("chat_id").is_none());
     }
 
     #[test]

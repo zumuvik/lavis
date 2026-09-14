@@ -715,29 +715,57 @@ impl ExternalManagerHandle {
         }
     }
 
+    /// Dispatches a message event to a module. When `message` is supplied and
+    /// the module holds the `message.delete` capability, the outgoing event
+    /// message is registered as a delete-authority handle and the payload's
+    /// `message_ref` is replaced with it, so the module can invoke
+    /// `message.delete` on the very message that triggered the event. Returns
+    /// the effective message reference the module received.
     pub async fn dispatch_event(
         &self,
         module_id: &str,
         event: super::protocol::MessageEventKind,
-        payload: super::protocol::MessageEvent,
-    ) -> Result<(String, Vec<super::protocol::EventAction>), ExternalError> {
+        message: Option<grammers_client::message::Message>,
+        mut payload: super::protocol::MessageEvent,
+    ) -> Result<(String, String, Vec<super::protocol::EventAction>), ExternalError> {
         let process = {
             let manager = self.inner.lock().await;
             manager.processes.get(module_id).cloned()
         }
         .ok_or(ExternalError::Unavailable)?;
-        match process {
-            ManagedProcess::Legacy { process, .. } => {
-                let mut process = process.lock().await;
-                if process.status() != ProcessStatus::Running
-                    || process.descriptor().protocol_version < 3
-                {
-                    return Err(ExternalError::Unavailable);
-                }
-                process.dispatch_event(event, payload).await
-            }
-            ManagedProcess::V6(process) => process.dispatch_event_result(event, payload).await,
+        let original_ref = payload.message_ref.clone();
+        let mut issued_handle: Option<String> = None;
+        if let (ManagedProcess::V6(v6_process), Some(message)) = (&process, message)
+            && payload.outgoing
+            && v6_process
+                .descriptor()
+                .capabilities
+                .contains(&super::manifest::ExternalCapability::MessageDelete)
+            && let Ok(handle) = v6_process.register_current_message(message, true)
+        {
+            payload.message_ref = handle.clone();
+            issued_handle = Some(handle);
         }
+        let dispatch = async {
+            match &process {
+                ManagedProcess::Legacy { process, .. } => {
+                    let mut process = process.lock().await;
+                    if process.status() != ProcessStatus::Running
+                        || process.descriptor().protocol_version < 3
+                    {
+                        return Err(ExternalError::Unavailable);
+                    }
+                    process.dispatch_event(event, payload).await
+                }
+                ManagedProcess::V6(process) => process.dispatch_event_result(event, payload).await,
+            }
+        };
+        let result = dispatch.await;
+        if let (ManagedProcess::V6(process), Some(handle)) = (&process, issued_handle.clone()) {
+            process.release_handle(&handle);
+        }
+        let (request_id, actions) = result?;
+        Ok((request_id, issued_handle.unwrap_or(original_ref), actions))
     }
 
     pub async fn execute(
@@ -852,6 +880,7 @@ impl ExternalManagerHandle {
                             text: message_text,
                             replied: reply_context.clone(),
                             companion,
+                            chat_id: peer_id.bot_api_dialog_id(),
                         }),
                     )
                     .await

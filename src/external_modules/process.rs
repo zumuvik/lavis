@@ -1843,6 +1843,7 @@ for line in sys.stdin:
                 vec![protocol::EventAction {
                     message_ref: "message-1".to_owned(),
                     reactions: vec![protocol::ReactionSpec::Emoji("👍".to_owned())],
+                    note: None,
                 }],
             ),
             (
@@ -1852,6 +1853,7 @@ for line in sys.stdin:
                     reactions: vec![protocol::ReactionSpec::CustomEmoji {
                         document_id: "5456140674028019486".to_owned(),
                     }],
+                    note: None,
                 }],
             ),
         ] {

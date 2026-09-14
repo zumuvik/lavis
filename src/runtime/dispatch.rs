@@ -7,9 +7,9 @@ pub struct CreatedEventDispatch {
 
 struct CreatedEventRequest {
     descriptor: crate::external_modules::manifest::ExternalModuleDescriptor,
-    message_ref: String,
     event: MessageEventKind,
     payload: MessageEvent,
+    message: Option<grammers_client::message::Message>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,23 +32,28 @@ impl CreatedEventDispatch {
             async move {
                 let CreatedEventRequest {
                     descriptor,
-                    message_ref,
+                    message,
                     event,
                     payload,
                 } = request;
                 let module_id = descriptor.id.clone();
-                let response = handle.dispatch_event(&module_id, event, payload).await;
-                (descriptor, message_ref, response)
+                let response = handle
+                    .dispatch_event(&module_id, event, message, payload)
+                    .await;
+                (descriptor, response)
             }
         });
 
-        for (descriptor, message_ref, response) in join_all(dispatches).await {
+        for (descriptor, response) in join_all(dispatches).await {
             let module_id = descriptor.id.clone();
             match response {
-                Ok((request_id, actions)) => {
+                Ok((request_id, message_ref, actions)) => {
                     let scope = EventScope {
                         module_id: module_id.clone(),
                         request_id: request_id.clone(),
+                        // The module may have received a delete-authority
+                        // handle instead of the original opaque reference;
+                        // actions are validated against what it actually saw.
                         message_ref,
                     };
                     for action in actions {
@@ -90,6 +95,7 @@ fn stable_message_key(peer_id: PeerId, message_id: i32, module_id: &str) -> Stri
 }
 
 impl RuntimeState {
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare_message_event_dispatch(
         &self,
         peer_id: PeerId,
@@ -98,6 +104,9 @@ impl RuntimeState {
         text: &str,
         outgoing: bool,
         entities: Vec<crate::external_modules::protocol::CustomEmojiEntity>,
+        // Present in production so outgoing event messages can be registered
+        // as delete-authority handles; tests omit it.
+        message: Option<grammers_client::message::Message>,
     ) -> Option<CreatedEventDispatch> {
         if !self.external_projection_permitted {
             return None;
@@ -130,9 +139,9 @@ impl RuntimeState {
             };
             requests.push(CreatedEventRequest {
                 descriptor: descriptor.clone(),
-                message_ref,
                 event,
                 payload,
+                message: message.clone(),
             });
         }
         (!requests.is_empty()).then_some(CreatedEventDispatch { handle, requests })

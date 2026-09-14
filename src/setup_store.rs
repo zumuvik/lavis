@@ -86,6 +86,8 @@ pub struct SetupIdentities {
     #[serde(default)]
     pub companion_logs_topic_id: Option<i32>,
     #[serde(default)]
+    pub companion_reactions_topic_id: Option<i32>,
+    #[serde(default)]
     pub companion_backups_topic_id: Option<i32>,
     #[serde(default)]
     pub companion_folder_id: Option<i32>,

@@ -974,13 +974,21 @@ async fn process_update(
                 "Skipped external event dispatch because the task queue is full"
             );
         } else if let Some(dispatch) = runtime.prepare_message_event_dispatch(
-            peer_id, message_id, event, event_text, outgoing, entities,
+            peer_id,
+            message_id,
+            event,
+            event_text,
+            outgoing,
+            entities,
+            Some(message.clone().into_inner()),
         ) {
-            let reaction_message = message.clone();
+            let reaction_message = message.clone().into_inner();
             let reaction_client = client.clone();
+            let audit_context = runtime.reaction_audit_context().await;
             let spawned = event_dispatches.try_spawn(async move {
                 let result = dispatch.execute().await;
-                handle_event_dispatch(reaction_client, reaction_message, result).await;
+                handle_event_dispatch(reaction_client, reaction_message, result, audit_context)
+                    .await;
             });
             debug_assert!(
                 spawned,
@@ -1479,8 +1487,9 @@ fn should_prepare_message_event(edited: bool, event_protected: bool) -> bool {
 
 async fn handle_event_dispatch(
     client: grammers_client::Client,
-    message: Message,
+    message: grammers_client::message::Message,
     result: CreatedEventDispatchResult,
+    audit_context: Option<crate::runtime::ReactionAuditContext>,
 ) {
     for failure in result.failures {
         tracing::warn!(
@@ -1489,6 +1498,20 @@ async fn handle_event_dispatch(
             error_category = failure.category,
             "External event failed"
         );
+    }
+    // The companion group and its forum topics must never receive
+    // auto-reactions: modules react to any matching chat they can see.
+    let companion_chat_id = audit_context
+        .as_ref()
+        .and_then(|context| context.companion_chat_id);
+    let target_chat_id = message.peer_id().bot_api_dialog_id();
+    if companion_chat_id.is_some_and(|companion| Some(companion) == target_chat_id) {
+        tracing::info!(
+            event = "reaction_vetoed",
+            reason = "companion_chat",
+            "Dropped external reaction targeting the companion group"
+        );
+        return;
     }
     for action in result.actions {
         let mut reactions = Vec::with_capacity(action.reactions.len());
@@ -1538,8 +1561,135 @@ async fn handle_event_dispatch(
                 error_category = invocation_error_category(&error),
                 "External reaction action failed"
             );
+            continue;
+        }
+        if let Some(context) = &audit_context {
+            crate::updates::spawn_reactions_audit(context, action.note, &message);
         }
     }
+}
+
+static REACTIONS_AUDIT_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Posts a bounded audit line to the companion group's "Reactions" forum
+/// topic. Best-effort: a failure drops the line and warns once (the warn
+/// target is excluded from log forwarding, so there is no feedback loop).
+fn spawn_reactions_audit(
+    context: &crate::runtime::ReactionAuditContext,
+    note: Option<String>,
+    message: &grammers_client::message::Message,
+) {
+    let Some(chat_id) = message.peer_id().bot_api_dialog_id() else {
+        return;
+    };
+    let reactions = match &message.raw {
+        tl::enums::Message::Message(raw) => match &raw.reactions {
+            Some(tl::enums::MessageReactions::Reactions(reactions)) => reactions
+                .results
+                .iter()
+                .filter_map(|entry| {
+                    let tl::enums::ReactionCount::Count(entry) = entry;
+                    let label = match &entry.reaction {
+                        tl::enums::Reaction::Emoji(emoji) => emoji.emoticon.clone(),
+                        tl::enums::Reaction::CustomEmoji(emoji) => {
+                            format!("#{}", emoji.document_id)
+                        }
+                        _ => return None,
+                    };
+                    Some(format!("{label}x{}", entry.count))
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+            _ => String::new(),
+        },
+        _ => String::new(),
+    };
+    let reactions = if reactions.is_empty() {
+        "-".to_owned()
+    } else {
+        reactions
+    };
+    let chat = chat_id.to_string();
+    let line = format!(
+        "{} → {} in chat {}, msg {}",
+        note.as_deref().unwrap_or("-"),
+        reactions,
+        chat,
+        message.id()
+    );
+    let line = if line.chars().count() > 300 {
+        line.chars().take(300).collect::<String>()
+    } else {
+        line
+    };
+    let context = crate::runtime::ReactionAuditContext {
+        state_path: context.state_path.clone(),
+        token_path: context.token_path.clone(),
+        companion_chat_id: context.companion_chat_id,
+    };
+    tokio::spawn(async move {
+        let Some(token) = load_audit_token(&context).await else {
+            return;
+        };
+        let Some(companion_chat_id) = context.companion_chat_id else {
+            return;
+        };
+        let client = match reqwest::Client::builder().https_only(true).build() {
+            Ok(client) => client,
+            Err(_) => return,
+        };
+        let Some(topic_id) = crate::companion_forum::ensure_forum_topic(
+            &client,
+            &token,
+            companion_chat_id,
+            context.state_path.clone(),
+            context.token_path.clone(),
+            crate::companion_forum::CompanionTopic::Reactions,
+        )
+        .await
+        else {
+            audit_warn("reactions topic unavailable");
+            return;
+        };
+        use crate::bot_api::BotSendApi as _;
+        let api = match crate::bot_api::HttpBotApi::new() {
+            Ok(api) => api,
+            Err(_) => return,
+        };
+        let audit_message = crate::bot_api::BotMessage {
+            chat_id: companion_chat_id,
+            message_thread_id: Some(topic_id),
+            text: line,
+        };
+        if api.send_message(&token, &audit_message).await.is_err() {
+            audit_warn("reactions audit delivery failed");
+        }
+    });
+}
+
+fn audit_warn(reason: &'static str) {
+    if !REACTIONS_AUDIT_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            target: "lavis_log_forwarder",
+            event = "reactions_audit_failed",
+            reason,
+            "Reactions audit delivery failed — further audit lines are dropped silently"
+        );
+    }
+}
+
+async fn load_audit_token(
+    context: &crate::runtime::ReactionAuditContext,
+) -> Option<crate::setup_store::CompanionToken> {
+    let state_path = context.state_path.clone();
+    let token_path = context.token_path.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::setup_store::SetupStore::new(state_path, token_path).load_token()
+    })
+    .await
+    .ok()?
+    .ok()
 }
 
 async fn send_provision_completion(
