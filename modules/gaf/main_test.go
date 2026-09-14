@@ -23,28 +23,28 @@ func mustPayload(t *testing.T, value any) json.RawMessage {
 }
 
 func TestContainsTriggerWordBoundary(t *testing.T) {
-	for _, text := range []string{"фур", "фури", "фурре", "ФУРРИ", "про фурре!"} {
-		if !containsTrigger(text, "фур", false, false) {
+	for _, text := range []string{"лайк", "лайки", "лайкнул", "ЛАЙКНИ", "про лайкнул!"} {
+		if !containsTrigger(text, "лайк", false, false) {
 			t.Fatalf("word prefix should match %q", text)
 		}
 	}
-	if containsTrigger("антифур", "фур", false, false) {
+	if containsTrigger("полайк", "лайк", false, false) {
 		t.Fatal("trigger must start at a word boundary by default")
 	}
 }
 
 func TestContainsTriggerBoundaryFlags(t *testing.T) {
 	if containsTrigger("агаф", "гаф", false, false) {
-		t.Fatal("mid-word match must require match_start (agaf)")
+		t.Fatal("mid-word match must require match_start (prefixes)")
 	}
 	if !containsTrigger("агаф", "гаф", true, false) {
-		t.Fatal("match_start (agaf) must fire mid-word")
+		t.Fatal("match_start (prefixes) must fire mid-word")
 	}
 	if !containsTrigger("гафа", "гаф", false, false) {
 		t.Fatal("trailing continuation stays allowed by default")
 	}
 	if containsTrigger("гафа", "гаф", false, true) {
-		t.Fatal("match_end (gafa) must require a trailing word boundary")
+		t.Fatal("match_end (whole word) must require a trailing word boundary")
 	}
 	if !containsTrigger("гаф", "гаф", false, true) {
 		t.Fatal("whole word must match with match_end")
@@ -115,18 +115,18 @@ func TestReactionsForMatchesTriggerPrefix(t *testing.T) {
 		state: state{
 			Enabled: true,
 			Triggers: []trigger{{
-				ID: 1, Word: "фур", Enabled: true, AllChats: true,
+				ID: 1, Word: "лайк", Enabled: true, AllChats: true,
 				Reactions: []reaction{{Type: "emoji", Emoji: "🐈"}},
 			}},
 		},
 	}
-	for _, text := range []string{"фури", "фурре"} {
+	for _, text := range []string{"лайки", "лайкнул"} {
 		reactions, _ := m.reactionsFor(text, 42)
 		if len(reactions) != 1 || reactions[0].Emoji != "🐈" {
 			t.Fatalf("unexpected reactions for %q: %#v", text, reactions)
 		}
 	}
-	if reactions, _ := m.reactionsFor("антифур", 42); len(reactions) != 0 {
+	if reactions, _ := m.reactionsFor("полайк", 42); len(reactions) != 0 {
 		t.Fatalf("embedded trigger must not match: %#v", reactions)
 	}
 }
@@ -136,13 +136,13 @@ func TestReactionsForReturnsTriggerNote(t *testing.T) {
 		state: state{
 			Enabled: true,
 			Triggers: []trigger{{
-				ID: 1, Word: "фур", Enabled: true, AllChats: true,
+				ID: 1, Word: "лайк", Enabled: true, AllChats: true,
 				Reactions: []reaction{{Type: "emoji", Emoji: "🐈"}},
 			}},
 		},
 	}
-	_, note := m.reactionsFor("фури", 42)
-	if note != "фур" {
+	_, note := m.reactionsFor("лайки", 42)
+	if note != "лайк" {
 		t.Fatalf("note must name the fired trigger: %q", note)
 	}
 }
@@ -152,15 +152,15 @@ func TestReactionsForRespectsTriggerChatScope(t *testing.T) {
 		state: state{
 			Enabled: true,
 			Triggers: []trigger{{
-				ID: 1, Word: "фур", Enabled: true, AllChats: false, ChatID: 100,
+				ID: 1, Word: "лайк", Enabled: true, AllChats: false, ChatID: 100,
 				Reactions: []reaction{{Type: "emoji", Emoji: "🐈"}},
 			}},
 		},
 	}
-	if reactions, _ := m.reactionsFor("фури", 200); len(reactions) != 0 {
+	if reactions, _ := m.reactionsFor("лайки", 200); len(reactions) != 0 {
 		t.Fatalf("scoped trigger fired in a foreign chat: %#v", reactions)
 	}
-	if reactions, _ := m.reactionsFor("фури", 100); len(reactions) != 1 {
+	if reactions, _ := m.reactionsFor("лайки", 100); len(reactions) != 1 {
 		t.Fatalf("scoped trigger must fire in its own chat: %#v", reactions)
 	}
 }

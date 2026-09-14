@@ -552,7 +552,7 @@ func (m *module) listText() string {
 		}
 		fmt.Fprintf(&b, "%s %d. %s | %s %s%s\n", marker, item.ID, item.Word, formatReactions(item.Reactions), scope, flags)
 	}
-	b.WriteString("\n⇢ agaf · ⇠ gafa · 🌐 все чаты · 💬 один чат")
+	b.WriteString("\n⇢ приставки · ⇠ целое слово · 🌐 все чаты · 💬 один чат")
 	return strings.TrimSuffix(b.String(), "\n")
 }
 
@@ -631,9 +631,9 @@ func scopeAllows(scope scopeConfig, peerID int64) bool {
 
 // containsTrigger matches word against text. By default the trigger must
 // start at a word boundary and may continue inside a longer word (v1
-// behavior: "фур" fires on "фури"). match_start (agaf) drops the leading
-// boundary so mid-word matches like "агаф" fire; match_end (gafa) requires
-// a trailing word boundary so only whole-word matches fire.
+// behavior: "лайк" fires on "лайки"). match_start (prefixes) drops the leading
+// boundary so mid-word matches like "пришёл" for "шёл" fire; match_end
+// (whole word) requires a trailing word boundary so only pure words fire.
 func containsTrigger(text, word string, matchStart, matchEnd bool) bool {
 	textRunes := []rune(strings.ToLower(text))
 	wordRunes := []rune(strings.ToLower(strings.TrimSpace(word)))
@@ -773,7 +773,7 @@ func (m *module) listView() (string, [][]inlineButton) {
 	if hidden > 0 {
 		fmt.Fprintf(&b, "… и ещё %d\n", hidden)
 	}
-	b.WriteString("\n⇢ agaf · ⇠ gafa · 🌐 все чаты · 💬 один чат")
+	b.WriteString("\n⇢ приставки · ⇠ целое слово · 🌐 все чаты · 💬 один чат")
 	return strings.TrimSuffix(b.String(), "\n"), [][]inlineButton{
 		{{Text: "« Назад", Data: "b"}},
 	}
@@ -874,7 +874,7 @@ func (m *module) editorText(d *draft) string {
 	if !d.AllChats {
 		scope = "только этот чат"
 	}
-	return fmt.Sprintf("✏️ %s | %s\nagaf: %s · gafa: %s\nОбласть: %s\n(%s)",
+	return fmt.Sprintf("✏️ %s | %s\nПриставки: %s · целое слово: %s\nОбласть: %s\n(%s)",
 		d.Word, formatReactions(d.Reactions), onOff(d.MatchStart), onOff(d.MatchEnd), scope, origin)
 }
 
@@ -897,9 +897,9 @@ func (m *module) editorButtons(id int) [][]inlineButton {
 	third = append(third, inlineButton{Text: "❌ Закрыть", Data: fmt.Sprintf("q%d", id)})
 	return [][]inlineButton{
 		{
-			{Text: "agaf: " + startMark, Data: fmt.Sprintf("s%d", id)},
+			{Text: "Приставки: " + startMark, Data: fmt.Sprintf("s%d", id)},
 			{Text: "✏️ Изменить", Data: fmt.Sprintf("w%d", id)},
-			{Text: "gafa: " + endMark, Data: fmt.Sprintf("f%d", id)},
+			{Text: "Целое слово: " + endMark, Data: fmt.Sprintf("f%d", id)},
 		},
 		{
 			{Text: "Все чаты", Data: fmt.Sprintf("a%d", id)},
