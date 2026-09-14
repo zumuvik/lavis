@@ -116,7 +116,17 @@ pub(crate) async fn ensure_forum_topic(
         }
     };
     if !response.status().is_success() {
-        warn_topic_create(&topic, "http_status", Some(&response.status().to_string()));
+        // Bot API puts the human-readable reason in the JSON body even on
+        // 4xx responses; surface it instead of just the status code.
+        let status = response.status().to_string();
+        let detail = response
+            .bytes()
+            .await
+            .ok()
+            .and_then(|body| serde_json::from_slice::<ForumTopicResponse>(&body).ok())
+            .and_then(|parsed| parsed.description)
+            .unwrap_or_else(|| status.clone());
+        warn_topic_create(&topic, "http_status", Some(&detail));
         return None;
     }
     let body = response.bytes().await.ok()?;
