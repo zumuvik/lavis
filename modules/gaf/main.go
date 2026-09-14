@@ -890,14 +890,11 @@ func (m *module) editorButtons(id int) [][]inlineButton {
 	if d.MatchEnd {
 		endMark = "✅"
 	}
-	third := []inlineButton{{Text: "❌ Закрыть", Data: fmt.Sprintf("q%d", id)}}
+	third := []inlineButton{{Text: "✅ Сохранить", Data: fmt.Sprintf("v%d", id)}}
 	if d.Exists {
-		third = []inlineButton{
-			{Text: "✅ Сохранить", Data: fmt.Sprintf("v%d", id)},
-			{Text: "🗑 Удалить", Data: fmt.Sprintf("r%d", id)},
-			{Text: "❌ Закрыть", Data: fmt.Sprintf("q%d", id)},
-		}
+		third = append(third, inlineButton{Text: "🗑 Удалить", Data: fmt.Sprintf("r%d", id)})
 	}
+	third = append(third, inlineButton{Text: "❌ Закрыть", Data: fmt.Sprintf("q%d", id)})
 	return [][]inlineButton{
 		{
 			{Text: "agaf: " + startMark, Data: fmt.Sprintf("s%d", id)},
