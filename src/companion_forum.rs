@@ -85,6 +85,17 @@ struct ForumTopicResult {
     message_thread_id: i32,
 }
 
+/// Bot API addresses supergroups as -100 + the MTProto channel id, while the
+/// setup store may hold the raw positive channel id. Both formats address the
+/// same forum group; negative ids are already in Bot API form.
+pub(crate) fn bot_api_chat_id(chat_id: i64) -> i64 {
+    if chat_id > 0 {
+        -(chat_id + 1_000_000_000_000)
+    } else {
+        chat_id
+    }
+}
+
 /// Returns the persisted topic id, creating the topic on first use. Creation
 /// and persistence are both best-effort: `None` means "no topic this time".
 pub(crate) async fn ensure_forum_topic(
@@ -95,6 +106,7 @@ pub(crate) async fn ensure_forum_topic(
     token_path: PathBuf,
     topic: CompanionTopic,
 ) -> Option<i32> {
+    let chat_id = bot_api_chat_id(chat_id);
     if let Some(id) = load_persisted_topic_id(&state_path, &token_path, topic).await {
         return Some(id);
     }
@@ -159,4 +171,19 @@ pub(crate) async fn ensure_forum_topic(
     })
     .await;
     Some(thread_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bot_api_chat_id_normalizes_mtproto_channel_ids() {
+        // The setup store may hold the raw MTProto channel id of the
+        // companion supergroup; Bot API wants the -100 dialog format.
+        assert_eq!(bot_api_chat_id(3916245893), -1003916245893);
+        assert_eq!(bot_api_chat_id(-1003916245893), -1003916245893);
+        // Already-negative ids pass through untouched.
+        assert_eq!(bot_api_chat_id(-123), -123);
+    }
 }

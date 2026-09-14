@@ -151,7 +151,9 @@ async fn worker(state_path: PathBuf, token_path: PathBuf, mut rx: Receiver<Strin
             continue;
         };
         if chat_id.is_none() {
-            chat_id = load_companion_chat_id(&state_path, &token_path).await;
+            chat_id = load_companion_chat_id(&state_path, &token_path)
+                .await
+                .map(crate::companion_forum::bot_api_chat_id);
         }
         let Some(resolved_chat_id) = chat_id else {
             // Setup may complete later; drain slowly until it does.

@@ -1503,7 +1503,10 @@ async fn handle_event_dispatch(
     // auto-reactions: modules react to any matching chat they can see.
     let companion_chat_id = audit_context
         .as_ref()
-        .and_then(|context| context.companion_chat_id);
+        .and_then(|context| context.companion_chat_id)
+        // The setup store may hold the raw MTProto channel id; the veto and
+        // the Bot API audit delivery both speak the -100 dialog format.
+        .map(crate::companion_forum::bot_api_chat_id);
     let target_chat_id = message.peer_id().bot_api_dialog_id();
     if companion_chat_id.is_some_and(|companion| Some(companion) == target_chat_id) {
         tracing::info!(
