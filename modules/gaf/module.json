@@ -12,7 +12,8 @@
     "message.read",
     "message.react",
     "message.delete",
-    "message.peer_id"
+    "message.peer_id",
+    "message.send_bot"
   ],
   "default_command": "gaf",
   "subscriptions": [
