@@ -1556,9 +1556,17 @@ async fn handle_event_dispatch(
             })
             .await
         {
+            // The sanitized Telegram rejection name is the only way to tell
+            // REACTION_INVALID (chat reaction set) from throttling or premium
+            // gates without instrumenting the module itself.
+            let name = match &error {
+                grammers_client::InvocationError::Rpc(rpc) => rpc.name.as_str(),
+                _ => "-",
+            };
             tracing::warn!(
                 event = "external_reaction_failed",
                 error_category = invocation_error_category(&error),
+                name,
                 "External reaction action failed"
             );
             continue;

@@ -64,6 +64,20 @@ async fn load_state(
 struct ForumTopicResponse {
     ok: bool,
     result: Option<ForumTopicResult>,
+    description: Option<String>,
+}
+
+/// Forum topic creation is best-effort; the target is excluded from log
+/// forwarding, so these warnings cannot loop back into the companion bot.
+fn warn_topic_create(topic: &CompanionTopic, reason: &str, detail: Option<&str>) {
+    tracing::warn!(
+        target: "lavis_log_forwarder",
+        event = "forum_topic_create_failed",
+        topic = topic.name(),
+        reason,
+        detail = detail.unwrap_or(""),
+        "Could not create companion forum topic"
+    );
 }
 
 #[derive(Deserialize)]
@@ -88,26 +102,44 @@ pub(crate) async fn ensure_forum_topic(
         "https://api.telegram.org/bot{}/createForumTopic",
         token.as_str()
     );
-    let response = client
+    let response = match client
         .post(url)
         .timeout(CREATE_TIMEOUT)
         .json(&serde_json::json!({ "chat_id": chat_id, "name": topic.name() }))
         .send()
         .await
-        .ok()?;
+    {
+        Ok(response) => response,
+        Err(error) => {
+            warn_topic_create(&topic, "transport", Some(&error.to_string()));
+            return None;
+        }
+    };
     if !response.status().is_success() {
+        warn_topic_create(&topic, "http_status", Some(&response.status().to_string()));
         return None;
     }
     let body = response.bytes().await.ok()?;
     if body.len() > 64 * 1024 {
+        warn_topic_create(&topic, "oversized_body", None);
         return None;
     }
-    let parsed: ForumTopicResponse = serde_json::from_slice(&body).ok()?;
-    let thread_id = parsed
-        .ok
-        .then_some(parsed.result)
-        .flatten()?
-        .message_thread_id;
+    let parsed: ForumTopicResponse = match serde_json::from_slice(&body) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            warn_topic_create(&topic, "malformed", Some(&error.to_string()));
+            return None;
+        }
+    };
+    if !parsed.ok {
+        warn_topic_create(&topic, "api_rejected", parsed.description.as_deref());
+        return None;
+    }
+    let Some(result) = parsed.result else {
+        warn_topic_create(&topic, "no_result", None);
+        return None;
+    };
+    let thread_id = result.message_thread_id;
     // Persisting the topic id is best-effort: the process can still use it.
     let _ = tokio::task::spawn_blocking(move || {
         let mut store = SetupStore::new(state_path, token_path);
