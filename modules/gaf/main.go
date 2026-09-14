@@ -44,11 +44,11 @@ type customEmojiEntity struct {
 }
 
 type requestContext struct {
-	Peer              string              `json:"peer,omitempty"`
-	Message           string              `json:"message,omitempty"`
-	Text              string              `json:"text,omitempty"`
-	ChatID            int64               `json:"chat_id,omitempty"`
-	ArgumentEntities  []customEmojiEntity `json:"argument_entities"`
+	Peer             string              `json:"peer,omitempty"`
+	Message          string              `json:"message,omitempty"`
+	Text             string              `json:"text,omitempty"`
+	ChatID           int64               `json:"chat_id,omitempty"`
+	ArgumentEntities []customEmojiEntity `json:"argument_entities"`
 }
 
 type eventPayload struct {
@@ -196,12 +196,12 @@ func newModule(path string, currentState state) *module {
 	out := &lineWriter{w: os.Stdout}
 	rpc := newRPC(out)
 	return &module{
-		path:     path,
-		out:      out,
-		rpc:      rpc,
-		hc:       &hostCaller{rpc: rpc},
-		state:    currentState,
-		drafts:   make(map[int]*draft),
+		path:   path,
+		out:    out,
+		rpc:    rpc,
+		hc:     &hostCaller{rpc: rpc},
+		state:  currentState,
+		drafts: make(map[int]*draft),
 	}
 }
 
