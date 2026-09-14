@@ -1509,7 +1509,10 @@ async fn handle_event_dispatch(
         .map(crate::companion_forum::bot_api_chat_id);
     let target_chat_id = message.peer_id().bot_api_dialog_id();
     if companion_chat_id.is_some_and(|companion| Some(companion) == target_chat_id) {
-        tracing::info!(
+        // A deliberate, expected drop: the companion group is excluded from
+        // auto-reactions by design. Not a warning - flooding the owner's
+        // Logs topic on every panel message would be worse than the drop.
+        tracing::debug!(
             event = "reaction_vetoed",
             reason = "companion_chat",
             "Dropped external reaction targeting the companion group"
