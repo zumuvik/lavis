@@ -78,6 +78,11 @@ impl<S: Subscriber> Layer<S> for BridgeLayer {
         if metadata.target().starts_with("lavis_log_forwarder") {
             return;
         }
+        // Library chatter (update gaps on busy channels, transport retries)
+        // is routine noise: it would flood the owner's Logs topic.
+        if suppressed_target(metadata.target()) {
+            return;
+        }
         let Some(bridge) = BRIDGE.get() else {
             return;
         };
@@ -102,6 +107,13 @@ impl<S: Subscriber> Layer<S> for BridgeLayer {
 
 fn count_dropped(bridge: &LogBridge) {
     bridge.dropped.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Library targets whose warnings are routine operational noise. Update gaps
+/// fire on every busy channel tick, and forwarding them would drown the
+/// owner's Logs topic in lines nobody can act on.
+fn suppressed_target(target: &str) -> bool {
+    target.starts_with("grammers_session::message_box")
 }
 
 fn format_line(level: &str, target: &str, message: &str) -> String {
@@ -282,6 +294,13 @@ mod tests {
         let line = format_line("WARN", "t", &"x".repeat(5000));
         assert_eq!(line.chars().count(), MAX_LINE_CHARS);
         assert!(line.starts_with("⚠️ t: "));
+    }
+
+    #[test]
+    fn library_chatter_targets_are_suppressed() {
+        assert!(suppressed_target("grammers_session::message_box"));
+        assert!(!suppressed_target("lavis::updates"));
+        assert!(!suppressed_target("grammers_client::net"));
     }
 
     #[tokio::test]
