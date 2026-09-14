@@ -1,20 +1,24 @@
 {
-  "schema_version": 4,
+  "schema_version": 6,
+  "contract_revision": 5,
   "id": "gaf",
   "name": "GAF",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "zumuvik",
   "entrypoint": "gaf",
   "capabilities": [
     "persistent_state_read",
     "persistent_state_write",
     "message.read",
-    "message.react"
+    "message.react",
+    "message.delete",
+    "message.peer_id"
   ],
   "default_command": "gaf",
   "subscriptions": [
     "message.created",
-    "message.edited"
+    "message.edited",
+    "bot.callback"
   ],
   "actions": [
     "message.react"
@@ -23,7 +27,7 @@
     {
       "name": "gaf",
       "summary_ru": "Меню и управление триггерами реакций",
-      "description_ru": "Показывает меню GAF или выполняет подкоманду listt, setr, remt или toggle.",
+      "description_ru": "Без аргументов открывает inline-меню GAF от бота: переключатели ЛС/группы/текущий чат, список триггеров и закрытие. Подкоманды: listt — текстовый список, setr — редактор триггера (inline-меню), remt — удаление, toggle — включение/выключение.",
       "usage": "[listt|setr|remt|toggle] [аргументы]",
       "examples": [
         "listt",
@@ -34,14 +38,14 @@
     {
       "name": "listt",
       "summary_ru": "Список триггеров реакций",
-      "description_ru": "Показывает все настроенные словесные триггеры, их реакции и состояние.",
+      "description_ru": "Показывает все настроенные словесные триггеры, их реакции, флаги границ слова и состояние.",
       "usage": "[без аргументов]",
       "examples": []
     },
     {
       "name": "setr",
       "summary_ru": "Создать или изменить триггер",
-      "description_ru": "Назначает триггеру слева от | от одной до трёх обычных или Premium-реакций справа.",
+      "description_ru": "Открывает inline-редактор триггера: реакции задаются справа от |, кнопками переключаются границы слова (agaf/gafa) и область чатов. Кнопка «Изменить» ждёт следующее исходящее сообщение вида <триггер> | <реакции> в этом чате.",
       "usage": "<триггер> | <реакция> [реакция] [реакция]",
       "examples": [
         "никс | 👍",
