@@ -91,6 +91,17 @@ impl<S: Subscriber> Layer<S> for BridgeLayer {
             extras: Vec::new(),
         };
         event.record(&mut visitor);
+        // Events forwarded from the `log` crate collapse metadata.target() to
+        // "log" and carry the real target in the `log.target` field, so
+        // suppression runs only after the fields are collected.
+        let suppressed = suppressed_target(metadata.target())
+            || visitor
+                .extras
+                .iter()
+                .any(|(key, value)| key == "log.target" && suppressed_target(value));
+        if suppressed {
+            return;
+        }
         let Some(message) = visitor.message else {
             return;
         };
