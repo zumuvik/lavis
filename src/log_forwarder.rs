@@ -93,12 +93,12 @@ impl<S: Subscriber> Layer<S> for BridgeLayer {
         event.record(&mut visitor);
         // Events forwarded from the `log` crate collapse metadata.target() to
         // "log" and carry the real target in the `log.target` field, so
-        // suppression runs only after the fields are collected.
+        // suppression runs only after the fields are collected. Values are
+        // Debug-rendered, i.e. wrapped in quotes - trim them before matching.
         let suppressed = suppressed_target(metadata.target())
-            || visitor
-                .extras
-                .iter()
-                .any(|(key, value)| key == "log.target" && suppressed_target(value));
+            || visitor.extras.iter().any(|(key, value)| {
+                key == "log.target" && suppressed_target(value.trim_matches('"'))
+            });
         if suppressed {
             return;
         }
