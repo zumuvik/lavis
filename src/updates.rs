@@ -1563,18 +1563,34 @@ async fn handle_event_dispatch(
             .await
         {
             // The sanitized Telegram rejection name is the only way to tell
-            // REACTION_INVALID (chat reaction set) from throttling or premium
-            // gates without instrumenting the module itself.
+            // REACTION_INVALID (chat reaction set) or CHAT_WRITE_FORBIDDEN
+            // (the sender is muted/restricted) from real infrastructure
+            // trouble. Expected rejections are routine - flooding the
+            // owner's Logs topic on each of them would be worse than the
+            // drop - so those stay at debug level.
             let name = match &error {
                 grammers_client::InvocationError::Rpc(rpc) => rpc.name.as_str(),
                 _ => "-",
             };
-            tracing::warn!(
-                event = "external_reaction_failed",
-                error_category = invocation_error_category(&error),
+            let expected_rejection = matches!(
                 name,
-                "External reaction action failed"
+                "CHAT_WRITE_FORBIDDEN" | "REACTION_INVALID" | "REACTION_DISABLED"
             );
+            if expected_rejection {
+                tracing::debug!(
+                    event = "external_reaction_dropped",
+                    error_category = invocation_error_category(&error),
+                    name,
+                    "External reaction rejected by Telegram"
+                );
+            } else {
+                tracing::warn!(
+                    event = "external_reaction_failed",
+                    error_category = invocation_error_category(&error),
+                    name,
+                    "External reaction action failed"
+                );
+            }
             continue;
         }
         if let Some(context) = &audit_context {
