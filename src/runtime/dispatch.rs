@@ -16,6 +16,7 @@ struct CreatedEventRequest {
 pub struct CreatedEventDispatchFailure {
     pub module_id: String,
     pub category: &'static str,
+    pub error: String,
 }
 
 #[derive(Debug, Default)]
@@ -70,6 +71,7 @@ impl CreatedEventDispatch {
                     result.failures.push(CreatedEventDispatchFailure {
                         module_id,
                         category: external_event_error_category(&error),
+                        error: error.to_string(),
                     });
                 }
             }

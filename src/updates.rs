@@ -1496,6 +1496,7 @@ async fn handle_event_dispatch(
             event = "external_event_failed",
             module_id = %failure.module_id,
             error_category = failure.category,
+            error = %failure.error,
             "External event failed"
         );
     }
