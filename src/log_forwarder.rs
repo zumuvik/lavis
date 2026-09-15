@@ -72,7 +72,7 @@ impl Visit for LineVisitor {
 impl<S: Subscriber> Layer<S> for BridgeLayer {
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
         let metadata = event.metadata();
-        if *metadata.level() < tracing::Level::WARN {
+        if !should_forward(metadata.level()) {
             return;
         }
         if metadata.target().starts_with("lavis_log_forwarder") {
@@ -118,6 +118,13 @@ impl<S: Subscriber> Layer<S> for BridgeLayer {
 
 fn count_dropped(bridge: &LogBridge) {
     bridge.dropped.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Only WARN and ERROR are forwarded. Note: `tracing::Level` orders more
+/// severe levels as *smaller* (ERROR < WARN < INFO < DEBUG < TRACE), so
+/// "more verbose than WARN" is `level > WARN`, not `level < WARN`.
+fn should_forward(level: &tracing::Level) -> bool {
+    level <= &tracing::Level::WARN
 }
 
 /// Library targets whose warnings are routine operational noise. Update gaps
@@ -289,6 +296,17 @@ async fn load_companion_chat_id(state_path: &Path, token_path: &Path) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forwards_only_warn_and_error() {
+        // Regression: tracing's inverted Level order means `< WARN` filtered
+        // out ERROR and forwarded INFO/DEBUG instead of the reverse.
+        assert!(should_forward(&tracing::Level::WARN));
+        assert!(should_forward(&tracing::Level::ERROR));
+        assert!(!should_forward(&tracing::Level::INFO));
+        assert!(!should_forward(&tracing::Level::DEBUG));
+        assert!(!should_forward(&tracing::Level::TRACE));
+    }
 
     #[test]
     fn format_line_uses_level_emoji_and_target() {
