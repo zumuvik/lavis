@@ -1679,31 +1679,64 @@ fn spawn_reactions_audit(
         )
         .await
         else {
-            audit_warn("reactions topic unavailable");
+            audit_warn(
+                "reactions topic unavailable",
+                &companion_chat_id.to_string(),
+            );
             return;
         };
-        use crate::bot_api::BotSendApi as _;
-        let api = match crate::bot_api::HttpBotApi::new() {
-            Ok(api) => api,
-            Err(_) => return,
+        // Direct Bot API call (not HttpBotApi): on failure the sanitized
+        // error enum hides the reason, and the topic-delivery failure is
+        // exactly what needs a verbatim Bot API description to debug.
+        let url = format!("https://api.telegram.org/bot{}/sendMessage", token.as_str());
+        let response = match client
+            .post(&url)
+            .timeout(std::time::Duration::from_secs(15))
+            .json(&serde_json::json!({
+                "chat_id": companion_chat_id,
+                "message_thread_id": topic_id,
+                "text": line,
+            }))
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                audit_warn("transport", &error.to_string());
+                return;
+            }
         };
-        let audit_message = crate::bot_api::BotMessage {
-            chat_id: companion_chat_id,
-            message_thread_id: Some(topic_id),
-            text: line,
+        let status = response.status().to_string();
+        let body = match response.bytes().await {
+            Ok(body) => body,
+            Err(error) => {
+                audit_warn("body_read", &error.to_string());
+                return;
+            }
         };
-        if api.send_message(&token, &audit_message).await.is_err() {
-            audit_warn("reactions audit delivery failed");
+        #[derive(serde::Deserialize)]
+        struct AuditDeliveryResponse {
+            ok: bool,
+            description: Option<String>,
+        }
+        match serde_json::from_slice::<AuditDeliveryResponse>(&body) {
+            Ok(parsed) if parsed.ok => {}
+            Ok(parsed) => audit_warn(
+                "api_rejected",
+                parsed.description.as_deref().unwrap_or(&status),
+            ),
+            Err(error) => audit_warn("malformed", &error.to_string()),
         }
     });
 }
 
-fn audit_warn(reason: &'static str) {
+fn audit_warn(reason: &'static str, detail: &str) {
     if !REACTIONS_AUDIT_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         tracing::warn!(
             target: "lavis_log_forwarder",
             event = "reactions_audit_failed",
             reason,
+            detail,
             "Reactions audit delivery failed — further audit lines are dropped silently"
         );
     }
