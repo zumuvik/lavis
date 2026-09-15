@@ -1694,7 +1694,7 @@ fn spawn_reactions_audit(
             .post(&url)
             .timeout(std::time::Duration::from_secs(15))
             .json(&serde_json::json!({
-                "chat_id": companion_chat_id,
+                "chat_id": crate::companion_forum::bot_api_chat_id(companion_chat_id),
                 "message_thread_id": topic_id,
                 "text": line,
             }))
