@@ -4,6 +4,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum V6Method {
     AccountUpdateStatus,
+    UsersGetUsers,
     ContactsGetContacts,
     MessagesGetHistory,
     MessagesGetDialogs,
@@ -21,6 +22,7 @@ pub struct MethodSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputShape {
     UpdateStatusParams,
+    SelfPresenceParams,
     ContactsHashParams,
     HistorySelfParams,
     DialogsInitialParams,
@@ -30,6 +32,7 @@ pub enum InputShape {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResultShape {
     UpdateStatusResult,
+    SelfPresenceResult,
     ContactsSummary,
     HistorySummary,
     DialogsSummary,
@@ -43,6 +46,12 @@ impl V6Method {
                 name: "account.updateStatus",
                 input: InputShape::UpdateStatusParams,
                 result: ResultShape::UpdateStatusResult,
+                required_capability: Some("telegram.account.status"),
+            },
+            Self::UsersGetUsers => MethodSpec {
+                name: "users.getUsers",
+                input: InputShape::SelfPresenceParams,
+                result: ResultShape::SelfPresenceResult,
                 required_capability: Some("telegram.account.status"),
             },
             Self::ContactsGetContacts => MethodSpec {
@@ -73,8 +82,9 @@ impl V6Method {
     }
 }
 
-pub const METHOD_SPECS: [MethodSpec; 5] = [
+pub const METHOD_SPECS: [MethodSpec; 6] = [
     V6Method::AccountUpdateStatus.spec(),
+    V6Method::UsersGetUsers.spec(),
     V6Method::ContactsGetContacts.spec(),
     V6Method::MessagesGetHistory.spec(),
     V6Method::MessagesGetDialogs.spec(),
@@ -84,6 +94,7 @@ pub const METHOD_SPECS: [MethodSpec; 5] = [
 pub fn lookup(name: &str) -> Option<V6Method> {
     match name {
         "account.updateStatus" => Some(V6Method::AccountUpdateStatus),
+        "users.getUsers" => Some(V6Method::UsersGetUsers),
         "contacts.getContacts" => Some(V6Method::ContactsGetContacts),
         "messages.getHistory" => Some(V6Method::MessagesGetHistory),
         "messages.getDialogs" => Some(V6Method::MessagesGetDialogs),

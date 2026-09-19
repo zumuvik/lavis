@@ -160,6 +160,7 @@ impl V6TelegramExecutor for GrammersV6Executor {
                 .map_err(|_| V6ExecutorError::ShuttingDown)?;
             match method {
                 V6Method::AccountUpdateStatus => self.update_status(params).await,
+                V6Method::UsersGetUsers => self.get_users(params).await,
                 V6Method::ContactsGetContacts => self.get_contacts(params).await,
                 V6Method::MessagesGetHistory => self.get_history(params).await,
                 V6Method::MessagesGetDialogs => self.get_dialogs(params).await,
@@ -181,6 +182,23 @@ impl GrammersV6Executor {
             .await
             .map_err(map_invocation_error)?;
         V6RpcOutput::new(serde_json::Value::Bool(result))
+    }
+
+    async fn get_users(&self, params: Box<RawValue>) -> Result<V6RpcOutput, V6ExecutorError> {
+        let _params = decode::<SelfPresenceParams>(&params)?;
+        let me = self.client.get_me().await.map_err(map_invocation_error)?;
+        let presence = match me.status() {
+            grammers_client::tl::enums::UserStatus::Online(status) => {
+                serde_json::json!({"online": true, "expires": status.expires, "was_online": null})
+            }
+            grammers_client::tl::enums::UserStatus::Offline(status) => {
+                serde_json::json!({"online": false, "expires": null, "was_online": status.was_online})
+            }
+            // Hidden-relative statuses (recently/last week/month) carry no
+            // timestamp; the account is simply not online right now.
+            _ => serde_json::json!({"online": false, "expires": null, "was_online": null}),
+        };
+        V6RpcOutput::new(presence)
     }
 
     async fn get_contacts(&self, params: Box<RawValue>) -> Result<V6RpcOutput, V6ExecutorError> {
@@ -339,6 +357,12 @@ fn decode<T: for<'de> Deserialize<'de>>(value: &RawValue) -> Result<T, V6Executo
 struct UpdateStatusParams {
     offline: bool,
 }
+
+/// `users.getUsers` exposes only the signed-in account's presence; params
+/// carry no ids, so a module cannot probe third-party presence.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SelfPresenceParams {}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -640,6 +664,8 @@ mod tests {
 
     #[test]
     fn strict_params_reject_unknown_peers_and_out_of_range_limits() {
+        assert!(decode::<SelfPresenceParams>(&raw(r#"{}"#)).is_ok());
+        assert!(decode::<SelfPresenceParams>(&raw(r#"{"id":[]}"#)).is_err());
         assert!(matches!(
             decode::<GetHistoryParams>(&raw(r#"{"peer":{"kind":"other"},"hash":"1"}"#)),
             Ok(params) if require_self_peer(&params.peer).is_err()

@@ -20,6 +20,13 @@ METHODS = (
         "update_status_result",
         "telegram.account.status",
     ),
+    (
+        "users.getUsers",
+        "UsersGetUsers",
+        "self_presence_params",
+        "self_presence_result",
+        "telegram.account.status",
+    ),
     ("contacts.getContacts", "ContactsGetContacts", "contacts_hash_params", "contacts_summary", None),
     ("messages.getHistory", "MessagesGetHistory", "history_self_params", "history_summary", None),
     ("messages.getDialogs", "MessagesGetDialogs", "dialogs_initial_params", "dialogs_summary", None),
@@ -29,6 +36,7 @@ METHODS = (
 )
 INPUT_SHAPES = {
     "update_status_params": "UpdateStatusParams",
+    "self_presence_params": "SelfPresenceParams",
     "contacts_hash_params": "ContactsHashParams",
     "history_self_params": "HistorySelfParams",
     "dialogs_initial_params": "DialogsInitialParams",
@@ -36,6 +44,7 @@ INPUT_SHAPES = {
 }
 RESULT_SHAPES = {
     "update_status_result": "UpdateStatusResult",
+    "self_presence_result": "SelfPresenceResult",
     "contacts_summary": "ContactsSummary",
     "history_summary": "HistorySummary",
     "dialogs_summary": "DialogsSummary",
