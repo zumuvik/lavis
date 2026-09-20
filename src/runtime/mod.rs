@@ -2468,9 +2468,9 @@ for line in sys.stdin:
         open(os.path.join(ready_dir, "started-" + module_id), "w").close()
         while not os.path.exists(os.path.join(ready_dir, "release")):
             time.sleep(0.01)
-        response = {"protocol_version": 3, "type": "event_result", "request_id": request_id, "actions": []}
-    elif message["type"] == "shutdown":
-        response = {"protocol_version": 3, "type": "health", "request_id": request_id}
+        response = {"protocol_version": 6, "type": "event_result", "request_id": request_id, "actions": []}
+    elif message["type"] in ("health", "shutdown"):
+        response = {"protocol_version": 6, "type": "health", "request_id": request_id}
     else:
         continue
     sys.stdout.write(json.dumps(response) + "\n")
@@ -2525,10 +2525,9 @@ for line in sys.stdin:
             .expect("fixture tests require python3 in PATH");
         let mut descriptors = Vec::new();
         for (id, protocol_version, subscribed) in [
-            ("first", 3, true),
-            ("second", 3, true),
-            ("legacy", 2, true),
-            ("unsubscribed", 3, false),
+            ("first", 6, true),
+            ("second", 6, true),
+            ("unsubscribed", 6, false),
         ] {
             let module_dir = directory.join(id);
             fs::create_dir_all(&module_dir).unwrap();
@@ -2557,8 +2556,24 @@ for line in sys.stdin:
             ));
         }
 
+        struct NoopExecutor;
+        impl crate::external_modules::v6_executor::V6TelegramExecutor for NoopExecutor {
+            fn execute<'a>(
+                &'a self,
+                _context: crate::external_modules::v6_executor::V6ExecutionContext,
+                _method: crate::external_modules::v6_registry::V6Method,
+                _params: Box<serde_json::value::RawValue>,
+            ) -> crate::external_modules::v6_executor::V6ExecutorFuture<'a> {
+                Box::pin(async {
+                    Err(crate::external_modules::v6_executor::V6ExecutorError::Transport)
+                })
+            }
+        }
+
+        crate::external_modules::v6_process::ensure_test_state_base();
         let mut manager = crate::external_modules::manager::ExternalManager::new();
         manager.set_descriptors(descriptors.clone());
+        manager.set_v6_executor(std::sync::Arc::new(NoopExecutor));
         let handle = crate::external_modules::manager::ExternalManagerHandle::new(manager);
         handle
             .startup_enabled(
@@ -2580,7 +2595,7 @@ for line in sys.stdin:
                 vec![],
                 None,
             )
-            .expect("only subscribed v3 modules should receive events");
+            .expect("only subscribed modules should receive events");
 
         let execute = dispatch.execute();
         tokio::pin!(execute);
@@ -2594,7 +2609,6 @@ for line in sys.stdin:
         })
         .await
         .expect("independent module requests did not begin together");
-        assert!(!directory.join("started-legacy").exists());
         assert!(!directory.join("started-unsubscribed").exists());
         fs::write(directory.join("release"), "").unwrap();
         assert!(execute.await.actions.is_empty());

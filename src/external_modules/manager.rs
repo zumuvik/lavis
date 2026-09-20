@@ -6,7 +6,7 @@ use tracing;
 use super::{
     MAX_COMMANDS_PER_MODULE,
     manifest::{ExternalCommandDescriptor, ExternalModuleDescriptor},
-    process::{LegacyMetadata, LegacyMetadataView, ModuleProcess, ProcessStatus},
+    process::{LegacyMetadataView, ProcessStatus},
     v6_executor::V6TelegramExecutor,
     v6_process::V6Process,
 };
@@ -43,7 +43,7 @@ pub enum ExternalModuleRuntimeStatus {
 
 pub struct ExternalManager {
     descriptors: Vec<ExternalModuleDescriptor>,
-    processes: BTreeMap<String, ManagedProcess>,
+    processes: BTreeMap<String, V6Process>,
     gateway: Option<Arc<dyn super::gateway::TelegramGateway>>,
     v6_executor: Option<Arc<dyn V6TelegramExecutor>>,
     /// Last known crash/startup-failure diagnostic per module, retained even
@@ -58,55 +58,17 @@ pub struct ExternalManager {
     bot_inline: Option<Arc<dyn super::v6_host::HostInlineSurface>>,
 }
 
-#[derive(Clone)]
-enum ManagedProcess {
-    Legacy {
-        process: Arc<Mutex<ModuleProcess>>,
-        metadata: Arc<LegacyMetadata>,
-    },
-    V6(V6Process),
-}
-
-#[derive(Debug, Eq, PartialEq)]
-enum ProcessStartKind {
-    Legacy,
-    V6,
-}
-
-fn process_start_kind(
-    protocol_version: u32,
-    has_v6_executor: bool,
-) -> Result<ProcessStartKind, ExternalError> {
-    match protocol_version {
-        2..=5 => Ok(ProcessStartKind::Legacy),
-        6 if has_v6_executor => Ok(ProcessStartKind::V6),
-        6 => Err(ExternalError::Unavailable),
-        _ => Err(ExternalError::Unavailable),
+fn metadata_view(process: &V6Process) -> LegacyMetadataView {
+    LegacyMetadataView {
+        descriptor: Arc::new(process.descriptor().clone()),
+        status: process.status(),
     }
 }
 
-impl ManagedProcess {
-    fn metadata_view(&self) -> LegacyMetadataView {
-        match self {
-            Self::Legacy { metadata, .. } => LegacyMetadataView {
-                descriptor: metadata.descriptor.clone(),
-                status: metadata.status(),
-            },
-            Self::V6(process) => LegacyMetadataView {
-                descriptor: Arc::new(process.descriptor().clone()),
-                status: process.status(),
-            },
-        }
-    }
-
-    fn diagnostic_text(&self) -> Option<String> {
-        match self {
-            Self::Legacy { .. } => None,
-            Self::V6(process) => process
-                .diagnostic()
-                .map(|diagnostic| diagnostic.render_user()),
-        }
-    }
+fn diagnostic_text(process: &V6Process) -> Option<String> {
+    process
+        .diagnostic()
+        .map(|diagnostic| diagnostic.render_user())
 }
 
 /// Wait for the v6 supervisor to record its crash diagnostic. The supervisor
@@ -123,25 +85,10 @@ async fn retain_v6_diagnostic(process: &V6Process) -> Option<super::process::Cra
     None
 }
 
-async fn shutdown_process(id: &str, process: ManagedProcess) {
-    match process {
-        ManagedProcess::Legacy { process, .. } => {
-            let mut process = process.lock().await;
-            if process.status() == ProcessStatus::Running
-                && process.graceful_shutdown().await.is_err()
-            {
-                tracing::warn!(event = "external_module_shutdown_forced", module_id = %id, "Forcefully terminating external module");
-                process.terminate().await;
-            }
-        }
-        ManagedProcess::V6(process) => {
-            if process.status() == ProcessStatus::Running
-                && process.graceful_shutdown().await.is_err()
-            {
-                tracing::warn!(event = "external_module_shutdown_forced", module_id = %id, "Forcefully terminating external module");
-                process.terminate().await;
-            }
-        }
+async fn shutdown_process(id: &str, process: V6Process) {
+    if process.status() == ProcessStatus::Running && process.graceful_shutdown().await.is_err() {
+        tracing::warn!(event = "external_module_shutdown_forced", module_id = %id, "Forcefully terminating external module");
+        process.terminate().await;
     }
 }
 
@@ -228,7 +175,7 @@ impl ExternalManager {
     pub fn has_running_process(&self, id: &str) -> bool {
         self.processes
             .get(id)
-            .map(|process| process.metadata_view().status == ProcessStatus::Running)
+            .map(|process| metadata_view(process).status == ProcessStatus::Running)
             .unwrap_or(false)
     }
 
@@ -244,7 +191,7 @@ impl ExternalManager {
     fn process_views(&self) -> BTreeMap<String, LegacyMetadataView> {
         self.processes
             .iter()
-            .map(|(id, process)| (id.clone(), process.metadata_view()))
+            .map(|(id, process)| (id.clone(), metadata_view(process)))
             .collect()
     }
 
@@ -300,7 +247,7 @@ impl ExternalManager {
         if module_id.is_empty() || command_name.is_empty() {
             return None;
         }
-        let view = self.processes.get(module_id)?.metadata_view();
+        let view = metadata_view(self.processes.get(module_id)?);
         if view.status != ProcessStatus::Running {
             return None;
         }
@@ -312,7 +259,7 @@ impl ExternalManager {
     }
 
     pub fn resolve_default_command(&self, module_id: &str) -> Option<(String, String)> {
-        let view = self.processes.get(module_id)?.metadata_view();
+        let view = metadata_view(self.processes.get(module_id)?);
         (view.status == ProcessStatus::Running)
             .then(|| view.descriptor.default_command.clone())
             .flatten()
@@ -322,7 +269,7 @@ impl ExternalManager {
     pub fn command_refs(&self) -> Vec<ExternalCommandRef> {
         let mut refs = Vec::new();
         for process in self.processes.values() {
-            let view = process.metadata_view();
+            let view = metadata_view(process);
             if view.status != ProcessStatus::Running {
                 continue;
             }
@@ -346,7 +293,7 @@ impl ExternalManager {
     }
 
     pub fn find_command(&self, module_id: &str, command_name: &str) -> Option<ExternalCommandRef> {
-        let view = self.processes.get(module_id)?.metadata_view();
+        let view = metadata_view(self.processes.get(module_id)?);
         if view.status != ProcessStatus::Running {
             return None;
         }
@@ -377,12 +324,10 @@ impl ExternalManager {
     }
 
     pub fn remove_crashed(&mut self, module_id: &str) {
-        if let Some(proc) = self.processes.get(module_id)
-            && proc.metadata_view().status == ProcessStatus::Crashed
+        if let Some(process) = self.processes.get(module_id)
+            && metadata_view(process).status == ProcessStatus::Crashed
         {
-            if let ManagedProcess::V6(process) = &self.processes[module_id]
-                && let Some(diagnostic) = process.diagnostic()
-            {
+            if let Some(diagnostic) = process.diagnostic() {
                 self.latest_diagnostics
                     .insert(module_id.to_owned(), diagnostic);
             }
@@ -491,11 +436,7 @@ impl ExternalManagerHandle {
 
     pub async fn diagnostic_text(&self, module_id: &str) -> Option<String> {
         let mgr = self.inner.lock().await;
-        match mgr
-            .processes
-            .get(module_id)
-            .and_then(ManagedProcess::diagnostic_text)
-        {
+        match mgr.processes.get(module_id).and_then(diagnostic_text) {
             Some(text) => Some(text),
             None => mgr
                 .latest_diagnostics
@@ -507,7 +448,7 @@ impl ExternalManagerHandle {
     /// One-line crash summary (live process or retained), for `lm doctor`.
     pub async fn diagnostic_summary(&self, module_id: &str) -> Option<String> {
         let mgr = self.inner.lock().await;
-        if let Some(ManagedProcess::V6(process)) = mgr.processes.get(module_id)
+        if let Some(process) = mgr.processes.get(module_id)
             && let Some(diagnostic) = process.diagnostic()
         {
             return Some(diagnostic.summary());
@@ -529,8 +470,8 @@ impl ExternalManagerHandle {
         let process = {
             let manager = self.inner.lock().await;
             match manager.processes.get(module_id) {
-                Some(process @ ManagedProcess::V6(_)) => {
-                    let view = process.metadata_view();
+                Some(process) => {
+                    let view = metadata_view(process);
                     if view.status != ProcessStatus::Running
                         || !view
                             .descriptor
@@ -543,10 +484,7 @@ impl ExternalManagerHandle {
                     {
                         return Err(ExternalError::Unavailable);
                     }
-                    match process {
-                        ManagedProcess::V6(process) => process.clone(),
-                        ManagedProcess::Legacy { .. } => return Err(ExternalError::Unavailable),
-                    }
+                    process.clone()
                 }
                 _ => return Err(ExternalError::Unavailable),
             }
@@ -564,7 +502,7 @@ impl ExternalManagerHandle {
     /// Starts children without retaining the manager mutex. Process I/O belongs
     /// to the individual process mutex; the manager only owns the index.
     pub async fn startup_enabled(&self, enabled_ids: &std::collections::BTreeSet<String>) {
-        let (descriptors, gateway, v6_executor, self_edit_ledger, bot_send, bot_inline) = {
+        let (descriptors, v6_executor, self_edit_ledger, bot_send, bot_inline) = {
             let manager = self.inner.lock().await;
             (
                 manager
@@ -573,7 +511,6 @@ impl ExternalManagerHandle {
                     .filter(|descriptor| enabled_ids.contains(&descriptor.id))
                     .cloned()
                     .collect::<Vec<_>>(),
-                manager.gateway.clone(),
                 manager.v6_executor.clone(),
                 manager.self_edit_ledger.clone(),
                 manager.bot_send.clone(),
@@ -582,95 +519,72 @@ impl ExternalManagerHandle {
         };
         for descriptor in descriptors {
             let id = descriptor.id.clone();
-            let process =
-                match process_start_kind(descriptor.protocol_version, v6_executor.is_some()) {
-                    Ok(ProcessStartKind::V6) => match v6_executor.clone() {
-                        Some(executor) => {
-                            let restart_generation = {
-                                let mut manager = self.inner.lock().await;
-                                let next =
-                                    manager.restart_generations.get(&id).copied().unwrap_or(0) + 1;
-                                manager.restart_generations.insert(id.clone(), next);
-                                next
-                            };
-                            match V6Process::start_with_ledger(
-                                descriptor.clone(),
-                                executor,
-                                restart_generation,
-                                self_edit_ledger.clone(),
-                                bot_send.clone(),
-                                bot_inline.clone(),
-                            )
-                            .await
+            let process = match v6_executor.clone() {
+                Some(executor) => {
+                    let restart_generation = {
+                        let mut manager = self.inner.lock().await;
+                        let next = manager.restart_generations.get(&id).copied().unwrap_or(0) + 1;
+                        manager.restart_generations.insert(id.clone(), next);
+                        next
+                    };
+                    match V6Process::start_with_ledger(
+                        descriptor.clone(),
+                        executor,
+                        restart_generation,
+                        self_edit_ledger.clone(),
+                        bot_send.clone(),
+                        bot_inline.clone(),
+                    )
+                    .await
+                    {
+                        Ok(process) => {
+                            let handshake: Result<(), ExternalError> = match process
+                                .initialize(super::protocol::request_id(), id.clone())
+                                .await
                             {
-                                Ok(process) => {
-                                    let handshake: Result<(), ExternalError> = match process
-                                        .initialize(super::protocol::request_id(), id.clone())
-                                        .await
-                                    {
-                                        Ok(super::protocol::V6InboundFrame::Initialized {
-                                            module_id,
-                                            ..
-                                        }) if module_id == id => {
-                                            match process
-                                                .health(super::protocol::request_id())
-                                                .await
-                                            {
-                                                Ok(super::protocol::V6InboundFrame::Health {
-                                                    ..
-                                                }) => Ok(()),
-                                                Ok(_) => Err(ExternalError::ProtocolDecode),
-                                                Err(error) => Err(error),
-                                            }
+                                Ok(super::protocol::V6InboundFrame::Initialized {
+                                    module_id,
+                                    ..
+                                }) if module_id == id => {
+                                    match process.health(super::protocol::request_id()).await {
+                                        Ok(super::protocol::V6InboundFrame::Health { .. }) => {
+                                            Ok(())
                                         }
                                         Ok(_) => Err(ExternalError::ProtocolDecode),
                                         Err(error) => Err(error),
-                                    };
-                                    match handshake {
-                                        Ok(()) => Ok(ManagedProcess::V6(process)),
-                                        Err(error) => {
-                                            // The supervisor records the crash
-                                            // diagnostic during teardown, after
-                                            // the failed request reply; poll
-                                            // briefly so the failure is not
-                                            // lost when the process is dropped.
-                                            if let Some(diagnostic) =
-                                                retain_v6_diagnostic(&process).await
-                                            {
-                                                let mut manager = self.inner.lock().await;
-                                                manager
-                                                    .latest_diagnostics
-                                                    .insert(id.clone(), diagnostic);
-                                            }
-                                            process.terminate().await;
-                                            Err(error)
-                                        }
                                     }
                                 }
-                                Err(failure) => {
-                                    let mut manager = self.inner.lock().await;
-                                    manager
-                                        .latest_diagnostics
-                                        .insert(id.clone(), failure.diagnostics);
-                                    Err(failure.error)
+                                Ok(_) => Err(ExternalError::ProtocolDecode),
+                                Err(error) => Err(error),
+                            };
+                            match handshake {
+                                Ok(()) => Ok(process),
+                                Err(error) => {
+                                    // The supervisor records the crash
+                                    // diagnostic during teardown, after
+                                    // the failed request reply; poll
+                                    // briefly so the failure is not
+                                    // lost when the process is dropped.
+                                    if let Some(diagnostic) = retain_v6_diagnostic(&process).await {
+                                        let mut manager = self.inner.lock().await;
+                                        manager.latest_diagnostics.insert(id.clone(), diagnostic);
+                                    }
+                                    process.terminate().await;
+                                    Err(error)
                                 }
                             }
                         }
-                        None => Err(ExternalError::Unavailable),
-                    },
-                    Ok(ProcessStartKind::Legacy) => {
-                        ModuleProcess::start_with_gateway(descriptor.clone(), gateway.clone())
-                            .await
-                            .map(|process| {
-                                let metadata = process.metadata();
-                                ManagedProcess::Legacy {
-                                    process: Arc::new(Mutex::new(process)),
-                                    metadata,
-                                }
-                            })
+                        Err(failure) => {
+                            let mut manager = self.inner.lock().await;
+                            manager
+                                .latest_diagnostics
+                                .insert(id.clone(), failure.diagnostics);
+                            Err(failure.error)
+                        }
                     }
-                    Err(error) => Err(error),
-                };
+                }
+                None => Err(ExternalError::Unavailable),
+            };
             match process {
                 Ok(process) => {
                     // A healthy fresh start clears any retained crash history.
@@ -735,33 +649,19 @@ impl ExternalManagerHandle {
         .ok_or(ExternalError::Unavailable)?;
         let original_ref = payload.message_ref.clone();
         let mut issued_handle: Option<String> = None;
-        if let (ManagedProcess::V6(v6_process), Some(message)) = (&process, message)
+        if let Some(message) = message
             && payload.outgoing
-            && v6_process
+            && process
                 .descriptor()
                 .capabilities
                 .contains(&super::manifest::ExternalCapability::MessageDelete)
-            && let Ok(handle) = v6_process.register_current_message(message, true)
+            && let Ok(handle) = process.register_current_message(message, true)
         {
             payload.message_ref = handle.clone();
             issued_handle = Some(handle);
         }
-        let dispatch = async {
-            match &process {
-                ManagedProcess::Legacy { process, .. } => {
-                    let mut process = process.lock().await;
-                    if process.status() != ProcessStatus::Running
-                        || process.descriptor().protocol_version < 3
-                    {
-                        return Err(ExternalError::Unavailable);
-                    }
-                    process.dispatch_event(event, payload).await
-                }
-                ManagedProcess::V6(process) => process.dispatch_event_result(event, payload).await,
-            }
-        };
-        let result = dispatch.await;
-        if let (ManagedProcess::V6(process), Some(handle)) = (&process, issued_handle.clone()) {
+        let result = process.dispatch_event_result(event, payload).await;
+        if let Some(handle) = issued_handle.clone() {
             process.release_handle(&handle);
         }
         let (request_id, actions) = result?;
@@ -780,24 +680,13 @@ impl ExternalManagerHandle {
             manager.processes.get(module_id).cloned()
         }
         .ok_or(ExternalError::Unavailable)?;
-        match process {
-            ManagedProcess::Legacy { process, .. } => {
-                let mut process = process.lock().await;
-                if process.status() != ProcessStatus::Running {
-                    return Err(ExternalError::Unavailable);
-                }
-                process
-                    .execute_with_entities(command_name, arguments, argument_entities)
-                    .await
+        {
+            if process.status() != ProcessStatus::Running {
+                return Err(ExternalError::Unavailable);
             }
-            ManagedProcess::V6(process) => {
-                if process.status() != ProcessStatus::Running {
-                    return Err(ExternalError::Unavailable);
-                }
-                process
-                    .execute_command(command_name, arguments, argument_entities)
-                    .await
-            }
+            process
+                .execute_command(command_name, arguments, argument_entities)
+                .await
         }
     }
 
@@ -820,85 +709,79 @@ impl ExternalManagerHandle {
             manager.processes.get(module_id).cloned()
         }
         .ok_or(ExternalError::Unavailable)?;
-        match process {
-            ManagedProcess::Legacy { .. } => {
-                self.execute(module_id, command_name, arguments, argument_entities)
-                    .await
+        {
+            if process.status() != ProcessStatus::Running
+                || process.descriptor().contract_revision.unwrap_or(2)
+                    < super::protocol::V6_HOST_CONTRACT_REVISION
+            {
+                return self
+                    .execute(module_id, command_name, arguments, argument_entities)
+                    .await;
             }
-            ManagedProcess::V6(process) => {
-                if process.status() != ProcessStatus::Running
-                    || process.descriptor().contract_revision.unwrap_or(2)
-                        < super::protocol::V6_HOST_CONTRACT_REVISION
-                {
-                    return self
-                        .execute(module_id, command_name, arguments, argument_entities)
-                        .await;
+            let replied = if process
+                .descriptor()
+                .capabilities
+                .contains(&super::manifest::ExternalCapability::MessageRead)
+            {
+                replied
+            } else {
+                None
+            };
+            let companion = if process.descriptor().contract_revision.unwrap_or(2)
+                >= super::protocol::V6_COMPANION_SINCE
+            {
+                companion
+            } else {
+                None
+            };
+            let message_handle = process.register_current_message(message, authored_by_self)?;
+            let peer_handle = match process.register_peer_handle(peer_id) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    process.release_handle(&message_handle);
+                    return Err(error);
                 }
-                let replied = if process
-                    .descriptor()
-                    .capabilities
-                    .contains(&super::manifest::ExternalCapability::MessageRead)
-                {
-                    replied
-                } else {
-                    None
-                };
-                let companion = if process.descriptor().contract_revision.unwrap_or(2)
-                    >= super::protocol::V6_COMPANION_SINCE
-                {
-                    companion
-                } else {
-                    None
-                };
-                let message_handle = process.register_current_message(message, authored_by_self)?;
-                let peer_handle = match process.register_peer_handle(peer_id) {
-                    Ok(handle) => handle,
-                    Err(error) => {
-                        process.release_handle(&message_handle);
-                        return Err(error);
-                    }
-                };
-                let reply_context = replied.and_then(|reply| {
-                    process
-                        .register_reply_message(reply.clone())
-                        .ok()
-                        .map(|handle| super::protocol::V6ReplyContext {
-                            message: handle,
-                            text: bounded_context_text(reply.text()),
-                        })
-                });
-                let reply_handle = reply_context.as_ref().map(|reply| reply.message.clone());
-                let result = match process
-                    .execute_with_context(
-                        super::protocol::request_id(),
-                        command_name.to_owned(),
-                        arguments.to_owned(),
-                        argument_entities.to_vec(),
-                        Some(super::protocol::V6CommandContext {
-                            peer: peer_handle.clone(),
-                            message: message_handle.clone(),
-                            text: message_text,
-                            replied: reply_context.clone(),
-                            companion,
-                            chat_id: peer_id.bot_api_dialog_id(),
-                        }),
-                    )
-                    .await
-                {
-                    Ok(super::protocol::V6InboundFrame::Result { text, .. }) => Ok(text),
-                    Ok(super::protocol::V6InboundFrame::Error { message, .. }) => {
-                        Err(ExternalError::ModuleError(message))
-                    }
-                    Ok(_) => Err(ExternalError::ModuleError(String::new())),
-                    Err(error) => Err(error),
-                };
-                process.release_handle(&message_handle);
-                if let Some(reply) = reply_handle {
-                    process.release_handle(&reply);
+            };
+            let reply_context = replied.and_then(|reply| {
+                process
+                    .register_reply_message(reply.clone())
+                    .ok()
+                    .map(|handle| super::protocol::V6ReplyContext {
+                        message: handle,
+                        text: bounded_context_text(reply.text()),
+                    })
+            });
+            let reply_handle = reply_context.as_ref().map(|reply| reply.message.clone());
+            let result = match process
+                .execute_with_context(
+                    super::protocol::request_id(),
+                    command_name.to_owned(),
+                    arguments.to_owned(),
+                    argument_entities.to_vec(),
+                    Some(super::protocol::V6CommandContext {
+                        peer: peer_handle.clone(),
+                        message: message_handle.clone(),
+                        text: message_text,
+                        replied: reply_context.clone(),
+                        companion,
+                        chat_id: peer_id.bot_api_dialog_id(),
+                    }),
+                )
+                .await
+            {
+                Ok(super::protocol::V6InboundFrame::Result { text, .. }) => Ok(text),
+                Ok(super::protocol::V6InboundFrame::Error { message, .. }) => {
+                    Err(ExternalError::ModuleError(message))
                 }
-                process.release_handle(&peer_handle);
-                result
+                Ok(_) => Err(ExternalError::ModuleError(String::new())),
+                Err(error) => Err(error),
+            };
+            process.release_handle(&message_handle);
+            if let Some(reply) = reply_handle {
+                process.release_handle(&reply);
             }
+            process.release_handle(&peer_handle);
+            result
         }
     }
 }
@@ -920,17 +803,14 @@ fn bounded_context_text(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ExternalManager, ExternalModuleRuntimeStatus, ManagedProcess, ProcessStartKind,
-        bounded_context_text, process_start_kind,
-    };
+    use super::{ExternalManager, ExternalModuleRuntimeStatus, bounded_context_text};
     use crate::external_modules::manifest::{ExternalCommandDescriptor, ExternalModuleDescriptor};
     use std::path::PathBuf;
 
     fn descriptor(id: &str, version: &str) -> ExternalModuleDescriptor {
         ExternalModuleDescriptor {
-            protocol_version: 2,
-            contract_revision: None,
+            protocol_version: 6,
+            contract_revision: Some(2),
             id: id.to_owned(),
             display_name: "Sample".to_owned(),
             version: version.to_owned(),
@@ -1015,28 +895,6 @@ mod tests {
         let handle = super::ExternalManagerHandle::new(ExternalManager::new());
         handle.stop_module("sample").await;
         assert!(!handle.lock().await.has_running_process("sample"));
-    }
-
-    #[test]
-    fn schemas_two_through_five_select_the_legacy_process() {
-        for version in 2..=5 {
-            assert!(matches!(
-                process_start_kind(version, false),
-                Ok(ProcessStartKind::Legacy)
-            ));
-        }
-    }
-
-    #[test]
-    fn schema_six_requires_the_v6_executor_and_selects_only_v6() {
-        assert!(matches!(
-            process_start_kind(6, false),
-            Err(crate::error::ExternalError::Unavailable)
-        ));
-        assert!(matches!(
-            process_start_kind(6, true),
-            Ok(ProcessStartKind::V6)
-        ));
     }
 
     #[tokio::test]
@@ -1264,84 +1122,6 @@ mod tests {
             handle.lock().await.statuses()[0].status,
             ExternalModuleRuntimeStatus::Failed
         );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn legacy_metadata_reads_do_not_wait_for_process_mutex() {
-        use std::{os::unix::fs::PermissionsExt, time::Duration};
-        let root = std::env::temp_dir().join(format!("lavis-legacy-meta-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let python = std::env::var_os("PATH")
-            .unwrap()
-            .to_string_lossy()
-            .split(':')
-            .map(|p| std::path::Path::new(p).join("python3"))
-            .find(|p| p.is_file())
-            .unwrap();
-        let entrypoint = root.join("run");
-        std::fs::write(&entrypoint, format!("#!{}\nimport json,sys\nfor line in sys.stdin:\n v=json.loads(line)\n if v['type']=='initialize': print(json.dumps({{'protocol_version':4,'type':'initialized','request_id':v['request_id'],'module_id':v['module_id']}}),flush=True)\n", python.display())).unwrap();
-        std::fs::set_permissions(&entrypoint, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let mut module = descriptor("legacy", "1");
-        module.protocol_version = 4;
-        module.module_dir = root.clone();
-        module.entrypoint = entrypoint;
-        module.default_command = Some("run".into());
-        let handle = super::ExternalManagerHandle::new(ExternalManager::new());
-        {
-            let mut m = handle.lock().await;
-            m.set_descriptors(vec![module]);
-        }
-        handle
-            .startup_enabled(&std::collections::BTreeSet::from(["legacy".into()]))
-            .await;
-        let process = {
-            let m = handle.lock().await;
-            match m.processes.get("legacy").unwrap() {
-                ManagedProcess::Legacy { process, .. } => process.clone(),
-                _ => panic!(),
-            }
-        };
-        let guard = process.lock().await;
-        let snapshot = tokio::time::timeout(Duration::from_secs(1), handle.snapshot())
-            .await
-            .unwrap();
-        assert_eq!(
-            snapshot.module_statuses[0].status,
-            ExternalModuleRuntimeStatus::Running
-        );
-        assert!(snapshot.active_commands.contains("legacy.run"));
-        assert_eq!(
-            snapshot.active_defaults.get("legacy"),
-            Some(&"run".to_owned())
-        );
-        assert_eq!(snapshot.command_refs.len(), 1);
-        assert_eq!(snapshot.command_refs[0].module_id, "legacy");
-        assert_eq!(snapshot.command_refs[0].command_name, "run");
-        assert_eq!(snapshot.descriptors[0].id, "legacy");
-        assert_eq!(
-            snapshot.descriptors[0].default_command.as_deref(),
-            Some("run")
-        );
-        let manager = handle.lock().await;
-        assert_eq!(
-            manager.resolve_namespaced_command("legacy.run"),
-            Some(("legacy".to_owned(), "run".to_owned()))
-        );
-        assert_eq!(
-            manager.resolve_default_command("legacy"),
-            Some(("legacy".to_owned(), "run".to_owned()))
-        );
-        let help = manager
-            .find_command("legacy", "run")
-            .expect("help metadata");
-        assert_eq!(help.summary_ru, "run");
-        assert!(manager.has_command("legacy", "run"));
-        drop(manager);
-        drop(guard);
-        handle.shutdown_all().await;
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
