@@ -680,14 +680,12 @@ impl ExternalManagerHandle {
             manager.processes.get(module_id).cloned()
         }
         .ok_or(ExternalError::Unavailable)?;
-        {
-            if process.status() != ProcessStatus::Running {
-                return Err(ExternalError::Unavailable);
-            }
-            process
-                .execute_command(command_name, arguments, argument_entities)
-                .await
+        if process.status() != ProcessStatus::Running {
+            return Err(ExternalError::Unavailable);
         }
+        process
+            .execute_command(command_name, arguments, argument_entities)
+            .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -709,80 +707,78 @@ impl ExternalManagerHandle {
             manager.processes.get(module_id).cloned()
         }
         .ok_or(ExternalError::Unavailable)?;
+        if process.status() != ProcessStatus::Running
+            || process.descriptor().contract_revision.unwrap_or(2)
+                < super::protocol::V6_HOST_CONTRACT_REVISION
         {
-            if process.status() != ProcessStatus::Running
-                || process.descriptor().contract_revision.unwrap_or(2)
-                    < super::protocol::V6_HOST_CONTRACT_REVISION
-            {
-                return self
-                    .execute(module_id, command_name, arguments, argument_entities)
-                    .await;
-            }
-            let replied = if process
-                .descriptor()
-                .capabilities
-                .contains(&super::manifest::ExternalCapability::MessageRead)
-            {
-                replied
-            } else {
-                None
-            };
-            let companion = if process.descriptor().contract_revision.unwrap_or(2)
-                >= super::protocol::V6_COMPANION_SINCE
-            {
-                companion
-            } else {
-                None
-            };
-            let message_handle = process.register_current_message(message, authored_by_self)?;
-            let peer_handle = match process.register_peer_handle(peer_id) {
-                Ok(handle) => handle,
-                Err(error) => {
-                    process.release_handle(&message_handle);
-                    return Err(error);
-                }
-            };
-            let reply_context = replied.and_then(|reply| {
-                process
-                    .register_reply_message(reply.clone())
-                    .ok()
-                    .map(|handle| super::protocol::V6ReplyContext {
-                        message: handle,
-                        text: bounded_context_text(reply.text()),
-                    })
-            });
-            let reply_handle = reply_context.as_ref().map(|reply| reply.message.clone());
-            let result = match process
-                .execute_with_context(
-                    super::protocol::request_id(),
-                    command_name.to_owned(),
-                    arguments.to_owned(),
-                    argument_entities.to_vec(),
-                    Some(super::protocol::V6CommandContext {
-                        peer: peer_handle.clone(),
-                        message: message_handle.clone(),
-                        text: message_text,
-                        replied: reply_context.clone(),
-                        companion,
-                        chat_id: peer_id.bot_api_dialog_id(),
-                    }),
-                )
-                .await
-            {
-                Ok(super::protocol::V6InboundFrame::Result { text, .. }) => Ok(text),
-                Ok(super::protocol::V6InboundFrame::Error { message, .. }) => {
-                    Err(ExternalError::ModuleError(message))
-                }
-                Ok(_) => Err(ExternalError::ModuleError(String::new())),
-                Err(error) => Err(error),
-            };
-            process.release_handle(&message_handle);
-            if let Some(reply) = reply_handle {
-                process.release_handle(&reply);
-            }
-            process.release_handle(&peer_handle);
-            result
+            return self
+                .execute(module_id, command_name, arguments, argument_entities)
+                .await;
         }
+        let replied = if process
+            .descriptor()
+            .capabilities
+            .contains(&super::manifest::ExternalCapability::MessageRead)
+        {
+            replied
+        } else {
+            None
+        };
+        let companion = if process.descriptor().contract_revision.unwrap_or(2)
+            >= super::protocol::V6_COMPANION_SINCE
+        {
+            companion
+        } else {
+            None
+        };
+        let message_handle = process.register_current_message(message, authored_by_self)?;
+        let peer_handle = match process.register_peer_handle(peer_id) {
+            Ok(handle) => handle,
+            Err(error) => {
+                process.release_handle(&message_handle);
+                return Err(error);
+            }
+        };
+        let reply_context = replied.and_then(|reply| {
+            process
+                .register_reply_message(reply.clone())
+                .ok()
+                .map(|handle| super::protocol::V6ReplyContext {
+                    message: handle,
+                    text: bounded_context_text(reply.text()),
+                })
+        });
+        let reply_handle = reply_context.as_ref().map(|reply| reply.message.clone());
+        let result = match process
+            .execute_with_context(
+                super::protocol::request_id(),
+                command_name.to_owned(),
+                arguments.to_owned(),
+                argument_entities.to_vec(),
+                Some(super::protocol::V6CommandContext {
+                    peer: peer_handle.clone(),
+                    message: message_handle.clone(),
+                    text: message_text,
+                    replied: reply_context.clone(),
+                    companion,
+                    chat_id: peer_id.bot_api_dialog_id(),
+                }),
+            )
+            .await
+        {
+            Ok(super::protocol::V6InboundFrame::Result { text, .. }) => Ok(text),
+            Ok(super::protocol::V6InboundFrame::Error { message, .. }) => {
+                Err(ExternalError::ModuleError(message))
+            }
+            Ok(_) => Err(ExternalError::ModuleError(String::new())),
+            Err(error) => Err(error),
+        };
+        process.release_handle(&message_handle);
+        if let Some(reply) = reply_handle {
+            process.release_handle(&reply);
+        }
+        process.release_handle(&peer_handle);
+        result
     }
 }
 
