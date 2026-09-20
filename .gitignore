@@ -22,8 +22,15 @@
 /modules/cleaner/bin/
 
 # Intermediate build dirs of bundled modules
-# (packed .lmod artifacts are committed, like gaf's dist/)
+# Packed .lmod artifacts are produced by `nix build .#lavis-lmod-<id>` (or
+# modules/<id>/build-lmod.sh), never committed: multi-megabyte binaries would
+# grow git history on every module rebuild.
 modules/**/.lmod-pkg/
+modules/**/build/
+modules/**/dist/
 
 __pycache__/
 *.pyc
+
+# Local analysis report (not tracked)
+/Report.md

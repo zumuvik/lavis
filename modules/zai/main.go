@@ -79,14 +79,14 @@ var menuButtons = [][]inlineButton{
 }
 
 type response struct {
-	ProtocolVersion int    `json:"protocol_version"`
-	Type            string `json:"type"`
-	RequestID       string `json:"request_id"`
-	ModuleID        string `json:"module_id,omitempty"`
+	ProtocolVersion int     `json:"protocol_version"`
+	Type            string  `json:"type"`
+	RequestID       string  `json:"request_id"`
+	ModuleID        string  `json:"module_id,omitempty"`
 	Text            *string `json:"text,omitempty"`
-	Code            string `json:"code,omitempty"`
-	Message         string `json:"message,omitempty"`
-	Actions         *[]any `json:"actions,omitempty"`
+	Code            string  `json:"code,omitempty"`
+	Message         string  `json:"message,omitempty"`
+	Actions         *[]any  `json:"actions,omitempty"`
 }
 
 type module struct {

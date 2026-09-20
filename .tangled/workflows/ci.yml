@@ -19,13 +19,23 @@ dependencies:
     - python3
 
 steps:
-  - name: Test GAF module
+  - name: Test bundled Go modules
     command: |
       bash -euo pipefail <<'BASH'
-      cd modules/gaf
-      test -z "$(gofmt -l *.go)"
-      go vet ./...
-      go test ./...
+      for module in modules/*/; do
+        test -f "$module/go.mod" || continue
+        echo "== $module"
+        (
+          cd "$module"
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed: $unformatted" >&2
+            exit 1
+          fi
+          go vet ./...
+          go test ./...
+        )
+      done
       BASH
 
   - name: Check generated v6 registry
@@ -68,4 +78,14 @@ steps:
     command: |
       bash -euo pipefail <<'BASH'
       nix build --print-build-logs
+      BASH
+
+  - name: Build module .lmod archives
+    command: |
+      bash -euo pipefail <<'BASH'
+      nix build --print-build-logs \
+        .#lavis-lmod-cleaner \
+        .#lavis-lmod-gaf \
+        .#lavis-lmod-zai \
+        .#lavis-lmod-remotefetch
       BASH

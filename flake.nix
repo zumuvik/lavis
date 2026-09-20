@@ -105,36 +105,112 @@
             '';
             meta = corePackage.meta;
           };
-          gafExtension = pkgs.stdenvNoCC.mkDerivation {
-            pname = "lavis-extension-gaf";
-            version = "0.1.0";
+          # Every bundled Go module builds the same way: one static binary plus
+          # the manifest, laid out exactly as the .lmod archive root expects.
+          goExtension =
+            {
+              id,
+              version,
+              src,
+              description,
+              binary ? id,
+              path ? binary,
+            }:
+            pkgs.stdenvNoCC.mkDerivation {
+              pname = "lavis-extension-${id}";
+              inherit version src;
+              nativeBuildInputs = [ pkgs.go ];
+              buildPhase = ''
+                runHook preBuild
+                export GOCACHE="$TMPDIR/go-cache"
+                export CGO_ENABLED=0
+                export GOOS=linux
+                export GOARCH=${goArch}
+                go build -trimpath -buildvcs=false -ldflags='-s -w -buildid=' -o ${binary} .
+                runHook postBuild
+              '';
+              installPhase = ''
+                runHook preInstall
+                install -Dm700 ${binary} "$out/${path}"
+                install -Dm600 module.json "$out/module.json"
+                runHook postInstall
+              '';
+              meta = {
+                inherit description;
+                license = pkgs.lib.licenses.gpl3Only;
+                platforms = pkgs.lib.platforms.linux;
+              };
+            };
+          # Packs an already-built extension into the stored-only ZIP the host
+          # inspector accepts. Modes and timestamps are pinned so the archive is
+          # byte-reproducible, matching modules/<id>/build-lmod.sh.
+          lmodArchive =
+            {
+              id,
+              extension,
+              path,
+            }:
+            pkgs.runCommand "lavis-${id}.lmod"
+              {
+                nativeBuildInputs = [ pkgs.zip ];
+              }
+              ''
+                mkdir -p build
+                install -Dm700 ${extension}/${path} build/${path}
+                install -Dm600 ${extension}/module.json build/module.json
+                TZ=UTC touch -t 198001010000 build/${path} build/module.json
+                cd build
+                zip -q -0 -X "$out" module.json ${path}
+              '';
+          gafExtension = goExtension {
+            id = "gaf";
+            version = "0.2.0";
             src = ./modules/gaf;
-            nativeBuildInputs = [ pkgs.go ];
-            buildPhase = ''
-              runHook preBuild
-              export GOCACHE="$TMPDIR/go-cache"
-              export CGO_ENABLED=0
-              export GOOS=linux
-              export GOARCH=${goArch}
-              go build -trimpath -buildvcs=false -ldflags='-s -w -buildid=' -o gaf .
-              runHook postBuild
-            '';
+            description = "GAF external module for Lavis";
+          };
+          zaiExtension = goExtension {
+            id = "zai";
+            version = "0.3.0";
+            src = ./modules/zai;
+            description = "Z.AI quota external module for Lavis";
+          };
+          remotefetchExtension = goExtension {
+            id = "remotefetch";
+            version = "0.1.0";
+            src = ./modules/remotefetch;
+            description = "Remote fastfetch external module for Lavis";
+          };
+          # cleaner is the only bundled module with a third-party dependency
+          # (gotd/td), so its modules are fetched rather than built from a bare
+          # source tree. The host expects bin/cleaner plus a root manifest, not
+          # Go's default $out/bin layout.
+          cleanerExtension = pkgs.buildGoModule {
+            pname = "lavis-extension-cleaner";
+            version = "0.3.1";
+            src = ./modules/cleaner;
+            vendorHash = "sha256-vnbaia5400XRNMsCjwE0pJM0TPF9EsiY8ek3/xnd+j0=";
+            env.CGO_ENABLED = 0;
+            ldflags = [
+              "-s"
+              "-w"
+              "-buildid="
+            ];
             installPhase = ''
               runHook preInstall
-              install -Dm700 gaf "$out/gaf"
+              install -Dm700 "$GOPATH/bin/cleaner" "$out/bin/cleaner"
               install -Dm600 module.json "$out/module.json"
               runHook postInstall
             '';
             meta = {
-              description = "GAF external module for Lavis";
+              description = "Cleaner external module for Lavis";
               license = pkgs.lib.licenses.gpl3Only;
               platforms = pkgs.lib.platforms.linux;
             };
           };
-          zaiExtension = pkgs.stdenvNoCC.mkDerivation {
-            pname = "lavis-extension-zai";
-            version = "0.2.0";
-            src = ./modules/zai;
+          fetchdAgent = pkgs.stdenvNoCC.mkDerivation {
+            pname = "lavis-fetchd";
+            version = "0.1.0";
+            src = ./modules/remotefetch;
             nativeBuildInputs = [ pkgs.go ];
             buildPhase = ''
               runHook preBuild
@@ -142,19 +218,19 @@
               export CGO_ENABLED=0
               export GOOS=linux
               export GOARCH=${goArch}
-              go build -trimpath -buildvcs=false -ldflags='-s -w -buildid=' -o zai .
+              go build -trimpath -buildvcs=false -ldflags='-s -w -buildid=' -o lavis-fetchd ./agent
               runHook postBuild
             '';
             installPhase = ''
               runHook preInstall
-              install -Dm700 zai "$out/zai"
-              install -Dm600 module.json "$out/module.json"
+              install -Dm755 lavis-fetchd "$out/bin/lavis-fetchd"
               runHook postInstall
             '';
             meta = {
-              description = "Z.AI quota external module for Lavis";
+              description = "Fastfetch agent queried by the Lavis remotefetch module";
               license = pkgs.lib.licenses.gpl3Only;
               platforms = pkgs.lib.platforms.linux;
+              mainProgram = "lavis-fetchd";
             };
           };
           moduleEvalCheck =
@@ -375,6 +451,47 @@ PY
 
               touch "$out"
             '';
+          fetchdEvalCheck =
+            let
+              evaluated = nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.fetchd
+                  (
+                    { ... }:
+                    {
+                      users.users.laptop-owner = {
+                        isNormalUser = true;
+                        home = "/home/laptop-owner";
+                      };
+                      services.lavis-fetchd = {
+                        enable = true;
+                        user = "laptop-owner";
+                        listenAddress = "100.120.95.96:8471";
+                        tokenFile = "/run/secrets/lavis-fetchd-token";
+                        openFirewall = true;
+                      };
+                    }
+                  )
+                ];
+              };
+            in
+            pkgs.runCommand "lavis-fetchd-module-eval"
+              {
+                unit = evaluated.config.systemd.user.units."lavis-fetchd.service".unit;
+                ports = builtins.toJSON evaluated.config.networking.firewall.interfaces.tailscale0.allowedTCPPorts;
+                linger = nixpkgs.lib.boolToString evaluated.config.users.users.laptop-owner.linger;
+              }
+              ''
+                grep -q 'ConditionUser=laptop-owner' "$unit/lavis-fetchd.service"
+                grep -q -- '--listen 100.120.95.96:8471' "$unit/lavis-fetchd.service"
+                grep -q -- '--token-file /run/secrets/lavis-fetchd-token' "$unit/lavis-fetchd.service"
+                # File-reading fastfetch options stay off unless asked for.
+                ! grep -q -- '--allow-file-args' "$unit/lavis-fetchd.service"
+                test "$ports" = '[8471]'
+                test "$linger" = true
+                touch "$out"
+              '';
           mergeEnabledCheck = pkgs.runCommand "lavis-merge-enabled-extensions-check" { } ''
             work="$TMPDIR/lavis-state"
             mkdir -p "$work"
@@ -440,8 +557,33 @@ PY
           lib = extensionLib;
           packages = {
             default = package;
+            lavis-extension-cleaner = cleanerExtension;
             lavis-extension-gaf = gafExtension;
             lavis-extension-zai = zaiExtension;
+            lavis-extension-remotefetch = remotefetchExtension;
+            lavis-fetchd = fetchdAgent;
+            # Installable .lmod archives, replacing the binaries that used to be
+            # committed under modules/*/dist/.
+            lavis-lmod-cleaner = lmodArchive {
+              id = "cleaner";
+              extension = cleanerExtension;
+              path = "bin/cleaner";
+            };
+            lavis-lmod-gaf = lmodArchive {
+              id = "gaf";
+              extension = gafExtension;
+              path = "gaf";
+            };
+            lavis-lmod-zai = lmodArchive {
+              id = "zai";
+              extension = zaiExtension;
+              path = "zai";
+            };
+            lavis-lmod-remotefetch = lmodArchive {
+              id = "remotefetch";
+              extension = remotefetchExtension;
+              path = "remotefetch";
+            };
           };
           # Separate wrapper for `nix run` so it reports "Host: nix run" without
           # affecting the base package used by NixOS module or systemPackages.
@@ -477,12 +619,14 @@ PY
             default = package;
             merge-enabled-extensions = mergeEnabledCheck;
             nixos-module = moduleEvalCheck;
+            nixos-fetchd-module = fetchdEvalCheck;
             prefix-validator = prefixValidatorCheck;
           };
         };
     in
     {
       nixosModules.default = import ./nix/modules/lavis.nix { inherit self; };
+      nixosModules.fetchd = import ./nix/modules/lavis-fetchd.nix { inherit self; };
       lib = forAllSystems (system: (perSystem system).lib);
       packages = forAllSystems (system: (perSystem system).packages);
       apps = forAllSystems (system: (perSystem system).apps);

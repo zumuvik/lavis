@@ -1,6 +1,6 @@
 module cleaner
 
-go 1.26
+go 1.25.0
 
 require github.com/gotd/td v0.161.0
 

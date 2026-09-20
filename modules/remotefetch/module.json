@@ -1,0 +1,36 @@
+{
+  "schema_version": 6,
+  "contract_revision": 5,
+  "id": "remotefetch",
+  "name": "Remote Fastfetch",
+  "version": "0.1.0",
+  "author": "forge-sa",
+  "entrypoint": "remotefetch",
+  "capabilities": [
+    "network",
+    "persistent_state_read"
+  ],
+  "default_command": "fetch",
+  "subscriptions": [],
+  "actions": [],
+  "commands": [
+    {
+      "name": "fetch",
+      "summary_ru": "Fastfetch с другой машины, а не с сервера",
+      "description_ru": "Показывает вывод fastfetch с другой машины — ноутбука или рабочей станции, где запущен агент lavis-fetchd. Модуль ходит к агенту по приватной сети (Tailscale, VPN) с bearer-токеном; оболочка не запускается, аргументы уезжают массивом JSON и попадают в execve как есть. Любые параметры fastfetch передаются насквозь, кроме опций, читающих файлы с диска удалённой машины (--file, --raw, --config, --logo-type и подобные): их агент отклоняет, пока не запущен с --allow-file-args. Адрес и токен агента лежат в config.json каталога состояния модуля. Вывод может раскрыть данные хоста, сети, дисплея, питания и оборудования удалённой машины.",
+      "usage": "[параметры fastfetch]",
+      "examples": [
+        "--logo NixOS",
+        "--structure OS:Kernel:CPU:Memory",
+        "--separator \" -> \""
+      ]
+    },
+    {
+      "name": "status",
+      "summary_ru": "Связь с агентом на удалённой машине",
+      "description_ru": "Проверяет, доступен ли агент lavis-fetchd: имя машины, версия fastfetch на ней, время работы агента и задержка ответа. Полезно, чтобы отличить спящую машину от неверного токена или неправильного адреса.",
+      "usage": "[без аргументов]",
+      "examples": []
+    }
+  ]
+}
