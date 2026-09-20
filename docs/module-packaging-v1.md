@@ -1,7 +1,7 @@
 # Module Packaging v1 (future)
 
 This document specifies future packaging only. It does not authorize an
-installer or modify the v3 runtime; see [ADR 0002](adr/0002-module-runtime-and-distribution.md).
+installer or modify the v6 runtime; see [ADR 0002](adr/0002-module-runtime-and-distribution.md).
 
 ## Source package
 
