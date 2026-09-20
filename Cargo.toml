@@ -7,9 +7,6 @@ license = "GPL-3.0-only"
 repository = "https://github.com/zumuvik/lavis"
 readme = "README.md"
 
-[lib]
-path = "src/app.rs"
-
 [features]
 default = []
 fixture-tests = []
@@ -28,6 +25,7 @@ futures-util = "0.3"
 rpassword = "7.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }
+sha2 = "0.11"
 shell-words = "1.1.1"
 strip-ansi-escapes = "0.2.1"
 thiserror = "2.0"

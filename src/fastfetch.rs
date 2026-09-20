@@ -68,12 +68,19 @@ async fn execute(locale: Locale, arguments: Vec<String>) -> FastfetchResult {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
-        .env_remove("LAVIS_API_ID")
-        .env_remove("LAVIS_API_HASH")
+        // Allowlist, not denylist: this child's stdout is posted to Telegram,
+        // so it must not inherit a secret that is added to the host
+        // environment later. PATH is the one inherited variable, because it is
+        // what resolves `fastfetch` itself and the host may install it
+        // anywhere (notably /run/current-system/sw/bin on NixOS).
+        .env_clear()
         .env("NO_COLOR", "1")
         .env("CLICOLOR", "0")
         .env("CLICOLOR_FORCE", "0")
         .env("TERM", "dumb");
+    if let Some(path) = std::env::var_os("PATH") {
+        command.env("PATH", path);
+    }
 
     let mut child = match command.spawn() {
         Ok(child) => child,

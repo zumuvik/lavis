@@ -136,11 +136,60 @@ fn suppressed_target(target: &str) -> bool {
 
 fn format_line(level: &str, target: &str, message: &str) -> String {
     let emoji = if level == "WARN" { "⚠️" } else { "❌" };
-    let mut line = format!("{emoji} {target}: {message}");
+    let mut line = format!("{emoji} {target}: {}", redact_secrets(message));
     if line.chars().count() > MAX_LINE_CHARS {
         line = line.chars().take(MAX_LINE_CHARS).collect();
     }
     line
+}
+
+/// Defence in depth for the one log sink that leaves the host. Call sites are
+/// expected never to put a secret in an event - `bot_api` is careful to keep
+/// the token out of its errors, because the request URL contains it - but this
+/// sink forwards WARN/ERROR text verbatim into a Telegram topic, so a slip at
+/// any one call site must not become a disclosure.
+///
+/// Only the companion-bot token shape is scrubbed. Blanket redaction of long
+/// hex runs was considered and rejected: archive SHA-256 digests, module
+/// message keys and request ids are all long hex, and they are precisely what
+/// the Logs topic exists to show.
+fn redact_secrets(text: &str) -> String {
+    const REDACTED: &str = "[REDACTED]";
+    fn is_run_char(c: char) -> bool {
+        c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':')
+    }
+    // `<bot id>:<secret>`, e.g. 123456789:AAH... as issued by BotFather.
+    fn is_bot_token(run: &str) -> bool {
+        let Some((id, secret)) = run.split_once(':') else {
+            return false;
+        };
+        id.len() >= 5
+            && id.bytes().all(|b| b.is_ascii_digit())
+            && secret.len() >= 30
+            && secret
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        match rest.find(is_run_char) {
+            None => {
+                out.push_str(rest);
+                break;
+            }
+            Some(start) => {
+                out.push_str(&rest[..start]);
+                let tail = &rest[start..];
+                let end = tail.find(|c| !is_run_char(c)).unwrap_or(tail.len());
+                let run = &tail[..end];
+                out.push_str(if is_bot_token(run) { REDACTED } else { run });
+                rest = &tail[end..];
+            }
+        }
+    }
+    out
 }
 
 /// Starts the worker draining the installed bridge. Without an installed
@@ -295,6 +344,32 @@ async fn load_companion_chat_id(state_path: &Path, token_path: &Path) -> Option<
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn redacts_companion_bot_tokens_but_keeps_diagnostics() {
+        let token = "123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw";
+        let line = super::format_line(
+            "ERROR",
+            "lavis::bot_api",
+            &format!("send failed for {token} on chat 42"),
+        );
+        assert!(!line.contains(token), "{line}");
+        assert!(line.contains("[REDACTED]"), "{line}");
+        assert!(line.contains("chat 42"), "{line}");
+
+        // A SHA-256 digest and a module message key are long hex runs that the
+        // Logs topic is meant to show; they must survive redaction.
+        let digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let kept = super::format_line("WARN", "lavis::external_modules", digest);
+        assert!(kept.contains(digest), "{kept}");
+    }
+
+    #[test]
+    fn redaction_preserves_surrounding_punctuation_and_unicode() {
+        let text = "модуль (123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw), код=7";
+        let out = super::redact_secrets(text);
+        assert_eq!(out, "модуль ([REDACTED]), код=7");
+    }
     use super::*;
 
     #[test]
