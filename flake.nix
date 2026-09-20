@@ -190,10 +190,10 @@
             src = ./modules/cleaner;
             vendorHash = "sha256-vnbaia5400XRNMsCjwE0pJM0TPF9EsiY8ek3/xnd+j0=";
             env.CGO_ENABLED = 0;
+            # buildGoModule already passes -buildid= itself.
             ldflags = [
               "-s"
               "-w"
-              "-buildid="
             ];
             installPhase = ''
               runHook preInstall
