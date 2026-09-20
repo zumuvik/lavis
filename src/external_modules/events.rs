@@ -67,9 +67,7 @@ pub fn module_can_receive_event(
         MessageEventKind::Created => ExternalSubscription::MessageCreated,
         MessageEventKind::Edited => ExternalSubscription::MessageEdited,
     };
-    descriptor.protocol_version >= 3
-        && (event == MessageEventKind::Created || descriptor.protocol_version >= 4)
-        && descriptor.subscriptions.contains(&subscription)
+    descriptor.subscriptions.contains(&subscription)
         && descriptor
             .capabilities
             .contains(&ExternalCapability::MessageRead)
@@ -98,9 +96,6 @@ pub fn validate_reaction_action(
     }
     if action.reactions.len() > MAX_REACTIONS_PER_ACTION {
         return Err(ReactionValidationError::TooManyReactions);
-    }
-    if descriptor.protocol_version == 3 && action.reactions.len() != 1 {
-        return Err(ReactionValidationError::InvalidReactionCount);
     }
     let mut seen = HashSet::new();
     for reaction in &action.reactions {

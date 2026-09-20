@@ -1,5 +1,6 @@
 {
-    "schema_version": 2,
+    "schema_version": 6,
+    "contract_revision": 2,
     "id": "echo",
     "name": "Echo",
     "version": "1.0.0",

@@ -630,7 +630,7 @@ mod tests {
         let manifest: &[u8] = if invalid_manifest {
             b"{}"
         } else {
-            b"{\"schema_version\":2,\"id\":\"test\",\"name\":\"Test\",\"version\":\"1\",\"author\":\"A\",\"entrypoint\":\"run\",\"commands\":[{\"name\":\"go\",\"summary_ru\":\"x\",\"description_ru\":\"x\",\"usage\":\"<value>\"}]}"
+            b"{\"schema_version\":6,\"id\":\"test\",\"name\":\"Test\",\"version\":\"1\",\"author\":\"A\",\"entrypoint\":\"run\",\"commands\":[{\"name\":\"go\",\"summary_ru\":\"x\",\"description_ru\":\"x\",\"usage\":\"<value>\"}]}"
         };
         fs::write(payload.join("module.json"), manifest).unwrap();
         fs::write(payload.join("run"), b"#!/bin/sh").unwrap();
@@ -763,7 +763,7 @@ mod tests {
         fs::write(
             module.join("module.json"),
             format!(
-                r#"{{"schema_version":2,"id":"{id}","name":"Test","version":"{version}","author":"A","entrypoint":"run","commands":[{{"name":"go","summary_ru":"x","description_ru":"x","usage":"<value>"}}]}}"#
+                r#"{{"schema_version":6,"id":"{id}","name":"Test","version":"{version}","author":"A","entrypoint":"run","commands":[{{"name":"go","summary_ru":"x","description_ru":"x","usage":"<value>"}}]}}"#
             ),
         )
         .unwrap();

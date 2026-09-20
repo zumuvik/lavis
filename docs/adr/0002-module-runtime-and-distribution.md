@@ -15,7 +15,7 @@ Lavis separates three concerns:
 3. A future **module manager** will inspect, confirm, install, update, remove,
    and roll back packages through a built-in `,lm` UX.
 
-The normative runtime contract is [Module API v3](../module-api-v3.md). The
+The normative runtime contract is [Module API v6](../module-api-v6.md). The
 future package contract is [Module Packaging v1](../module-packaging-v1.md).
 The staged delivery plan is [Module roadmap](../module-roadmap.md).
 

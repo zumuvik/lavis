@@ -1,6 +1,6 @@
 use std::io::{self, BufRead, Write};
 
-const PROTOCOL_VERSION: u32 = 2;
+const PROTOCOL_VERSION: u32 = 6;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     for line in io::stdin().lock().lines() {
@@ -12,7 +12,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or(0);
         if proto != PROTOCOL_VERSION as u64 {
             let rid = val.get("request_id").and_then(|v| v.as_str()).unwrap_or("?");
-            send_error(rid, "protocol_version_mismatch", "Expected protocol v2");
+            send_error(rid, "protocol_version_mismatch", "Expected protocol v6");
             continue;
         }
         let msg_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");

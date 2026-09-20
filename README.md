@@ -369,10 +369,6 @@ nix build --print-build-logs
 | [Companion bot setup](docs/companion-bot-setup.md) | BotFather flow, workspace resources and recovery |
 | [External modules](docs/external-modules.md) | External module lifecycle and runtime model |
 | [`.lmod` packaging](docs/lmod-packaging.md) | Packaging and validation rules |
-| [Module API v1](docs/module-api-v1.md) | Early module metadata/API |
-| [Module API v2](docs/module-api-v2.md) / [v3](docs/module-api-v3.md) | Manifest and event protocol evolution |
-| [Module API v4](docs/module-api-v4.md) | Message edits and reaction sets |
-| [Module API v5](docs/module-api-v5.md) | Telegram account-status gateway |
 | [Module API v6](docs/module-api-v6.md) | Capability-based Telegram RPC and raw MTProto boundary |
 | [NixOS module](docs/nixos-module.md) | Declarative service configuration |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Development and contribution guide |

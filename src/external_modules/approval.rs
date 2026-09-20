@@ -371,7 +371,7 @@ mod tests {
     }
 
     fn valid_archive() -> Vec<u8> {
-        let manifest = br#"{"schema_version":2,"id":"test","name":"Test","version":"1","author":"A","entrypoint":"run","commands":[{"name":"go","summary_ru":"x","description_ru":"x","usage":"<value>"}]}"#;
+        let manifest = br#"{"schema_version":6,"id":"test","name":"Test","version":"1","author":"A","entrypoint":"run","commands":[{"name":"go","summary_ru":"x","description_ru":"x","usage":"<value>"}]}"#;
         let entries = [
             ("module.json", &manifest[..], 0o100644_u32),
             ("run", &b"#!/bin/sh"[..], 0o100755_u32),

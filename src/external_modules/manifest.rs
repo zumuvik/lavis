@@ -8,6 +8,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// The only manifest schema version the host accepts. v2-v5 were removed
+/// together with the legacy line-protocol runtime.
+pub const SCHEMA_VERSION: u32 = 6;
+
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_COMMANDS: usize = 32;
 const MAX_EXAMPLE_COUNT: usize = 16;
@@ -359,14 +363,12 @@ pub fn validate_manifest_at(
     let manifest: ManifestFile =
         serde_json::from_slice(&bytes).map_err(|_| ExternalError::MalformedManifest)?;
 
-    if manifest.schema_version <= 5 && manifest.telegram_methods.is_some() {
-        return Err(ExternalError::MalformedManifest);
+    // Schema versions 2-5 are no longer accepted. Every bundled module is v6
+    // and the legacy line-protocol runtime they required has been removed.
+    if manifest.schema_version != SCHEMA_VERSION {
+        return Err(ExternalError::UnsupportedSchemaVersion);
     }
-
-    if manifest.schema_version <= 5 && manifest.contract_revision.is_some() {
-        return Err(ExternalError::MalformedManifest);
-    }
-    let contract_revision = if manifest.schema_version == 6 {
+    let contract_revision = {
         let revision = manifest
             .contract_revision
             .unwrap_or(super::protocol::V6_ALPHA_CONTRACT_REVISION);
@@ -377,13 +379,7 @@ pub fn validate_manifest_at(
             return Err(ExternalError::UnsupportedSchemaVersion);
         }
         Some(revision)
-    } else {
-        None
     };
-
-    if !matches!(manifest.schema_version, 2..=6) {
-        return Err(ExternalError::UnsupportedSchemaVersion);
-    }
 
     validate_module_id(&manifest.id)?;
 
@@ -433,10 +429,7 @@ pub fn validate_manifest_at(
     let requests_raw = telegram_method_names
         .iter()
         .any(|method| method == "raw.invoke");
-    if has_raw != requests_raw
-        || telegram_method_names.len() > MAX_V6_TELEGRAM_METHODS
-        || (has_raw && manifest.schema_version != 6)
-    {
+    if has_raw != requests_raw || telegram_method_names.len() > MAX_V6_TELEGRAM_METHODS {
         return Err(ExternalError::InvalidCapability);
     }
     for method in &telegram_method_names {
@@ -469,23 +462,10 @@ pub fn validate_manifest_at(
 
     let mut subscriptions = Vec::new();
     let mut actions = Vec::new();
-    if manifest.schema_version == 2
-        && (manifest.default_command.is_some()
-            || !manifest.subscriptions.is_empty()
-            || !manifest.actions.is_empty())
-    {
-        return Err(ExternalError::UnsupportedSchemaVersion);
-    }
     for value in &manifest.subscriptions {
         let subscription =
             ExternalSubscription::from_str(value).ok_or(ExternalError::InvalidArgument)?;
-        if subscription == ExternalSubscription::MessageEdited && manifest.schema_version < 4 {
-            return Err(ExternalError::UnsupportedSchemaVersion);
-        }
         if subscription == ExternalSubscription::BotCallback {
-            if manifest.schema_version < 6 {
-                return Err(ExternalError::UnsupportedSchemaVersion);
-            }
             if contract_revision.is_none_or(|revision| revision < super::protocol::V6_INLINE_SINCE)
             {
                 return Err(ExternalError::UnsupportedSchemaVersion);
@@ -584,14 +564,8 @@ pub fn validate_manifest_at(
     if needs_message_read && !seen_capabilities.contains(&ExternalCapability::MessageRead) {
         return Err(ExternalError::InvalidCapability);
     }
-    if seen_capabilities.contains(&ExternalCapability::TelegramAccountStatus)
-        && manifest.schema_version < 5
-    {
-        return Err(ExternalError::InvalidCapability);
-    }
     if seen_capabilities.contains(&ExternalCapability::MessagePeerId)
-        && (manifest.schema_version < 4
-            || !seen_capabilities.contains(&ExternalCapability::MessageRead))
+        && !seen_capabilities.contains(&ExternalCapability::MessageRead)
     {
         return Err(ExternalError::InvalidCapability);
     }
@@ -601,9 +575,8 @@ pub fn validate_manifest_at(
         return Err(ExternalError::InvalidCapability);
     }
     if seen_capabilities.contains(&ExternalCapability::MessageEdit)
-        && (manifest.schema_version != 6
-            || contract_revision
-                .is_none_or(|revision| revision < super::protocol::V6_HOST_CONTRACT_REVISION))
+        && contract_revision
+            .is_none_or(|revision| revision < super::protocol::V6_HOST_CONTRACT_REVISION)
     {
         return Err(ExternalError::InvalidCapability);
     }
@@ -704,7 +677,7 @@ mod tests {
 
     fn valid_manifest_json() -> Vec<u8> {
         br#"{
-            "schema_version": 2,
+            "schema_version": 6,
             "id": "echo",
             "name": "Echo",
             "version": "0.1.0",
@@ -780,7 +753,7 @@ mod tests {
         let base = temp_dir();
         let dir = create_module_dir(&base, "echo");
         let json = br#"{
-            "schema_version": 2,
+            "schema_version": 6,
             "id": "echo",
             "name": "Echo",
             "version": "0.1.0",
@@ -817,18 +790,17 @@ mod tests {
     }
 
     #[test]
-    fn v3_manifest_requires_declared_permissions_and_default_target() {
+    fn declared_actions_require_the_matching_capability() {
         let base = temp_dir();
         let dir = create_module_dir(&base, "echo");
         let mut json = serde_json::from_slice::<serde_json::Value>(&valid_manifest_json()).unwrap();
-        json["schema_version"] = serde_json::json!(3);
         json["default_command"] = serde_json::json!("repeat");
         json["subscriptions"] = serde_json::json!(["message.created"]);
         json["actions"] = serde_json::json!(["message.react"]);
         json["capabilities"] = serde_json::json!(["message.read", "message.react"]);
         let path = write_manifest(&dir, &serde_json::to_vec(&json).unwrap());
         let descriptor = validate_manifest_at(&path, Some("echo")).unwrap();
-        assert_eq!(descriptor.protocol_version, 3);
+        assert_eq!(descriptor.protocol_version, SCHEMA_VERSION);
         assert_eq!(descriptor.default_command.as_deref(), Some("repeat"));
 
         json["capabilities"] = serde_json::json!([]);
@@ -841,18 +813,17 @@ mod tests {
     }
 
     #[test]
-    fn v4_manifest_accepts_edited_message_subscription() {
+    fn manifest_accepts_edited_message_subscription() {
         let base = temp_dir();
         let dir = create_module_dir(&base, "echo");
         let mut json = serde_json::from_slice::<serde_json::Value>(&valid_manifest_json()).unwrap();
-        json["schema_version"] = serde_json::json!(4);
         json["default_command"] = serde_json::json!("repeat");
         json["subscriptions"] = serde_json::json!(["message.created", "message.edited"]);
         json["actions"] = serde_json::json!(["message.react"]);
         json["capabilities"] = serde_json::json!(["message.read", "message.react"]);
         let path = write_manifest(&dir, &serde_json::to_vec(&json).unwrap());
         let descriptor = validate_manifest_at(&path, Some("echo")).unwrap();
-        assert_eq!(descriptor.protocol_version, 4);
+        assert_eq!(descriptor.protocol_version, SCHEMA_VERSION);
         assert!(
             descriptor
                 .subscriptions
@@ -862,11 +833,10 @@ mod tests {
     }
 
     #[test]
-    fn v5_accepts_account_status_capability_and_rejects_timer_api() {
+    fn account_status_capability_is_accepted_and_the_timer_api_is_not() {
         let base = temp_dir();
         let dir = create_module_dir(&base, "echo");
         let mut json = serde_json::from_slice::<serde_json::Value>(&valid_manifest_json()).unwrap();
-        json["schema_version"] = serde_json::json!(5);
         json["capabilities"] = serde_json::json!(["telegram.account.status"]);
         let path = write_manifest(&dir, &serde_json::to_vec(&json).unwrap());
         let descriptor = validate_manifest_at(&path, Some("echo")).unwrap();
@@ -905,23 +875,14 @@ mod tests {
             validate_manifest_at(&path, Some("echo")),
             Err(ExternalError::MalformedManifest)
         ));
-        for schema_version in 2..=4 {
-            json["schema_version"] = serde_json::json!(schema_version);
-            fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
-            assert!(matches!(
-                validate_manifest_at(&path, Some("echo")),
-                Err(ExternalError::MalformedManifest)
-            ));
-        }
         fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
-    fn v6_method_grants_preserve_least_privilege_and_legacy_rejects_the_field() {
+    fn method_grants_preserve_least_privilege() {
         let base = temp_dir();
         let dir = create_module_dir(&base, "echo");
         let mut json = serde_json::from_slice::<serde_json::Value>(&valid_manifest_json()).unwrap();
-        json["schema_version"] = serde_json::json!(6);
 
         json["capabilities"] = serde_json::json!(["telegram.account.status"]);
         json["telegram_methods"] = serde_json::json!(["account.updateStatus"]);
@@ -981,15 +942,6 @@ mod tests {
             Err(ExternalError::InvalidArgument)
         ));
 
-        json["telegram_methods"] = serde_json::json!(["account.updateStatus"]);
-        for schema_version in 2..=5 {
-            json["schema_version"] = serde_json::json!(schema_version);
-            fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
-            assert!(matches!(
-                validate_manifest_at(&path, Some("echo")),
-                Err(ExternalError::MalformedManifest)
-            ));
-        }
         fs::remove_dir_all(&base).unwrap();
     }
 
@@ -998,7 +950,6 @@ mod tests {
         let base = temp_dir();
         let dir = create_module_dir(&base, "echo");
         let mut json = serde_json::from_slice::<serde_json::Value>(&valid_manifest_json()).unwrap();
-        json["schema_version"] = serde_json::json!(6);
 
         // account.updateStatus requires telegram.account.status; an empty
         // grant set must be rejected at install time, before fingerprinting.
@@ -1047,11 +998,10 @@ mod tests {
     }
 
     #[test]
-    fn peer_id_capability_requires_schema_v4_and_message_read() {
+    fn peer_id_capability_requires_message_read() {
         let base = temp_dir();
         let dir = create_module_dir(&base, "echo");
         let mut json = serde_json::from_slice::<serde_json::Value>(&valid_manifest_json()).unwrap();
-        json["schema_version"] = serde_json::json!(4);
         json["capabilities"] = serde_json::json!(["message.read", "message.peer_id"]);
         let path = write_manifest(&dir, &serde_json::to_vec(&json).unwrap());
         let descriptor = validate_manifest_at(&path, Some("echo")).unwrap();
@@ -1068,44 +1018,29 @@ mod tests {
             Err(ExternalError::InvalidCapability)
         ));
 
-        json["schema_version"] = serde_json::json!(3);
-        json["capabilities"] = serde_json::json!(["message.read", "message.peer_id"]);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn removed_schema_versions_are_rejected() {
+        let base = temp_dir();
+        let dir = create_module_dir(&base, "echo");
+        let mut json = serde_json::from_slice::<serde_json::Value>(&valid_manifest_json()).unwrap();
+        let path = write_manifest(&dir, &serde_json::to_vec(&json).unwrap());
+        for schema_version in [0, 1, 2, 3, 4, 5, 7] {
+            json["schema_version"] = serde_json::json!(schema_version);
+            fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+            assert!(
+                matches!(
+                    validate_manifest_at(&path, Some("echo")),
+                    Err(ExternalError::UnsupportedSchemaVersion)
+                ),
+                "schema_version {schema_version} must be rejected"
+            );
+        }
+        json["schema_version"] = serde_json::json!(SCHEMA_VERSION);
         fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
-        assert!(matches!(
-            validate_manifest_at(&path, Some("echo")),
-            Err(ExternalError::InvalidCapability)
-        ));
-        fs::remove_dir_all(&base).unwrap();
-    }
-
-    #[test]
-    fn v3_manifest_rejects_edited_message_subscription() {
-        let base = temp_dir();
-        let dir = create_module_dir(&base, "echo");
-        let mut json = serde_json::from_slice::<serde_json::Value>(&valid_manifest_json()).unwrap();
-        json["schema_version"] = serde_json::json!(3);
-        json["subscriptions"] = serde_json::json!(["message.edited"]);
-        json["capabilities"] = serde_json::json!(["message.read"]);
-        let path = write_manifest(&dir, &serde_json::to_vec(&json).unwrap());
-        assert!(matches!(
-            validate_manifest_at(&path, Some("echo")),
-            Err(ExternalError::UnsupportedSchemaVersion)
-        ));
-        fs::remove_dir_all(&base).unwrap();
-    }
-
-    #[test]
-    fn v2_manifest_rejects_a_default_command() {
-        let base = temp_dir();
-        let dir = create_module_dir(&base, "echo");
-        let mut json = serde_json::from_slice::<serde_json::Value>(&valid_manifest_json()).unwrap();
-        json["default_command"] = serde_json::json!("repeat");
-        let path = write_manifest(&dir, &serde_json::to_vec(&json).unwrap());
-
-        assert!(matches!(
-            validate_manifest_at(&path, Some("echo")),
-            Err(ExternalError::UnsupportedSchemaVersion)
-        ));
+        assert!(validate_manifest_at(&path, Some("echo")).is_ok());
         fs::remove_dir_all(&base).unwrap();
     }
 
@@ -1217,7 +1152,7 @@ mod tests {
         let base = temp_dir();
         let dir = create_module_dir(&base, "echo");
         let json = br#"{
-            "schema_version": 2,
+            "schema_version": 6,
             "id": "echo",
             "name": "Echo",
             "version": "0.1.0",

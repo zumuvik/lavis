@@ -1056,7 +1056,7 @@ mod tests {
     fn manifest() -> Entry {
         file(
             "module.json",
-            br#"{"schema_version":2,"id":"test","name":"Test","version":"1","author":"A","entrypoint":"run","commands":[{"name":"go","summary_ru":"x","description_ru":"x","usage":"<value>"}]}"#,
+            br#"{"schema_version":6,"id":"test","name":"Test","version":"1","author":"A","entrypoint":"run","commands":[{"name":"go","summary_ru":"x","description_ru":"x","usage":"<value>"}]}"#,
         )
     }
 
@@ -1066,10 +1066,10 @@ mod tests {
         zip(&[manifest(), run])
     }
 
-    fn v5_archive() -> Vec<u8> {
+    fn account_status_archive() -> Vec<u8> {
         let manifest = file(
             "module.json",
-            br#"{"schema_version":5,"id":"status","name":"Status","version":"1","author":"A","entrypoint":"run","capabilities":["telegram.account.status"],"commands":[{"name":"go","summary_ru":"x","description_ru":"x","usage":"<value>"}]}"#,
+            br#"{"schema_version":6,"id":"status","name":"Status","version":"1","author":"A","entrypoint":"run","capabilities":["telegram.account.status"],"commands":[{"name":"go","summary_ru":"x","description_ru":"x","usage":"<value>"}]}"#,
         );
         let mut run = file("run", b"#!/bin/sh");
         run.mode = 0o100755;
@@ -1241,8 +1241,8 @@ mod tests {
     }
 
     #[test]
-    fn v5_plan_exposes_account_status_capability() {
-        let root = root("v5-plan");
+    fn plan_exposes_account_status_capability() {
+        let root = root("account-status-plan");
         let config = InspectionConfig {
             staging_root: root.clone(),
             limits: limits(),
@@ -1250,7 +1250,7 @@ mod tests {
         let mut random = TestRandom(1);
         let pending = inspect_pending(
             &config,
-            AcquiredLmod::archive(v5_archive()),
+            AcquiredLmod::archive(account_status_archive()),
             SystemTime::UNIX_EPOCH,
             SystemTime::UNIX_EPOCH,
             &mut random,

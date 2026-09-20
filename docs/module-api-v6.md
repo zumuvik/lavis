@@ -1,5 +1,11 @@
 # Module API v6
 
+Schema versions 1-5 have been removed. v6 is the only manifest schema the host
+accepts and the only runtime it can start; a module declaring `schema_version`
+below 6 is rejected at validation with `UnsupportedSchemaVersion`. Their
+specifications remain in Git history if an old module needs porting.
+
+
 API v6 keeps the module process persistent and allows parentless Telegram RPC
 calls while lifecycle requests are in flight.
 

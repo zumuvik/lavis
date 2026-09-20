@@ -8,14 +8,11 @@ External modules extend Lavis with commands implemented in any language. Each en
 
 | Schema/protocol | Статус и документ |
 | --- | --- |
-| v1 | Внутренние метаданные, не runtime внешнего процесса: [Module API v1](module-api-v1.md). |
-| v2–v3 | Базовый manifest и JSON Lines: [Module API v2/v3](module-api-v2.md). |
-| v4 | Редактирование сообщений и наборы реакций: [Module API v4](module-api-v4.md). |
-| v5 | Gateway статуса аккаунта: [Module API v5](module-api-v5.md). |
 | v6 | Capability-gated raw MTProto, peer/message handles: [Module API v6](module-api-v6.md). |
 
-V1–V5 сохраняют свои существующие wire-контракты; выбор v6 не изменяет их
-manifest или сообщения.
+Схемы v1–v5 удалены вместе со своим legacy-runtime: манифест с
+`schema_version` ниже 6 отклоняется на валидации с `UnsupportedSchemaVersion`.
+Их спецификации остаются в истории Git, если нужно портировать старый модуль.
 
 ## End-to-end workflow
 
@@ -38,8 +35,7 @@ write module
 mkdir -p my-echo/bin
 ```
 
-Create `my-echo/module.json`. See [Module API v2/v3](module-api-v2.md),
-[Module API v4](module-api-v4.md), and [Module API v5](module-api-v5.md) for
+Create `my-echo/module.json`. See [Module API v6](module-api-v6.md) for
 the schema selected by your module.
 
 Create a directly executable entrypoint that reads JSON lines from stdin and writes JSON lines to stdout:
@@ -296,7 +292,7 @@ allowlisted core account-status gateway; schema 6 adds capability-gated raw
 MTProto (`telegram.raw`, `raw.invoke`, `contract_revision`) and scoped
 peer/message handles. Contract revision 5 adds the companion-bot inline
 surface (`message.send_bot` capability, `inline.form`, `inline.answer`,
-`message.editBot`, `bot.callback`). See [Module API v5](module-api-v5.md) and
+`message.editBot`, `bot.callback`). See [Module API v6](module-api-v6.md) and
 [Module API v6](module-api-v6.md); v2–v5 behavior remains unchanged.
 
 ### Environment
@@ -316,7 +312,7 @@ Telegram credentials and arbitrary host environment variables are not passed to 
 Capabilities do not form an OS sandbox. A module retains the ordinary OS access
 of the Lavis user. In schema 5, `telegram.account.status` is enforced by the
 core gateway boundary; it controls that core-mediated feature, not direct OS
-access. See [Module API v5](module-api-v5.md).
+access. See [Module API v6](module-api-v6.md).
 
 ## Files and lifecycle
 

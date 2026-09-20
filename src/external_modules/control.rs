@@ -331,7 +331,7 @@ mod tests {
         let entrypoint = bin.join("module");
         fs::write(&entrypoint, "#!/bin/sh\nexit 0\n").unwrap();
         set_mode(&entrypoint, 0o700);
-        fs::write(module.join("module.json"), format!(r#"{{"schema_version":2,"id":"{id}","name":"Echo","version":"1.0.0","author":"Test","entrypoint":"bin/module","commands":[{{"name":"echo","summary_ru":"Echo","description_ru":"Echo text","usage":"<text>"}}]}}"#)).unwrap();
+        fs::write(module.join("module.json"), format!(r#"{{"schema_version":6,"id":"{id}","name":"Echo","version":"1.0.0","author":"Test","entrypoint":"bin/module","commands":[{{"name":"echo","summary_ru":"Echo","description_ru":"Echo text","usage":"<text>"}}]}}"#)).unwrap();
         set_mode(&module.join("module.json"), 0o600);
     }
 
