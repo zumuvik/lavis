@@ -51,7 +51,7 @@ Lavis — статически типизированный Telegram userbot н�
 
 - сохраняйте `serde(deny_unknown_fields)` для manifest boundaries;
 - обновляйте validator, protocol serializer/parser, manager/process tests и docs;
-- schema 2 не должна молча принимать schema 3-only fields;
+- манифесты со `schema_version` ниже 6 должны отвергаться с `UnsupportedSchemaVersion`, а не приниматься молча;
 - новые subscriptions/actions должны иметь явные capabilities и scoped validation;
 - входные/выходные строки, IDs, entities и actions должны иметь bounded limits;
 - request ID обязан точно связывать request и reply.

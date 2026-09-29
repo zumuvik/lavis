@@ -193,7 +193,7 @@ Namespaced invocation:
 ,my-echo.echo Hello from Lavis!
 ```
 
-A schema 3 manifest may declare `default_command`, which additionally enables:
+A manifest may declare `default_command`, which additionally enables:
 
 ```text
 ,my-echo Hello from Lavis!
@@ -262,7 +262,7 @@ Resolution order:
 
 1. built-in canonical commands;
 2. active external namespaced commands;
-3. active schema 3 default commands;
+3. active external default commands;
 4. aliases.
 
 Help for a discovered module card is available by module ID even while it is disabled. Command-specific help requires the command to be active:
@@ -310,7 +310,7 @@ Telegram credentials and arbitrary host environment variables are not passed to 
 
 Capabilities do not form an OS sandbox. A module retains the ordinary OS access
 of the Lavis user. `telegram.account.status` is enforced by the
-core gateway boundary; it controls that core-mediated feature, not direct OS
+core account-status boundary; it controls that core-mediated feature, not direct OS
 access. See [Module API v6](module-api-v6.md).
 
 ## Files and lifecycle
@@ -342,7 +342,7 @@ Pending staging is cleaned best-effort on cancel, expiry, shutdown and next star
 - `.lmod` inspection is structural validation, not malware analysis or signature verification.
 - External modules run as arbitrary executable code with the Lavis user's OS permissions.
 - No seccomp, container, WASM runtime or other system sandbox is applied.
-- `telegram.account.status` is enforced only at the core gateway
+- `telegram.account.status` is enforced only at the core account-status
   boundary; it is not an OS permission.
 - The installer never overwrites an existing module target.
 - Telegram acquisition is limited to a same-message document in Saved Messages and bounded by declared and actual bytes.
