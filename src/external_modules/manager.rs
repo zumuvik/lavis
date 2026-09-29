@@ -44,7 +44,6 @@ pub enum ExternalModuleRuntimeStatus {
 pub struct ExternalManager {
     descriptors: Vec<ExternalModuleDescriptor>,
     processes: BTreeMap<String, V6Process>,
-    gateway: Option<Arc<dyn super::gateway::TelegramGateway>>,
     v6_executor: Option<Arc<dyn V6TelegramExecutor>>,
     /// Last known crash/startup-failure diagnostic per module, retained even
     /// after the process leaves the running index (startup failure, crash
@@ -103,7 +102,6 @@ impl ExternalManager {
         Self {
             descriptors: Vec::new(),
             processes: BTreeMap::new(),
-            gateway: None,
             v6_executor: None,
             latest_diagnostics: BTreeMap::new(),
             restart_generations: BTreeMap::new(),
@@ -115,10 +113,6 @@ impl ExternalManager {
 
     pub fn set_descriptors(&mut self, descriptors: Vec<ExternalModuleDescriptor>) {
         self.descriptors = descriptors;
-    }
-
-    pub fn set_gateway(&mut self, gateway: Arc<dyn super::gateway::TelegramGateway>) {
-        self.gateway = Some(gateway);
     }
 
     pub fn set_v6_executor(&mut self, executor: Arc<dyn V6TelegramExecutor>) {

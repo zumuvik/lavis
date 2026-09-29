@@ -434,9 +434,6 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
         {
             let mut mgr = handle.lock().await;
             mgr.set_descriptors(descriptors);
-            mgr.set_gateway(external_modules::gateway::GrammersGateway::new(
-                guard.inner().client().clone(),
-            ));
             mgr.set_v6_executor(external_modules::v6_executor::GrammersV6Executor::new(
                 guard.inner().module_rpc_client(),
             ));
@@ -558,8 +555,8 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
     .await;
 
     if let Some(handle) = external_handle {
-        // Stop module processes before their core-owned Telegram gateway is
-        // disconnected.
+        // Stop module processes before the core-owned Telegram client
+        // shuts down.
         handle.shutdown_all().await;
     }
     let shutdown_result = guard.shutdown().await;

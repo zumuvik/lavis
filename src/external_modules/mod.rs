@@ -5,7 +5,6 @@ pub mod bot_updates;
 pub mod control;
 pub mod entities;
 pub mod events;
-pub mod gateway;
 pub mod installer;
 pub mod manager;
 pub mod manifest;
