@@ -286,14 +286,13 @@ Help for a discovered module card is available by module ID even while it is dis
 - start quickly;
 - use stderr only for diagnostics.
 
-Schema 3 may also receive `message.created` events and return one scoped
-`message.react` action. Schema 4 adds edited-message support; schema 5 adds the
-allowlisted core account-status gateway; schema 6 adds capability-gated raw
-MTProto (`telegram.raw`, `raw.invoke`, `contract_revision`) and scoped
-peer/message handles. Contract revision 5 adds the companion-bot inline
+A module may receive `message.created` events and return scoped actions. Schema
+6 provides capability-gated raw MTProto (`telegram.raw`, `raw.invoke`,
+`contract_revision`), scoped peer/message handles, and the companion-bot inline
 surface (`message.send_bot` capability, `inline.form`, `inline.answer`,
-`message.editBot`, `bot.callback`). See [Module API v6](module-api-v6.md) and
-[Module API v6](module-api-v6.md); v2–v5 behavior remains unchanged.
+`message.editBot`, `bot.callback`). The host accepts only schema 6 manifests
+and rejects older schemas with `UnsupportedSchemaVersion`. See
+[Module API v6](module-api-v6.md).
 
 ### Environment
 
@@ -310,7 +309,7 @@ Telegram credentials and arbitrary host environment variables are not passed to 
 ### Capabilities
 
 Capabilities do not form an OS sandbox. A module retains the ordinary OS access
-of the Lavis user. In schema 5, `telegram.account.status` is enforced by the
+of the Lavis user. `telegram.account.status` is enforced by the
 core gateway boundary; it controls that core-mediated feature, not direct OS
 access. See [Module API v6](module-api-v6.md).
 
@@ -343,7 +342,7 @@ Pending staging is cleaned best-effort on cancel, expiry, shutdown and next star
 - `.lmod` inspection is structural validation, not malware analysis or signature verification.
 - External modules run as arbitrary executable code with the Lavis user's OS permissions.
 - No seccomp, container, WASM runtime or other system sandbox is applied.
-- Schema-5 `telegram.account.status` is enforced only at the core gateway
+- `telegram.account.status` is enforced only at the core gateway
   boundary; it is not an OS permission.
 - The installer never overwrites an existing module target.
 - Telegram acquisition is limited to a same-message document in Saved Messages and bounded by declared and actual bytes.
