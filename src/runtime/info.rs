@@ -110,6 +110,9 @@ pub(super) fn diagnostic_label(
         Some(control::ModuleDiagnostic::InvalidManifest) => {
             lm_label(locale, LmLabel::InvalidManifest)
         }
+        Some(control::ModuleDiagnostic::UnsupportedSchema) => {
+            lm_label(locale, LmLabel::UnsupportedSchema)
+        }
         None => lm_label(locale, LmLabel::None),
     }
 }

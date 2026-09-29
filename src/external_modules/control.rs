@@ -65,6 +65,7 @@ pub struct ModuleInfo {
 pub enum ModuleDiagnostic {
     InvalidModuleId,
     InvalidManifest,
+    UnsupportedSchema,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,17 +121,26 @@ pub fn list_modules(
             ModuleManagement::Manual
         };
         let enabled = id.as_deref().is_some_and(|id| state.is_enabled(id));
+        let mut manifest_error = None;
         let module = match id.as_deref() {
             Some(id) if validate_module_id(id).is_ok() => {
                 match validate_manifest_at(&entry.path().join("module.json"), Some(id)) {
                     Ok(descriptor) => Some(to_info(descriptor, enabled, management)),
-                    Err(_) => None,
+                    Err(error) => {
+                        manifest_error = Some(error);
+                        None
+                    }
                 }
             }
             _ => None,
         };
         let diagnostic = if module.is_some() {
             None
+        } else if matches!(
+            manifest_error,
+            Some(crate::error::ExternalError::UnsupportedSchemaVersion)
+        ) {
+            Some(ModuleDiagnostic::UnsupportedSchema)
         } else if id
             .as_deref()
             .is_some_and(|id| validate_module_id(id).is_ok())
@@ -408,6 +418,34 @@ mod tests {
                 .unwrap()
                 .diagnostic,
             Some(ModuleDiagnostic::InvalidManifest)
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_schema_manifest_is_diagnosed_as_unsupported() {
+        let base = temp_dir();
+        let root = base.join("modules");
+        fs::create_dir(&root).unwrap();
+        set_mode(&root, 0o700);
+        install_module(&root, "echo");
+        install_module(&root, "legacy");
+        fs::write(
+            root.join("legacy/module.json"),
+            r#"{"schema_version":5,"id":"legacy","name":"Legacy","version":"1.0.0","author":"Test","entrypoint":"bin/module","commands":[{"name":"echo","summary_ru":"Echo","description_ru":"Echo text","usage":"<text>"}]}"#,
+        )
+        .unwrap();
+        set_mode(&root.join("legacy/module.json"), 0o600);
+        let state = store(&base).await;
+        let list = list_modules(&root, &base.join("declarative.json"), &state).unwrap();
+        assert!(list.modules.iter().any(|m| m.module.is_some()));
+        assert_eq!(
+            list.modules
+                .iter()
+                .find(|m| m.id.as_deref() == Some("legacy"))
+                .unwrap()
+                .diagnostic,
+            Some(ModuleDiagnostic::UnsupportedSchema)
         );
         fs::remove_dir_all(base).unwrap();
     }

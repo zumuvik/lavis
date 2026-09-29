@@ -1223,6 +1223,7 @@ pub enum LmLabel {
     None,
     InvalidId,
     InvalidManifest,
+    UnsupportedSchema,
     NotRunning,
     MissingCatalog,
     Status,
@@ -1262,6 +1263,10 @@ pub fn lm_label(locale: Locale, key: LmLabel) -> &'static str {
         (Locale::Russian, LmLabel::InvalidId) => "некорректный ID",
         (Locale::English, LmLabel::InvalidManifest) => "invalid manifest",
         (Locale::Russian, LmLabel::InvalidManifest) => "некорректный манифест",
+        (Locale::English, LmLabel::UnsupportedSchema) => {
+            "unsupported manifest schema (v6 required)"
+        }
+        (Locale::Russian, LmLabel::UnsupportedSchema) => "старая схема манифеста (нужна v6)",
         (Locale::English, LmLabel::NotRunning) => "not running",
         (Locale::Russian, LmLabel::NotRunning) => "не запущен",
         (Locale::English, LmLabel::MissingCatalog) => "enabled, but missing from the catalog",
