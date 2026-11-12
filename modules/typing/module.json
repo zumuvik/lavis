@@ -3,7 +3,7 @@
   "contract_revision": 5,
   "id": "typing",
   "name": "Typing",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "zumuvik",
   "entrypoint": "typing",
   "capabilities": ["telegram.raw"],
@@ -15,9 +15,9 @@
     {
       "name": "typing",
       "summary_ru": "Управление индикатором набора текста",
-      "description_ru": "Включает периодический индикатор набора текста для текущего чата или указанной цели; выключает его командой off.",
-      "usage": "on [@имя|ID]|off|target <@имя|ID>",
-      "examples": ["on", "on @username", "off", "target 123456"]
+      "description_ru": "Включает индикатор набора для нескольких чатов, показывает цели и время работы, выключает одну цель или все сразу.",
+      "usage": "on [@имя|ID]|off [@имя|ID]|target <@имя|ID>|list",
+      "examples": ["on", "on @username", "off @username", "off", "target 123456", "list"]
     }
   ]
 }

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,7 +18,10 @@ import (
 	"github.com/gotd/td/tg"
 )
 
-const protocolVersion = 6
+const (
+	protocolVersion  = 6
+	maxActiveTargets = 6
+)
 
 type request struct {
 	ProtocolVersion int    `json:"protocol_version"`
@@ -56,18 +60,23 @@ type result struct {
 	} `json:"error,omitempty"`
 }
 
+type activeTarget struct {
+	started time.Time
+	cancel  context.CancelFunc
+	done    chan struct{}
+}
+
 type module struct {
-	out      *bufio.Writer
-	active   bool
-	target   string
-	cancel   context.CancelFunc
-	loopDone chan struct{}
-	next     int
-	mu       sync.Mutex
-	pending  map[string]chan result
-	call     func(context.Context, string, bool) error
-	raw      func(context.Context, bin.Encoder) ([]byte, error)
-	peers    map[string]tg.InputPeerClass
+	out     *bufio.Writer
+	target  string
+	active  map[string]activeTarget
+	next    int
+	mu      sync.Mutex
+	peerMu  sync.Mutex
+	pending map[string]chan result
+	call    func(context.Context, string, bool) error
+	raw     func(context.Context, bin.Encoder) ([]byte, error)
+	peers   map[string]tg.InputPeerClass
 }
 
 func main() {
@@ -108,7 +117,7 @@ func main() {
 func parseCommand(args string, chatID int64) (string, string, error) {
 	f := strings.Fields(args)
 	if len(f) == 0 {
-		return "", "", errors.New("usage: typing on [target] | off | target <target>")
+		return "", "", errors.New("использование: typing on [цель] | off [цель] | target <цель> | list")
 	}
 	switch strings.ToLower(f[0]) {
 	case "on":
@@ -128,17 +137,25 @@ func parseCommand(args string, chatID int64) (string, string, error) {
 		}
 		return "on", target, nil
 	case "off":
-		if len(f) != 1 {
-			return "", "", errors.New("usage: typing off")
+		if len(f) > 2 || (len(f) == 2 && !validTarget(f[1])) {
+			return "", "", errors.New("использование: typing off [@username|ID]")
+		}
+		if len(f) == 2 {
+			return "off", f[1], nil
 		}
 		return "off", "", nil
+	case "list":
+		if len(f) != 1 {
+			return "", "", errors.New("использование: typing list")
+		}
+		return "list", "", nil
 	case "target":
 		if len(f) != 2 || !validTarget(f[1]) {
 			return "", "", errors.New("usage: typing target @username|numeric-ID")
 		}
 		return "target", f[1], nil
 	default:
-		return "", "", errors.New("usage: typing on [target] | off | target <target>")
+		return "", "", errors.New("использование: typing on [цель] | off [цель] | target <цель> | list")
 	}
 }
 func validTarget(s string) bool {
@@ -196,13 +213,13 @@ func (m *module) handle(r request) {
 			defer cancel()
 			switch action {
 			case "off":
-				err = m.stopWithContext(ctx)
-			case "target":
-				if m.active {
-					err = m.activate(ctx, target)
+				if target == "" {
+					err = m.stopWithContext(ctx)
 				} else {
-					m.target = target
+					err = m.stopTarget(ctx, target)
 				}
+			case "target":
+				m.target = target
 			case "on":
 				if len(strings.Fields(args)) == 1 && m.target != "" {
 					target = m.target
@@ -223,6 +240,9 @@ func (m *module) handle(r request) {
 			if action == "off" {
 				text = "Индикатор выключен"
 			}
+			if action == "list" {
+				text = m.list(time.Now())
+			}
 			if action == "target" {
 				text = "Цель установлена: " + target
 			}
@@ -236,23 +256,22 @@ func (m *module) handle(r request) {
 	m.write(b)
 }
 func (m *module) activate(ctx context.Context, target string) error {
-	if m.active && m.target == target {
+	if _, exists := m.active[target]; exists {
 		return nil
 	}
-	if m.active {
-		if err := m.stopWithContext(ctx); err != nil {
-			return err
-		}
+	if len(m.active) >= maxActiveTargets {
+		return fmt.Errorf("лимит: %d активных целей", maxActiveTargets)
 	}
 	if err := m.callTyping(ctx, target, true); err != nil {
 		return err
 	}
 	run, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	m.cancel = cancel
-	m.loopDone = done
+	if m.active == nil {
+		m.active = make(map[string]activeTarget)
+	}
+	m.active[target] = activeTarget{started: time.Now(), cancel: cancel, done: done}
 	m.target = target
-	m.active = true
 	go func() { defer close(done); m.loop(run, target) }()
 	return nil
 }
@@ -268,23 +287,52 @@ func (m *module) stop() {
 	_ = m.stopWithContext(ctx)
 }
 func (m *module) stopWithContext(ctx context.Context) error {
-	if !m.active {
-		return nil
+	targets := make([]string, 0, len(m.active))
+	for target := range m.active {
+		targets = append(targets, target)
 	}
-	m.active = false
-	if m.cancel != nil {
-		m.cancel()
-		m.cancel = nil
-	}
-	if m.loopDone != nil {
-		select {
-		case <-m.loopDone:
-		case <-ctx.Done():
-			return ctx.Err()
+	sort.Strings(targets)
+	var first error
+	for _, target := range targets {
+		if err := m.stopTarget(ctx, target); err != nil && first == nil {
+			first = err
 		}
-		m.loopDone = nil
 	}
-	return m.callTyping(ctx, m.target, false)
+	return first
+}
+func (m *module) stopTarget(ctx context.Context, target string) error {
+	entry, exists := m.active[target]
+	if !exists {
+		return fmt.Errorf("цель %s не активна", target)
+	}
+	entry.cancel()
+	delete(m.active, target)
+	select {
+	case <-entry.done:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return m.callTyping(ctx, target, false)
+}
+func (m *module) list(now time.Time) string {
+	if len(m.active) == 0 {
+		return "Активных целей нет"
+	}
+	targets := make([]string, 0, len(m.active))
+	for target := range m.active {
+		targets = append(targets, target)
+	}
+	sort.Strings(targets)
+	var text strings.Builder
+	text.WriteString("Печатает для:\n")
+	for _, target := range targets {
+		seconds := int64(now.Sub(m.active[target].started).Seconds())
+		if seconds < 0 {
+			seconds = 0
+		}
+		fmt.Fprintf(&text, "%s — %02d:%02d:%02d\n", target, seconds/3600, seconds/60%60, seconds%60)
+	}
+	return strings.TrimSuffix(text.String(), "\n")
 }
 func (m *module) loop(ctx context.Context, target string) {
 	ticker := time.NewTicker(4 * time.Second)
@@ -304,17 +352,21 @@ func (m *module) loop(ctx context.Context, target string) {
 	}
 }
 func (m *module) invoke(ctx context.Context, target string, typing bool) error {
+	m.peerMu.Lock()
 	peer := m.peers[target]
+	m.peerMu.Unlock()
 	if peer == nil {
 		var err error
 		peer, err = m.resolve(ctx, target)
 		if err != nil {
 			return err
 		}
+		m.peerMu.Lock()
 		if m.peers == nil {
 			m.peers = make(map[string]tg.InputPeerClass)
 		}
 		m.peers[target] = peer
+		m.peerMu.Unlock()
 	}
 	action := tg.SendMessageActionClass(&tg.SendMessageTypingAction{})
 	if !typing {
@@ -322,7 +374,9 @@ func (m *module) invoke(ctx context.Context, target string, typing bool) error {
 	}
 	body, err := m.rawCall(ctx, &tg.MessagesSetTypingRequest{Peer: peer, Action: action})
 	if err != nil {
+		m.peerMu.Lock()
 		delete(m.peers, target)
+		m.peerMu.Unlock()
 		return err
 	}
 	status, err := tg.DecodeBool(rawBuffer(body))
@@ -336,6 +390,9 @@ func (m *module) invoke(ctx context.Context, target string, typing bool) error {
 }
 
 func (m *module) rawInvoke(ctx context.Context, body []byte) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	m.mu.Lock()
 	m.next++
 	id := fmt.Sprintf("typing-%d", m.next)
